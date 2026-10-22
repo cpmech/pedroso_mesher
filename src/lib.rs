@@ -77,3 +77,9 @@ pub mod alt_decompose;
 pub mod alt_crossfield;
 
 pub mod config;
+
+pub mod simons_godf;
+
+pub mod simons_qgp;
+
+pub mod simons_sizefamily;
