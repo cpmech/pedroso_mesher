@@ -8,6 +8,8 @@
 //! produced, so "all-quad on the six parts" is a verdict with numbers behind it
 //! rather than a reading of the intent.
 
+use std::collections::HashMap;
+
 use crate::mesh::{Kind, Mesh};
 use crate::quality;
 
@@ -19,6 +21,8 @@ pub struct Gate {
     pub triangles: usize,
     /// Elements whose scaled Jacobian is not positive.
     pub inverted: usize,
+    /// Pairs of cells sharing more than one edge (overlapping cells).
+    pub overlapping: usize,
     pub min_scaled_jacobian: f64,
     pub min_corner_angle_deg: f64,
     /// Boundary vertices whose boundary-edge degree is not 2.
@@ -26,13 +30,15 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// The bar from the plan: all-quad, SJ ≥ 0.2, angle ≥ 40°, watertight.
+    /// The bar: all-quad, SJ ≥ 0.2, angle ≥ 30° (relaxed by the user on
+    /// 2026-10-22), watertight, no overlapping cells.
     pub fn passes(&self) -> bool {
         self.triangles == 0
             && self.inverted == 0
+            && self.overlapping == 0
             && self.cracks == 0
             && self.min_scaled_jacobian >= 0.2
-            && self.min_corner_angle_deg >= 40.0
+            && self.min_corner_angle_deg >= 30.0
     }
 
     /// The first reason the gate fails, or `None`.
@@ -43,6 +49,9 @@ impl Gate {
         if self.inverted > 0 {
             return Some(format!("{} inverted element(s)", self.inverted));
         }
+        if self.overlapping > 0 {
+            return Some(format!("{} overlapping cell pair(s)", self.overlapping));
+        }
         if self.cracks > 0 {
             return Some(format!("{} crack(s)", self.cracks));
         }
@@ -52,9 +61,9 @@ impl Gate {
                 self.min_scaled_jacobian
             ));
         }
-        if self.min_corner_angle_deg < 40.0 {
+        if self.min_corner_angle_deg < 30.0 {
             return Some(format!(
-                "min corner angle {:.1}° < 40°",
+                "min corner angle {:.1}° < 30°",
                 self.min_corner_angle_deg
             ));
         }
@@ -81,10 +90,33 @@ pub fn gate(mesh: &Mesh) -> Gate {
         quads,
         triangles,
         inverted,
+        overlapping: overlapping_pairs(mesh),
         min_scaled_jacobian: report.min_scaled_jacobian,
         min_corner_angle_deg: report.min_corner_angle_deg,
         cracks: topo.cracks,
     }
+}
+
+/// Pairs of cells that share more than one edge. Such cells overlap; the
+/// boundary-degree and Jacobian checks cannot see it.
+fn overlapping_pairs(mesh: &Mesh) -> usize {
+    let mut edges: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (id, cell) in mesh.cells.iter().enumerate() {
+        for i in 0..cell.nodes.len() {
+            let (a, b) = (cell.nodes[i], cell.nodes[(i + 1) % cell.nodes.len()]);
+            edges.entry((a.min(b), a.max(b))).or_default().push(id);
+        }
+    }
+    let mut shared: HashMap<(usize, usize), usize> = HashMap::new();
+    for owners in edges.values() {
+        for i in 0..owners.len() {
+            for j in (i + 1)..owners.len() {
+                let pair = (owners[i].min(owners[j]), owners[i].max(owners[j]));
+                *shared.entry(pair).or_default() += 1;
+            }
+        }
+    }
+    shared.values().filter(|&&count| count > 1).count()
 }
 
 #[cfg(test)]
@@ -132,6 +164,24 @@ mod tests {
         assert_eq!(g.inverted, 1);
         assert!(!g.passes());
         assert!(g.reason().unwrap_or_default().contains("inverted"));
+    }
+
+    #[test]
+    fn overlapping_cells_fail_the_gate() {
+        // Two identical quads share four edges and overlap completely.
+        let mesh = Mesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            vec![Cell::quad4([0, 1, 2, 3]), Cell::quad4([0, 1, 2, 3])],
+        );
+        let g = gate(&mesh);
+        assert_eq!(g.overlapping, 1, "{g:?}");
+        assert!(!g.passes());
+        assert!(g.reason().unwrap_or_default().contains("overlapping"));
     }
 
     #[test]

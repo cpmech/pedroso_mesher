@@ -109,6 +109,13 @@ pub struct CloseStats {
     /// Sun 2015 §5.2.1 M6-style absorptions: a boundary sliver plus its two
     /// quads become two quads, removing the collinear boundary node.
     pub boundary_absorptions: usize,
+    /// Residuals closed by a local cavity quadrangulation.
+    pub cavity_closures: usize,
+    pub cavity_attempts: usize,
+    pub cavity_boundary_fail: usize,
+    pub cavity_odd_fail: usize,
+    pub cavity_dp_fail: usize,
+    pub cavity_valid_fail: usize,
     /// Boundary residuals whose template was tried.
     pub template_attempts: usize,
     /// Template attempts rejected before adding cells (not simple).
@@ -145,6 +152,12 @@ struct WalkMesh {
     merge_failures: usize,
     repairs: usize,
     templates: usize,
+    cavities: usize,
+    cavity_attempts: usize,
+    cavity_boundary_fail: usize,
+    cavity_odd_fail: usize,
+    cavity_dp_fail: usize,
+    cavity_valid_fail: usize,
     move_min_sj: f64,
     template_attempts: usize,
     template_raw_failures: usize,
@@ -166,6 +179,12 @@ impl WalkMesh {
             merge_failures: 0,
             repairs: 0,
             templates: 0,
+            cavities: 0,
+            cavity_attempts: 0,
+            cavity_boundary_fail: 0,
+            cavity_odd_fail: 0,
+            cavity_dp_fail: 0,
+            cavity_valid_fail: 0,
             move_min_sj: MOVE_MIN_SJ,
             template_attempts: 0,
             template_raw_failures: 0,
@@ -751,6 +770,204 @@ impl WalkMesh {
         false
     }
 
+    /// The boundary cycle of a connected region of cells, or `None` when the
+    /// region is not simply connected (a hole or several loops).
+    fn region_boundary(&self, region: &HashSet<usize>) -> Option<Vec<usize>> {
+        let mut counts: HashMap<(usize, usize), usize> = HashMap::new();
+        for &id in region {
+            let cell = self.cell(id)?;
+            for i in 0..cell.n_nodes() {
+                *counts.entry(cell.edge(i)).or_default() += 1;
+            }
+        }
+        let mut boundary: Vec<(usize, usize)> = counts
+            .iter()
+            .filter(|(_, count)| **count == 1)
+            .map(|(&edge, _)| edge)
+            .collect();
+        if boundary.is_empty() {
+            return None;
+        }
+        boundary.sort_unstable();
+        let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (a, b) in boundary {
+            adj.entry(a).or_default().push(b);
+            adj.entry(b).or_default().push(a);
+        }
+        if adj.values().any(|neighbours| neighbours.len() != 2) {
+            return None;
+        }
+        let start = *adj.keys().min()?;
+        let mut loopv = Vec::new();
+        let mut previous = usize::MAX;
+        let mut current = start;
+        loop {
+            loopv.push(current);
+            let neighbours = adj.get(&current)?;
+            let next = if neighbours[0] == previous {
+                neighbours[1]
+            } else {
+                neighbours[0]
+            };
+            previous = current;
+            current = next;
+            if current == start {
+                break;
+            }
+            if loopv.len() > adj.len() {
+                return None;
+            }
+        }
+        if loopv.len() != adj.len() {
+            return None;
+        }
+        // Counter-clockwise for the quadrangulator.
+        let twice: f64 = (0..loopv.len())
+            .map(|i| {
+                let a = self.p(loopv[i]);
+                let b = self.p(loopv[(i + 1) % loopv.len()]);
+                a[0] * b[1] - b[0] * a[1]
+            })
+            .sum();
+        if twice < 0.0 {
+            loopv.reverse();
+        }
+        Some(loopv)
+    }
+
+    /// A quad adjacent to the region, for one growth step.
+    fn frontier_quad(&self, region: &HashSet<usize>) -> Option<usize> {
+        let mut candidates = Vec::new();
+        for &id in region {
+            let cell = self.cell(id)?;
+            for i in 0..cell.n_nodes() {
+                for &other in self.edge_cells(cell.edge(i)) {
+                    if region.contains(&other) || self.quad(other).is_none() {
+                        continue;
+                    }
+                    candidates.push(other);
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.first().copied()
+    }
+
+    /// Close one residual by quadrangulating a small cavity around it. Two
+    /// residuals are used as seeds when available, so the cavity boundary has
+    /// even parity; a lone residual grows until the cavity touches a domain
+    /// boundary edge, which is split with one point (the non-local Fig. 6).
+    fn cavity_one(&mut self) -> bool {
+        let ids = self.tri_ids();
+        for id in ids {
+            if self.cavity_close(id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn cavity_close(&mut self, seed: usize) -> bool {
+        let mut seed_sets = vec![vec![seed]];
+        if let Some(partner) = self.nearest_tris(seed).into_iter().next() {
+            if partner != seed {
+                seed_sets.push(vec![seed, partner]);
+            }
+        }
+        for seeds in seed_sets {
+            let mut region: HashSet<usize> = seeds.iter().copied().collect();
+            for _ in 0..=10 {
+                if self.try_cavity_region(&region) {
+                    return true;
+                }
+                match self.frontier_quad(&region) {
+                    Some(next) => {
+                        region.insert(next);
+                    }
+                    None => break,
+                }
+            }
+        }
+        false
+    }
+
+    fn try_cavity_region(&mut self, region: &HashSet<usize>) -> bool {
+        self.cavity_attempts += 1;
+        let mut loopv = match self.region_boundary(region) {
+            Some(loopv) => loopv,
+            None => {
+                self.cavity_boundary_fail += 1;
+                return false;
+            }
+        };
+        let mut inserted = None;
+        if loopv.len() % 2 == 1 {
+            // Split a domain boundary edge so the polygon becomes even.
+            let mut split = None;
+            for i in 0..loopv.len() {
+                let a = loopv[i];
+                let b = loopv[(i + 1) % loopv.len()];
+                let edge = (a.min(b), a.max(b));
+                if self.is_boundary_edge(edge) {
+                    split = Some((i, a, b));
+                    break;
+                }
+            }
+            let Some((index, a, b)) = split else {
+                self.cavity_odd_fail += 1;
+                return false;
+            };
+            let p = midpoint(self.p(a), self.p(b));
+            self.points.push([p[0], p[1], 0.0]);
+            let point = self.points.len() - 1;
+            inserted = Some(point);
+            loopv.insert(index + 1, point);
+        }
+        let quads = match quadrangulate(&self.points, &loopv) {
+            Some(quads) => quads,
+            None => {
+                self.cavity_dp_fail += 1;
+                if inserted.is_some() {
+                    self.points.pop();
+                }
+                return false;
+            }
+        };
+        let region_ids: Vec<usize> = region.iter().copied().collect();
+        let mut original_area = 0.0;
+        for &id in &region_ids {
+            if let Some(cell) = self.cell(id) {
+                original_area += match cell {
+                    Cell::Tri(t) => tri_area2(&self.points, t).abs(),
+                    Cell::Quad(q) => quad_area(&self.points, &q),
+                };
+            }
+        }
+        let new_area: f64 = quads.iter().map(|q| quad_area(&self.points, q)).sum();
+        let area_ok = (new_area - original_area).abs() <= 1.0e-6 * original_area.max(1.0);
+        let valid = area_ok
+            && quads
+                .iter()
+                .all(|q| self.valid_new_cell(Cell::Quad(*q), &region_ids));
+        if !valid {
+            self.cavity_valid_fail += 1;
+            if inserted.is_some() {
+                self.points.pop();
+            }
+            return false;
+        }
+        for id in region_ids {
+            self.remove(id);
+        }
+        for q in quads {
+            self.add(Cell::Quad(q));
+        }
+        self.recompute_boundary();
+        self.cavities += 1;
+        true
+    }
+
     /// Quads whose bilinear Jacobian is not strictly positive.
     fn bad_quad_ids(&self) -> Vec<usize> {
         let mut out = Vec::new();
@@ -908,6 +1125,9 @@ impl WalkMesh {
                     return true;
                 }
             }
+            if self.cavity_close(id) {
+                return true;
+            }
         }
         false
     }
@@ -1042,6 +1262,9 @@ impl WalkMesh {
                     return true;
                 }
             }
+            if self.cavity_close(id) {
+                return true;
+            }
             if let Some(edge) = self.adjacent_boundary_edge(id) {
                 if let Some(next) = self.move_onto_boundary(id, edge) {
                     id = next;
@@ -1170,8 +1393,10 @@ pub fn close_residuals(
             // insert a point on the same line and create a degenerate quad.
             if mesh.absorb_one_boundary_sliver() {
                 stats.boundary_absorptions += 1;
-            } else {
-                mesh.template_one_boundary();
+            } else if !mesh.template_one_boundary() {
+                // Last resort: a local cavity quadrangulation around an
+                // isolated interior sliver.
+                mesh.cavity_one();
             }
             if mesh.tri_count() == before {
                 break;
@@ -1194,12 +1419,226 @@ pub fn close_residuals(
     stats.boundary_repairs = mesh.repairs;
     stats.boundary_absorptions = mesh.absorptions;
     stats.boundary_templates = mesh.templates;
+    stats.cavity_closures = mesh.cavities;
+    stats.cavity_attempts = mesh.cavity_attempts;
+    stats.cavity_boundary_fail = mesh.cavity_boundary_fail;
+    stats.cavity_odd_fail = mesh.cavity_odd_fail;
+    stats.cavity_dp_fail = mesh.cavity_dp_fail;
+    stats.cavity_valid_fail = mesh.cavity_valid_fail;
+    stats.cavity_closures = mesh.cavities;
+    stats.cavity_attempts = mesh.cavity_attempts;
+    stats.cavity_boundary_fail = mesh.cavity_boundary_fail;
+    stats.cavity_odd_fail = mesh.cavity_odd_fail;
+    stats.cavity_dp_fail = mesh.cavity_dp_fail;
+    stats.cavity_valid_fail = mesh.cavity_valid_fail;
     stats.template_attempts = mesh.template_attempts;
     stats.template_raw_failures = mesh.template_raw_failures;
     stats.template_repair_failures = mesh.template_repair_failures;
     let (quads, tris) = mesh.collect();
     stats.remaining = tris.len();
     (mesh.points, quads, tris, stats)
+}
+
+/// Quadrangulate a simple polygon by dynamic programming over non-crossing
+/// diagonals. Returns the quads with the largest possible minimum Jacobian.
+fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
+    let n = loopv.len();
+    if n < 4 || n % 2 == 1 {
+        return None;
+    }
+    type Memo = HashMap<(usize, usize), Option<(f64, usize, usize)>>;
+    fn solve(
+        i: usize,
+        j: usize,
+        loopv: &[usize],
+        points: &[Node],
+        memo: &mut Memo,
+    ) -> Option<(f64, usize, usize)> {
+        if let Some(cached) = memo.get(&(i, j)) {
+            return *cached;
+        }
+        if j == i + 1 {
+            memo.insert((i, j), Some((f64::INFINITY, 0, 0)));
+            return Some((f64::INFINITY, 0, 0));
+        }
+        if j == i + 3 {
+            let quad = [loopv[i], loopv[i + 1], loopv[i + 2], loopv[j]];
+            let quad = normalize_quad(points, quad);
+            let result = if quad_simple(points, &quad) {
+                let sj = quad_min_sj(points, &quad);
+                if sj > -0.05 {
+                    Some((sj, i + 1, i + 2))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            memo.insert((i, j), result);
+            return result;
+        }
+        let mut best: Option<(f64, usize, usize)> = None;
+        let mut k = i + 1;
+        while k + 2 < j {
+            let mut l = k + 1;
+            while l + 1 < j {
+                if let (Some((s1, _, _)), Some((s2, _, _)), Some((s3, _, _))) = (
+                    solve(i, k, loopv, points, memo),
+                    solve(k, l, loopv, points, memo),
+                    solve(l, j, loopv, points, memo),
+                ) {
+                    let quad = normalize_quad(points, [loopv[i], loopv[k], loopv[l], loopv[j]]);
+                    if quad_simple(points, &quad) {
+                        let sq = quad_min_sj(points, &quad);
+                        if sq > -0.05 {
+                            let score = sq.min(s1).min(s2).min(s3);
+                            if best.as_ref().is_none_or(|(bs, _, _)| score > *bs) {
+                                best = Some((score, k, l));
+                            }
+                        }
+                    }
+                }
+                l += 2;
+            }
+            k += 2;
+        }
+        memo.insert((i, j), best);
+        best
+    }
+    let mut memo: Memo = HashMap::new();
+    let (_, top_k, top_l) = solve(0, n - 1, loopv, points, &mut memo)?;
+    fn build(i: usize, j: usize, loopv: &[usize], memo: &Memo, out: &mut Vec<[usize; 4]>) {
+        if j <= i + 1 {
+            return;
+        }
+        let Some((_, k, l)) = memo.get(&(i, j)).copied().flatten() else {
+            return;
+        };
+        if j == i + 3 {
+            out.push([loopv[i], loopv[i + 1], loopv[i + 2], loopv[j]]);
+        } else {
+            build(i, k, loopv, memo, out);
+            build(k, l, loopv, memo, out);
+            build(l, j, loopv, memo, out);
+        }
+    }
+    let mut quads = Vec::new();
+    if n == 4 {
+        quads.push([loopv[0], loopv[1], loopv[2], loopv[3]]);
+    } else {
+        build(0, n - 1, loopv, &memo, &mut quads);
+        let _ = (top_k, top_l);
+    }
+    let polygon_area: f64 = (0..n)
+        .map(|i| {
+            let a = [points[loopv[i]][0], points[loopv[i]][1]];
+            let b = [points[loopv[(i + 1) % n]][0], points[loopv[(i + 1) % n]][1]];
+            a[0] * b[1] - b[0] * a[1]
+        })
+        .sum::<f64>()
+        .abs()
+        * 0.5;
+    let quad_area_sum: f64 = quads.iter().map(|q| quad_area(points, q)).sum();
+    if (quad_area_sum - polygon_area).abs() > 1.0e-6 * polygon_area.max(1.0) {
+        return None;
+    }
+    Some(quads)
+}
+
+/// Greedy quality pass: swap the shared edge of two quads when the minimum
+/// corner angle of the pair improves and both new quads keep SJ >= 0.2. This is
+/// the topological half the node smoother cannot do; it runs on the final mesh.
+pub fn improve_quality(
+    points: &[Node],
+    quads: &[[usize; 4]],
+    tris: &[[usize; 3]],
+    rounds: usize,
+) -> (Vec<Node>, Vec<[usize; 4]>, Vec<[usize; 3]>, usize) {
+    let mut mesh = WalkMesh::new(points, quads, tris);
+    let mut swaps = 0usize;
+    for _ in 0..rounds {
+        let mut best: Option<(f64, usize, usize, [usize; 4], [usize; 4])> = None;
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        for id in 0..mesh.cells.len() {
+            let Some(q1) = mesh.quad(id) else {
+                continue;
+            };
+            let q1 = normalize_quad(&mesh.points, q1);
+            for i in 0..4 {
+                let edge = (q1[i].min(q1[(i + 1) % 4]), q1[i].max(q1[(i + 1) % 4]));
+                let owners = mesh.edge_cells(edge);
+                if owners.len() != 2 {
+                    continue;
+                }
+                let other = if owners[0] == id {
+                    owners[1]
+                } else {
+                    owners[0]
+                };
+                if mesh.quad(other).is_none() {
+                    continue;
+                }
+                let key = (id.min(other), id.max(other));
+                if !seen.insert(key) {
+                    continue;
+                }
+                let Some((_, left, right)) = mesh.best_swap_between(id, other) else {
+                    continue;
+                };
+                if quad_min_sj(&mesh.points, &left) < 0.2 || quad_min_sj(&mesh.points, &right) < 0.2
+                {
+                    continue;
+                }
+                let old = quad_min_angle(&mesh.points, &q1).min(quad_min_angle(
+                    &mesh.points,
+                    &normalize_quad(&mesh.points, mesh.quad(other).unwrap_or([0; 4])),
+                ));
+                let new =
+                    quad_min_angle(&mesh.points, &left).min(quad_min_angle(&mesh.points, &right));
+                let gain = new - old;
+                if gain > 1.0e-6 && best.as_ref().is_none_or(|(bg, _, _, _, _)| gain > *bg) {
+                    best = Some((gain, id, other, left, right));
+                }
+            }
+        }
+        let Some((_, a, b, left, right)) = best else {
+            break;
+        };
+        mesh.remove(a);
+        mesh.remove(b);
+        mesh.add(Cell::Quad(left));
+        mesh.add(Cell::Quad(right));
+        swaps += 1;
+    }
+    let (quads, tris) = mesh.collect();
+    (mesh.points, quads, tris, swaps)
+}
+
+fn quad_min_angle(points: &[Node], quad: &[usize; 4]) -> f64 {
+    let p = |i: usize| [points[i][0], points[i][1]];
+    let c = [p(quad[0]), p(quad[1]), p(quad[2]), p(quad[3])];
+    let mut min = f64::INFINITY;
+    for i in 0..4 {
+        let here = c[i];
+        let prev = c[(i + 3) % 4];
+        let next = c[(i + 1) % 4];
+        let u = [prev[0] - here[0], prev[1] - here[1]];
+        let v = [next[0] - here[0], next[1] - here[1]];
+        let denom = (u[0] * u[0] + u[1] * u[1]).sqrt() * (v[0] * v[0] + v[1] * v[1]).sqrt();
+        if denom <= 0.0 {
+            return 0.0;
+        }
+        let angle = ((u[0] * v[0] + u[1] * v[1]) / denom)
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees();
+        min = min.min(angle);
+    }
+    if min.is_finite() {
+        min
+    } else {
+        0.0
+    }
 }
 
 fn midpoint(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {

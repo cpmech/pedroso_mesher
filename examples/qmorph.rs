@@ -176,10 +176,39 @@ fn run(name: &str, d: &Domain, size: f64) {
     }
     let t_total = t0.elapsed().as_secs_f64();
 
-    let (mesh, gate) = match best {
+    let (mut mesh, _gate_before_quality) = match best {
         Some(best) => best,
         None => {
             smooth_mesh(&mut mesh, d, 80, size);
+            let gate = verify::gate(&mesh);
+            (mesh, gate)
+        }
+    };
+
+    // Topological quality pass: swap quad edges while the pair's minimum angle
+    // improves and both new quads keep SJ >= 0.2, then smooth once more.
+    let (points, quads, tris, quality_swaps) =
+        sun::improve_quality(&mesh.points, &quad_cells(&mesh), &tri_cells(&mesh), 12);
+    let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
+    cells.extend(tris.iter().map(|t| Cell::tri3(*t)));
+    mesh = Mesh::new(points, cells);
+    // Polish at the local size and at two finer radii; keep the best angle.
+    let mut polished: Option<(Mesh, verify::Gate)> = None;
+    for factor in [1.0, 0.5, 0.25] {
+        let mut candidate = mesh.clone();
+        smooth_mesh(&mut candidate, d, 80, size * factor);
+        let candidate_gate = verify::gate(&candidate);
+        let better = match &polished {
+            None => true,
+            Some((_, current)) => score(&candidate_gate) < score(current),
+        };
+        if better {
+            polished = Some((candidate, candidate_gate));
+        }
+    }
+    let (mesh, gate) = match polished {
+        Some(polished) => polished,
+        None => {
             let gate = verify::gate(&mesh);
             (mesh, gate)
         }
@@ -225,6 +254,7 @@ fn run(name: &str, d: &Domain, size: f64) {
         quad_report.min_corner_angle_deg,
         t_total,
     );
+    println!("      quality swaps: {quality_swaps}");
     if let Some(reason) = gate.reason() {
         println!("      reason: {reason}");
     }
