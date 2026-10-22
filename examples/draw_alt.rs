@@ -124,12 +124,13 @@ fn main() {
         post_pass(&domain, &mut mesh, size);
         let gate = verify::gate(&mesh);
         let title = format!(
-            "{name} — {label}: {} quads, {} tri, SJ {:.3}, {:.1}°, off {:.1e}",
+            "{name} — {label}: {} quads, {} tri, SJ {:.3}, {:.1}°, off {:.1e}, corner {:.1e}",
             gate.quads,
             gate.triangles,
             gate.min_scaled_jacobian,
             gate.min_corner_angle_deg,
-            verify::boundary_offset(&domain, &mesh)
+            verify::boundary_offset(&domain, &mesh),
+            verify::corner_offset(&domain, &mesh)
         );
         let opts = MeshDrawOptions {
             title,
@@ -140,11 +141,13 @@ fn main() {
         let path = format!("figures/alts/{name}-{label}.png");
         draw::draw_domain_with_mesh(&domain, &mesh, &path, &opts).unwrap();
         println!(
-            "{label:8} q {:5} tri {:3} SJ {:.3} ang {:.1} {} -> {path}",
+            "{label:8} q {:5} tri {:3} SJ {:.3} ang {:.1} off {:.1e} corner {:.1e} {} -> {path}",
             gate.quads,
             gate.triangles,
             gate.min_scaled_jacobian,
             gate.min_corner_angle_deg,
+            verify::boundary_offset(&domain, &mesh),
+            verify::corner_offset(&domain, &mesh),
             if gate.passes() { "PASS" } else { "FAIL" }
         );
     }
