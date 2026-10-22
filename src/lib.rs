@@ -89,3 +89,5 @@ pub mod simons_channel;
 pub mod sized;
 
 pub mod simons_smooth;
+
+pub mod simons_regions;
