@@ -10,7 +10,7 @@ No code is ported from anywhere and non-MIT code is not even looked, ever.
   materials. File formats come from public specifications.
 - **Public knowledge only.** If a Journal paper or an University MSc or PhD thesis mention an MIT-licensed code,
   the algorithms implemented in such MIT-licensed code may be observed, for learning and better understanding
-  the paper/thesis, but the code must not copied and no code may be ported.
+  the paper/thesis, but the code must not be copied and no code may be ported.
 - **BSD-licensed code requires cpmech's authorization.** If a Journal paper or thesis mentions
   source code under BSD-licenses, cpmech (Dorival Pedroso) must be contacted first for authorization
   to take a peek at such codes.
@@ -20,7 +20,6 @@ No code is ported from anywhere and non-MIT code is not even looked, ever.
 - **Never break wasm**: everything must build for `wasm32-unknown-unknown`
 
 ## Never crash
-People trust SolidCraft with their designs; a crash loses their work. **This outranks feature work.**
 - **No panics in non-test code:** no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`,
   `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`). The exceptions, in the app crate and in
   `crates/threedx-client` (which deny it instead), have no safe API: the macOS-only
