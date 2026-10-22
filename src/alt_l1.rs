@@ -75,6 +75,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
 use crate::mesh::{Cell, Kind, Mesh, Node};
@@ -533,6 +534,29 @@ const H_MAX: f64 = 4.0 / 3.0;
 /// existing node, otherwise the insertion would only create a sliver.
 const MIN_SPACING_FRACTION: f64 = 0.5;
 
+/// Options for the L∞ frontal Delaunay route.
+///
+/// The defaults reproduce the measured benchmark table exactly.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Options {
+    /// `h_max` of the paper (`4/3`): a triangle is resolved when its
+    /// adimensional size `2 R∞ / size` is at most this.
+    pub h_max: f64,
+    /// A candidate point must be at least this fraction of the target size away
+    /// from every existing node, otherwise the insertion would only create a
+    /// sliver.
+    pub min_spacing_fraction: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            h_max: H_MAX,
+            min_spacing_fraction: MIN_SPACING_FRACTION,
+        }
+    }
+}
+
 /// Refine a CDT with the frontal L∞ point insertion of §5.
 ///
 /// The target is a triangle whose L∞ circumsquare has side `size`, i.e. the
@@ -544,6 +568,7 @@ fn frontal_refine(
     domain: &Domain,
     field: &CrossField,
     size: f64,
+    options: &Options,
 ) -> Result<(), String> {
     let max_rounds = 4000;
     for _round in 0..max_rounds {
@@ -577,7 +602,7 @@ fn frontal_refine(
             }
             let radius = 0.5 * (up[0] - lo[0]).max(up[1] - lo[1]);
             hi[t] = 2.0 * radius / size;
-            resolved[t] = hi[t] <= H_MAX;
+            resolved[t] = hi[t] <= options.h_max;
         }
 
         let mut edges: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
@@ -645,7 +670,7 @@ fn frontal_refine(
                 continue;
             }
             let nearest = state.grid.nearest(candidate, &state.points);
-            if nearest < MIN_SPACING_FRACTION * size {
+            if nearest < options.min_spacing_fraction * size {
                 continue;
             }
             // The candidate must land in a still-unresolved triangle: inserting
@@ -672,7 +697,7 @@ fn frontal_refine(
                         }
                     }
                     let radius = 0.5 * (up[0] - lo[0]).max(up[1] - lo[1]);
-                    if 2.0 * radius / size <= H_MAX {
+                    if 2.0 * radius / size <= options.h_max {
                         continue;
                     }
                 }
@@ -1207,8 +1232,18 @@ fn close_leftovers(
 // Entry point
 // ------------------------------------------------------------------------- //
 
-/// Mesh `domain` with the L-norm frontal Delaunay route (see the module docs).
+/// Mesh `domain` with the L-norm frontal Delaunay route (see the module docs),
+/// using the default [`Options`].
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
+    mesh_with_options(domain, sizing, &Options::default())
+}
+
+/// Mesh `domain` with the L-norm frontal Delaunay route and explicit [`Options`].
+pub fn mesh_with_options(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<Mesh, String> {
     let size = sizing.size;
     if !size.is_finite() || size <= 0.0 {
         return Err("the element size must be positive and finite".to_string());
@@ -1242,7 +1277,7 @@ pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
         }
     }
 
-    frontal_refine(&mut state, domain, &field, size)?;
+    frontal_refine(&mut state, domain, &field, size, options)?;
 
     let base_tris = state.domain_triangles(domain);
     if base_tris.is_empty() {
@@ -1400,5 +1435,24 @@ mod tests {
         let mut bad = sizing;
         bad.size = 0.0;
         assert!(mesh(&domain, &bad).is_err());
+    }
+
+    #[test]
+    fn non_default_options_still_produce_a_valid_mesh() {
+        let domain = Domain::rectangle(12.0, 8.0).unwrap();
+        let sizing = Sizing::uniform(2.0).unwrap();
+        let options = Options {
+            h_max: 1.6,
+            min_spacing_fraction: 0.35,
+        };
+        assert_ne!(options.h_max, Options::default().h_max);
+        let mesh = mesh_with_options(&domain, &sizing, &options).unwrap();
+        let (quads, tris) = counts(&mesh);
+        assert!(quads > 0, "no quad");
+        assert_eq!(tris, 0, "{tris} triangles left");
+        let gate = verify::gate(&mesh);
+        assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
+        assert_eq!(gate.cracks, 0);
+        assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
     }
 }

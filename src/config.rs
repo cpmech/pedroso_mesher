@@ -303,14 +303,20 @@ mod tests {
     }
 
     #[test]
-    fn a_gate_failure_is_an_unsupported_error_in_the_quad_view() {
+    fn the_quad_view_records_the_generator() {
         let (domain, sizing) = square();
-        let config = MeshConfig::new(Route::Hybrid);
-        // a square is quad-dominant, so the quad view should refuse it
-        let result = generate_quad(&domain, &sizing, &config);
-        assert!(matches!(
-            result,
-            Err(crate::quad::QuadError::Unsupported(_)) | Ok(_)
-        ));
+        let config = MeshConfig::new(Route::Quadtree);
+        let q = generate_quad(&domain, &sizing, &config).unwrap();
+        assert_eq!(q.generator, Route::Quadtree);
+    }
+
+    #[test]
+    fn smoothing_can_be_switched_off() {
+        let (domain, sizing) = square();
+        let mut config = MeshConfig::new(Route::Bipartite);
+        config.smoothing.enabled = false;
+        let out = generate(&domain, &sizing, &config).unwrap();
+        assert!(out.smoothing.is_some());
+        assert_eq!(out.statistics.quads, out.before.quads);
     }
 }
