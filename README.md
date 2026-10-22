@@ -48,8 +48,8 @@ Rust, MIT licensed. No GPL, LGPL or AGPL dependency, and no external binary.
 >    by consuming a quad that bordered a second leftover triangle.
 > 2. **Pocket fan** (a connected pocket of leftovers, an even polygon, fanned
 >    into `n/2` quads around one interior point): correct, but nearly useless.
->    The leftovers are *isolated single triangles* — 423 of the 234 at 1 mm are
->    pockets of size one — and a triangle is an odd polygon.
+>    The leftovers are *isolated single triangles*: across the six parts the
+>    matcher leaves 423 pockets of size one — and a triangle is an odd polygon.
 > 3. **The parity wall.** An odd polygon cannot be quadrangulated round one
 >    interior point: with a fan, the centre ends up on the boundary. Adding an
 >    adjacent quad makes it worse (odd + 2 is still odd), and splitting a
