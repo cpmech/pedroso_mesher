@@ -419,7 +419,7 @@ pub fn mesh_2d(domain: &Domain, sizing: &Sizing) -> Result<TwoDResult, TwoDError
     smooth(&mut mesh, domain, SMOOTHING_ITERATIONS, sizing.size);
     Ok(TwoDResult {
         mesh,
-        unpaired: Vec::new(),
+        unpaired: leftover.clone(),
         stats,
     })
 }
