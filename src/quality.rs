@@ -1,21 +1,51 @@
-//! Element quality: the numbers the mesher is judged by.
+//! Element quality: the per-element metrics the mesher is judged by.
 //!
-//! The definitions are the ones from Knupp's Jacobian framework (2000), which
-//! the plan adopts as the contract:
+//! The contract metrics follow Knupp's Jacobian framework. The definitions,
+//! formulas, ranges and sources are:
 //!
-//! * **Scaled Jacobian** at a corner: `det J / (|c1| |c2| |c3|)`, where the
-//!   columns of `J` are the images of the parametric axes. It is 1 for a cube,
-//!   `sin θ` for a sheared cell, and negative for an inverted one.
+//! * **Scaled Jacobian (SJ)** at a corner: `det J / (||c1|| ||c2|| ||c3||)`,
+//!   where `c1, c2, c3` are the columns of the Jacobian `d x / d xi` (the images
+//!   of the parametric axes). This is `det(Q)` for the matrix whose columns are
+//!   normalised, the quantity Knupp calls the scaled Jacobian
+//!   (`knupp-2000-part2`, section 5, "The ideal element"; the CUBIT name is
+//!   cited there). The planar case applies the same normalisation to the 2x2
+//!   Jacobian of `knupp-2000-part1`, section 2. Range `[-1, 1]`: 1 for a cube or
+//!   a right-angled quad,
+//!   `sin(theta)` for a sheared cell, 0 for a degenerate one, negative for an
+//!   inverted one.
+//! * **Corner angle**: the angle between the two element edges meeting at a
+//!   node, in degrees, `acos(e_prev . e_next / (||e_prev|| ||e_next||))`.
+//!   Standard metric (not from the corpus). Range `[0, 180]`; 90 is ideal for a
+//!   quad. For a quad the two measures are related: at a corner `SJ = sin(angle)`.
 //! * **Dihedral angle** at a hex edge: `180° - angle(n1, n2)` between the
-//!   outward normals of the two faces meeting there; 90° for a cube.
-//! * **Aspect ratio**: longest edge over shortest edge.
+//!   outward normals of the two faces meeting there. Standard metric (Knupp's
+//!   papers compute 2D corner angles, not hex dihedrals). Range `[0, 180]`; 90
+//!   for a cube.
+//! * **Aspect ratio**: longest edge over shortest edge. Standard metric
+//!   (Knupp's aspect-ratio objective is a matrix-norm quantity based on the
+//!   diagonal of the metric tensor, `knupp-2000-part1`, not this geometric
+//!   ratio). Range `[1, inf)`; 1 for an equilateral element.
 //!
 //! Everything is computed from the trilinear (hex) or bilinear (quad) map, not
 //! from an approximation, so the values match what a finite element code sees.
+//! What is approximated or missing: the Jacobian is evaluated at the element's
+//! corner nodes only (no interior sampling and no minimum over integration
+//! points), there is no warp, taper or skew metric, and a `Tri3` has no
+//! parametric Jacobian at all — [`scaled_jacobian`] returns 1.0 for every
+//! triangle, so a reversed triangle is invisible here (the gate checks it by
+//! signed area instead). The planar metrics use the x and y coordinates only,
+//! relying on the z = 0 convention of [`crate::mesh`]; a non-planar quad is
+//! measured by its projection.
 
 use crate::mesh::{Cell, Kind, Mesh, Node};
 
 /// Local corner coordinates of a `Hex8`, matching [`Kind`]'s node order.
+///
+/// Entry `i` is `(xi, eta, zeta)` of node `i` in the trilinear reference cube
+/// `[-1, 1]^3`: the bottom ring `0..3` at `zeta = -1`, then the top ring `4..7`
+/// at `zeta = +1`, counter-clockwise seen from +Z. Each coordinate is `±1`, so
+/// the shape-function derivatives below are the standard
+/// `dN_i/dxi = xi_i (1 + eta_i eta)(1 + zeta_i zeta) / 8`.
 const HEX_XI: [[f64; 3]; 8] = [
     [-1.0, -1.0, -1.0],
     [1.0, -1.0, -1.0],
@@ -28,22 +58,46 @@ const HEX_XI: [[f64; 3]; 8] = [
 ];
 
 /// Local corner coordinates of a `Quad4`.
+///
+/// Entry `i` is `(xi, eta)` of node `i` in the bilinear reference square
+/// `[-1, 1]^2`, counter-clockwise from `(-1, -1)`, matching [`Kind`]'s node
+/// order. The shape-function derivatives are
+/// `dN_i/dxi = xi_i (1 + eta_i eta) / 4` (and the symmetric one in `eta`).
 const QUAD_XI: [[f64; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
 
-/// Thresholds a mesh is judged against. The defaults are the P0 contract:
-/// refuse anything with an inverted cell, target a scaled Jacobian of 0.2, and
-/// accept down to 0.1 on the benchmark corpus.
+/// Thresholds a mesh is judged against.
+///
+/// The defaults are the P0 contract: refuse anything with an inverted cell,
+/// target a scaled Jacobian of 0.2, keep hex dihedral angles in the 30..150°
+/// band, and accept a geometric aspect ratio up to 10 while refusing above 100.
+/// The 0.2 target is the usual scaled-Jacobian floor for a usable element, the
+/// same order as the ≈0.300 that Knupp's optimiser reached on whisker-weaved
+/// meshes (`knupp-2000-part2`, summary). The remaining numbers are project
+/// choices and rules of thumb, not values taken from a corpus paper.
 #[derive(Clone, Copy, Debug)]
 pub struct Thresholds {
-    /// Hard floor for the scaled Jacobian; at or below this, refuse.
+    /// Hard floor for the scaled Jacobian. An element whose smallest corner is
+    /// at or below this counts as inverted, and the mesh is refused. Default
+    /// 0.0 (so "positive Jacobian" is the validity rule).
     pub hard_scaled_jacobian: f64,
-    /// Target for every corner of every element.
+
+    /// Target for every corner of every element. An element below it is counted
+    /// in `Report::below_target`; missing it makes the verdict `BelowTarget`,
+    /// not `Refused`. Default 0.2.
     pub target_scaled_jacobian: f64,
-    /// Dihedral angles outside this band are recorded as violations.
+
+    /// Lower bound of the acceptable hex dihedral band, in degrees. Below it
+    /// the verdict is `BelowTarget`. Default 30.
     pub min_dihedral_deg: f64,
+
+    /// Upper bound of the acceptable hex dihedral band, in degrees. Above it
+    /// the verdict is `BelowTarget`. Default 150.
     pub max_dihedral_deg: f64,
-    /// Aspect ratio above this is reported; above `hard_aspect_ratio`, refused.
+
+    /// Aspect ratio above this is reported as `BelowTarget`. Default 10.
     pub target_aspect_ratio: f64,
+
+    /// Aspect ratio above this refuses the mesh. Default 100.
     pub hard_aspect_ratio: f64,
 }
 
@@ -61,40 +115,102 @@ impl Default for Thresholds {
 }
 
 /// How a mesh fares against the contract.
+///
+/// The precedence is `Refused` over `BelowTarget` over `Acceptable`: a hard
+/// failure hides the softer target misses, and a target miss is only reported
+/// when the mesh is otherwise valid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Every element meets the target.
+    /// Every element meets every target and no hard threshold was broken.
     Acceptable,
-    /// Valid, but below the target; usable with a caveat.
+    /// Valid (no inverted element), but at least one target was missed; usable
+    /// with a caveat and reported in `Report::reasons`.
     BelowTarget,
+
     /// Must not be shipped: an inverted element or a hard threshold was broken.
     Refused,
 }
 
-/// Per-mesh quality summary.
+/// Per-mesh quality summary: the aggregate of the per-element metrics plus the
+/// verdict and its human-readable reasons.
+///
+/// All angles are degrees and all lengths are in the mesh's unit (millimetres).
+/// The Jacobian fields are dimensionless. Fields that do not apply to a non-empty
+/// mesh are NaN, not zero, so a caller cannot mistake "not measured" for
+/// "perfect": dihedral angles are NaN when there is no hex, and corner angles
+/// are NaN when the mesh is purely 3D. The empty mesh is the exception: it is
+/// refused before that normalisation, so its angle fields keep the `INFINITY`
+/// sentinels and `worst_element` is `None`.
 #[derive(Clone, Debug)]
 pub struct Report {
+    /// Number of cells in the mesh.
     pub elements: usize,
+
+    /// Smallest scaled Jacobian over every corner of every element;
+    /// dimensionless, in `[-1, 1]` for a valid mesh. `INFINITY` for an empty
+    /// mesh (nothing was measured).
     pub min_scaled_jacobian: f64,
+
+    /// Arithmetic mean of the scaled Jacobian over every corner of every
+    /// element; dimensionless. Triangles contribute 1.0 per corner. 0.0 for an
+    /// empty mesh (the mean is not defined there).
     pub mean_scaled_jacobian: f64,
+
+    /// Largest scaled Jacobian over every corner of every element;
+    /// dimensionless, at most 1 for a non-inverted element. `-INFINITY` for an
+    /// empty mesh.
     pub max_scaled_jacobian: f64,
-    /// Index of the element holding the minimum.
+
+    /// Index of the element holding the minimum scaled Jacobian; the first one
+    /// in cell order when several tie. `None` for an empty mesh.
     pub worst_element: Option<usize>,
+
+    /// Elements whose smallest corner is at or below `hard_scaled_jacobian`, or
+    /// NaN (degenerate). Must be 0 for `Acceptable`/`BelowTarget`.
     pub inverted: usize,
+
+    /// Elements whose smallest corner is below `target_scaled_jacobian`. A
+    /// count, not a flag; the verdict uses it only in the reason text.
     pub below_target: usize,
+
+    /// Smallest dihedral angle over all 12 edges of all hexes, in degrees;
+    /// `[0, 180]`, 90 for a cube. NaN when a non-empty mesh has no hexahedron
+    /// (an empty mesh keeps `INFINITY`, see the struct note).
     pub min_dihedral_deg: f64,
+
+    /// Largest dihedral angle over all 12 edges of all hexes, in degrees;
+    /// `[0, 180]`, 90 for a cube. NaN when a non-empty mesh has no hexahedron.
     pub max_dihedral_deg: f64,
+
+    /// Largest aspect ratio (longest edge / shortest edge) over all cells;
+    /// dimensionless, `>= 1`, `INFINITY` for a degenerate cell.
     pub max_aspect_ratio: f64,
-    /// Smallest and largest corner angle over planar elements (quads and
-    /// triangles); NaN when the mesh is purely 3D.
+
+    /// Smallest corner angle over planar elements (quads and triangles), in
+    /// degrees; NaN when the mesh is purely 3D. This is the angle the W3 gate
+    /// holds to `>= 30°`.
     pub min_corner_angle_deg: f64,
+
+    /// Largest corner angle over planar elements, in degrees; NaN when the mesh
+    /// is purely 3D. A value above 180 would indicate a reflex corner, which a
+    /// valid planar cell does not have.
     pub max_corner_angle_deg: f64,
+
+    /// The overall verdict; `Refused` takes precedence over `BelowTarget`.
     pub verdict: Verdict,
+
+    /// Human-readable reasons for a non-`Acceptable` verdict, one per broken
+    /// hard threshold or missed target. Empty for `Acceptable`.
     pub reasons: Vec<String>,
 }
 
 impl Report {
     /// One-line summary for logs and the CLI.
+    ///
+    /// The format is `N element(s), min SJ …, mean …, dihedral …, aspect …,
+    /// verdict`, with the dihedral band replaced by `n/a (no hex)` when no
+    /// hexahedron was measured. It is for humans; parse the struct fields or the
+    /// JSON output when a machine needs the values.
     pub fn summary(&self) -> String {
         let verdict = match self.verdict {
             Verdict::Acceptable => "acceptable",
@@ -123,27 +239,40 @@ impl Report {
 // geometry helpers
 // --------------------------------------------------------------------------- //
 
+/// Difference of two points (`a - b`), component by component.
 fn sub(a: Node, b: Node) -> Node {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
+/// Euclidean dot product of two 3D vectors.
 fn dot(a: Node, b: Node) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+/// Euclidean norm of a 3D vector.
 fn norm(a: Node) -> f64 {
     dot(a, a).sqrt()
 }
 
+/// Determinant of a 3x3 matrix stored row-major, by cofactor expansion along
+/// the first row.
 fn det3(m: &[[f64; 3]; 3]) -> f64 {
     m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
 }
 
-/// Jacobian `d x / d xi` of the trilinear hex at a local point.
+/// Jacobian `d x / d xi` of the trilinear hex at a local point `xi`.
+///
+/// Returns a 3x3 matrix `J[row][column]` where the row is the spatial coordinate
+/// (x, y, z) and the column is the parametric direction (xi, eta, zeta), i.e.
+/// `J = [c0 c1 c2]` with the columns as vectors. The bubble-free trilinear
+/// shape functions are
+/// `N_i = (1 + xi_i xi)(1 + eta_i eta)(1 + zeta_i zeta) / 8`, differentiated
+/// analytically; the `0.125` is `1/8`.
 fn hex_jacobian(points: &[Node], cell: &Cell, xi: [f64; 3]) -> [[f64; 3]; 3] {
     let mut j = [[0.0f64; 3]; 3];
+    // Accumulate J = sum_i x_i (grad N_i)^T over the eight corners.
     for (i, local) in HEX_XI.iter().enumerate() {
         let p = points[cell.nodes[i]];
         // dN_i/dxi, dN_i/deta, dN_i/dzeta
@@ -162,7 +291,13 @@ fn hex_jacobian(points: &[Node], cell: &Cell, xi: [f64; 3]) -> [[f64; 3]; 3] {
     j
 }
 
-/// Jacobian of the bilinear quad, as a 2x2 matrix in the plane.
+/// Jacobian of the bilinear quad, as a 2x2 matrix in the xy plane.
+///
+/// Rows are (x, y), columns are (xi, eta); the z coordinate is ignored because
+/// planar meshes live in z = 0. The shape functions are
+/// `N_i = (1 + xi_i xi)(1 + eta_i eta) / 4`, again differentiated analytically.
+/// For a non-planar quad the matrix is the projection onto the xy plane, not the
+/// in-surface metric.
 fn quad_jacobian(points: &[Node], cell: &Cell, xi: [f64; 2]) -> [[f64; 2]; 2] {
     let mut j = [[0.0f64; 2]; 2];
     for (i, local) in QUAD_XI.iter().enumerate() {
@@ -184,6 +319,23 @@ fn quad_jacobian(points: &[Node], cell: &Cell, xi: [f64; 2]) -> [[f64; 2]; 2] {
 // --------------------------------------------------------------------------- //
 
 /// Scaled Jacobian at every corner, in the cell's node order.
+///
+/// `SJ = det J / (||c0|| ||c1|| ||c2||)` for a hex and
+/// `SJ = det J / (||c0|| ||c1||)` for a quad, with the columns `c_i` of the
+/// corner Jacobian; this is `det(Q)` of the column-normalised matrix
+/// (`knupp-2000-part2`, section 5). Range `[-1, 1]`: positive for a valid cell,
+/// 1 for a right-angled one, negative for an inverted one. A NaN is returned
+/// when a column has zero length, i.e. the cell is degenerate; the report treats
+/// a NaN as inverted.
+///
+/// Only the corners are sampled (the `HEX_XI`/`QUAD_XI` points). The returned
+/// vector has one entry per cell node, so it can be zipped with the node order
+/// for diagnostics.
+///
+/// A `Tri3` has no corner Jacobian in this parameterisation. The function
+/// returns `1.0` for each of its three corners as a neutral placeholder, which
+/// means the scaled Jacobian cannot see a reversed or degenerate triangle; the
+/// gate checks triangles by signed area instead (see `verify::cell_inverted`).
 pub fn scaled_jacobian(cell: &Cell, points: &[Node]) -> Vec<f64> {
     match cell.kind {
         Kind::Hex8 => HEX_XI
@@ -201,6 +353,8 @@ pub fn scaled_jacobian(cell: &Cell, points: &[Node]) -> Vec<f64> {
                 }
             })
             .collect(),
+        // Placeholder: see the doc comment above. `verify` does not rely on this
+        // value for triangles.
         Kind::Tri3 => vec![1.0; 3],
         Kind::Quad4 => QUAD_XI
             .iter()
@@ -222,8 +376,17 @@ pub fn scaled_jacobian(cell: &Cell, points: &[Node]) -> Vec<f64> {
 
 /// Signed volume of a hex, or signed area of a quad, by Gauss integration.
 ///
-/// Two Gauss points per direction integrate the degree-three Jacobian exactly,
-/// so the result is the true measure of the trilinear/bilinear element.
+/// Two Gauss points per direction (at `±1/sqrt(3)`, weight 1) integrate the
+/// degree-three Jacobian exactly, so the result is the true measure of the
+/// trilinear/bilinear element, not an approximation. The sign follows the cell
+/// orientation: positive for the node order of [`crate::mesh::Kind`], negative
+/// for an inverted cell, and zero for a degenerate one. Units are the mesh unit
+/// cubed for a hex and squared for a planar cell.
+///
+/// A `Tri3` uses the z component of the edge cross product, i.e. its signed area
+/// in the xy plane; that is exact for the z = 0 convention the 2D pipeline
+/// keeps. A quad's area is likewise its xy projection, so a non-planar quad is
+/// not measured by its surface area.
 pub fn volume(cell: &Cell, points: &[Node]) -> f64 {
     let g = 1.0 / 3.0_f64.sqrt();
     match cell.kind {
@@ -260,7 +423,16 @@ pub fn volume(cell: &Cell, points: &[Node]) -> f64 {
 }
 
 /// Longest edge over shortest edge.
+///
+/// A standard geometric metric (not taken from a corpus paper; Knupp's
+/// aspect-ratio objective is a different, matrix-norm quantity). Range
+/// `[1, inf)`: 1 for an equilateral element, larger for a stretched one, and
+/// `INFINITY` when an edge has zero length. Edges come from
+/// [`Kind::edges`], so the count is 4 for a quad, 3 for a triangle and 12 for a
+/// hex.
 pub fn aspect_ratio(cell: &Cell, points: &[Node]) -> f64 {
+    // Sentinel extremes: every valid kind has at least three edges, so both are
+    // overwritten. A zero-length edge leaves `lo == 0` and yields INFINITY.
     let mut lo = f64::INFINITY;
     let mut hi = 0.0f64;
     for &(a, b) in cell.kind.edges() {
@@ -276,6 +448,13 @@ pub fn aspect_ratio(cell: &Cell, points: &[Node]) -> f64 {
 }
 
 /// Corner angles of a quad, in degrees, in node order.
+///
+/// At node `i` the angle is between the edges to the previous and next node in
+/// the ring, `acos(e_prev . e_next / (||e_prev|| ||e_next||))`, clamped to
+/// `[-1, 1]` before the `acos` so that round-off cannot produce a NaN. A
+/// standard metric; range `[0, 180]`, 90 for a square. The value is NaN when an
+/// incident edge has zero length. The function is also applied to a `Tri3` by
+/// [`corner_angles`], which uses the same ring formula.
 pub fn quad_angles(cell: &Cell, points: &[Node]) -> Vec<f64> {
     let n = cell.nodes.len();
     (0..n)
@@ -296,6 +475,10 @@ pub fn quad_angles(cell: &Cell, points: &[Node]) -> Vec<f64> {
 }
 
 /// Corner angles of a planar element (quad or triangle), in degrees.
+///
+/// Returns 4 values for a `Quad4`, 3 for a `Tri3` and an empty vector for a
+/// `Hex8` (a solid has no planar corner angle). The per-corner definition and
+/// range are those of [`quad_angles`].
 pub fn corner_angles(cell: &Cell, points: &[Node]) -> Vec<f64> {
     if cell.kind == Kind::Quad4 {
         return quad_angles(cell, points);
@@ -322,11 +505,22 @@ pub fn corner_angles(cell: &Cell, points: &[Node]) -> Vec<f64> {
 }
 
 /// Dihedral angle at each of the 12 hex edges, in degrees, in edge order.
+///
+/// For each edge, take the two faces that contain it and the angle between their
+/// outward normals; the dihedral angle is `180° - that angle` (the normals of a
+/// cube's adjacent faces are perpendicular, so the dihedral is 90°). Range
+/// `[0, 180]`, clamped against round-off. This is a standard metric; the corpus
+/// papers define corner angles, not hex dihedrals. Returns an empty vector for a
+/// non-hex cell and NaN for an edge not shared by exactly two faces (only a
+/// malformed cell can produce that).
 pub fn dihedral_angles(cell: &Cell, points: &[Node]) -> Vec<f64> {
     if cell.kind != Kind::Hex8 {
         return Vec::new();
     }
     let faces = cell.kind.faces();
+    // One normal per face. The face loops in `Kind::faces` are outward-facing;
+    // for adjacent faces `n1 . n2` is 1 when they are coplanar (dihedral 180°),
+    // 0 at a right angle (90°) and -1 when folded flat onto each other (0°).
     let normals: Vec<Node> = faces
         .iter()
         .map(|f| {
@@ -373,11 +567,22 @@ pub fn dihedral_angles(cell: &Cell, points: &[Node]) -> Vec<f64> {
 // --------------------------------------------------------------------------- //
 
 /// Judge a mesh against the default contract.
+///
+/// Shorthand for [`report_with`] with [`Thresholds::default`]; this is the call
+/// the CLI and the library example use.
 pub fn report(mesh: &Mesh) -> Report {
     report_with(mesh, &Thresholds::default())
 }
 
 /// Judge a mesh against explicit thresholds.
+///
+/// One pass over the cells accumulates the minima/maxima/mean, the inversion and
+/// target counts, the aspect ratio and the applicable angle metrics, then the
+/// verdict is derived from the thresholds. The empty mesh is refused with a
+/// reason, and its sentinel `INFINITY` fields must not be read as a perfect
+/// mesh. For a non-empty mesh, metrics that do not apply are set to NaN rather
+/// than left at their `INFINITY` sentinels (dihedral when there is no hex,
+/// corner angles when there is no planar cell).
 pub fn report_with(mesh: &Mesh, thresholds: &Thresholds) -> Report {
     let mut report = Report {
         elements: mesh.cells.len(),
@@ -395,17 +600,23 @@ pub fn report_with(mesh: &Mesh, thresholds: &Thresholds) -> Report {
         verdict: Verdict::Acceptable,
         reasons: Vec::new(),
     };
+    // An empty mesh has no element to measure. Refuse it here so that no caller
+    // reads the sentinel INFINITY fields as "perfect".
     if mesh.cells.is_empty() {
         report.verdict = Verdict::Refused;
         report.reasons.push("the mesh has no elements".to_string());
         return report;
     }
 
+    // Mean over every corner of every cell, not over elements: a hex therefore
+    // contributes eight samples and a quad four. That is the documented
+    // element-corner average, not a bug.
     let mut total = 0.0;
     let mut corners = 0usize;
     for (index, cell) in mesh.cells.iter().enumerate() {
         let sj = scaled_jacobian(cell, &mesh.points);
         let smallest = sj.iter().copied().fold(f64::INFINITY, f64::min);
+        // Strict `<` keeps the first element in cell order on a tie.
         if smallest < report.min_scaled_jacobian {
             report.min_scaled_jacobian = smallest;
             report.worst_element = Some(index);
@@ -417,6 +628,9 @@ pub fn report_with(mesh: &Mesh, thresholds: &Thresholds) -> Report {
             total += value;
             corners += 1;
         }
+        // `<= hard` is the validity rule: a zero Jacobian is degenerate and is
+        // as unusable as a negative one. NaN means a zero-length column, also
+        // degenerate.
         if smallest <= thresholds.hard_scaled_jacobian || smallest.is_nan() {
             report.inverted += 1;
         }
@@ -427,6 +641,8 @@ pub fn report_with(mesh: &Mesh, thresholds: &Thresholds) -> Report {
         let aspect = aspect_ratio(cell, &mesh.points);
         report.max_aspect_ratio = report.max_aspect_ratio.max(aspect);
 
+        // Corner angles only exist for planar cells; a hex contributes no
+        // entry, and a purely 3D mesh is normalised to NaN below.
         if cell.kind.dim() == 2 {
             for value in corner_angles(cell, &mesh.points) {
                 if value.is_finite() {
@@ -450,6 +666,8 @@ pub fn report_with(mesh: &Mesh, thresholds: &Thresholds) -> Report {
         f64::NAN
     };
 
+    // Normalise "not measured" from the `INFINITY` accumulators to NaN, so the
+    // summary and the callers can tell it apart from a perfect value.
     if !report.min_corner_angle_deg.is_finite() {
         report.min_corner_angle_deg = f64::NAN;
         report.max_corner_angle_deg = f64::NAN;
@@ -459,6 +677,8 @@ pub fn report_with(mesh: &Mesh, thresholds: &Thresholds) -> Report {
         report.min_dihedral_deg = f64::NAN;
         report.max_dihedral_deg = f64::NAN;
     }
+    // Hard failures come first and override every target check below: an
+    // inverted element or an aspect ratio over the hard limit refuses the mesh.
     if report.inverted > 0 {
         report.verdict = Verdict::Refused;
         report.reasons.push(format!(
@@ -473,6 +693,9 @@ pub fn report_with(mesh: &Mesh, thresholds: &Thresholds) -> Report {
             report.max_aspect_ratio, thresholds.hard_aspect_ratio
         ));
     }
+    // Target misses only soften an otherwise valid mesh; they never upgrade a
+    // refused one. NaN comparisons are false, so an inapplicable metric (no hex)
+    // does not trigger its target.
     if report.verdict != Verdict::Refused {
         if report.min_scaled_jacobian < thresholds.target_scaled_jacobian {
             report.verdict = Verdict::BelowTarget;
