@@ -8,9 +8,16 @@
 //!
 //! 1. **grid refinement to the size field** (§2.1): a quadtree over the
 //!    bounding box whose leaves are refined until the leaf diagonal is at most
-//!    the requested size.  With the uniform [`Sizing`] of this crate the
-//!    strongly balanced quadtree is exactly the uniform grid it refines to, so
-//!    the implementation walks that grid directly;
+//!    [`DEFAULT_CELL_FACTOR`] times the requested size (`1.0` is the paper's
+//!    density; the factor is the element-count knob).  The default is `1.5`,
+//!    which puts the effective edge at `1.06 * size` and matches the paving
+//!    element count at the nominal size.  The sweep in
+//!    `examples/alt_quadtree.rs` documents `2.0` as the **coarse option**
+//!    (largest swept factor that still passes every gate, edge `1.41 * size`,
+//!    about 1.7x fewer elements); `1.0` is the conservative paper density.
+//!    With the uniform [`Sizing`] of this crate the strongly balanced
+//!    quadtree is exactly the uniform grid it refines to, so the
+//!    implementation walks that grid directly;
 //! 2. **repelling** (§2.2): grid corners closer than `delta = 0.40 s` (the
 //!    local square size) to the geometry are moved away from it along a grid
 //!    line, so a grid/geometry intersection can never sit next to a corner and
@@ -48,8 +55,20 @@
 //! lines, where their angle is naturally split between the cells, so a
 //! re-entrant corner never becomes one reflex polygon.
 //!
+//! **Product limitation: grid-aligned, isotropic mesh.**  This is a
+//! Cartesian/quadtree route, so the mesh follows the background grid.  A
+//! curved boundary is approximated by axis-aligned cell sides plus short
+//! chords whose nodes lie on the input polyline; there is no tangential
+//! projection of whole rows and no anisotropic boundary layer.  For CFD
+//! boundary layers, strongly curved geometry, or a mesh whose edges must be
+//! aligned with a wall normal, an advancing-front/paving or an anisotropic
+//! layer route is the right tool — this is a deliberate limitation of the
+//! grid-based method, not a conformity or cleanup bug (the boundary nodes are
+//! on the geometry and `boundary_offset` is round-off).
+//!
 //! The module never panics and returns `Err` for configurations it cannot
-//! resolve (it retries once at half the spacing before giving up).
+//! resolve (it retries at half the spacing, up to three levels, before giving
+//! up).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -57,11 +76,27 @@ use crate::mesh::{Cell, Mesh, Node};
 use crate::two_d::{Domain, Sizing};
 
 /// How many grid alignments are tried before the result is accepted.
-const ALIGNMENTS: usize = 6;
+const ALIGNMENTS: usize = 3;
 /// How many times the whole grid is rebuilt at half the spacing before failing.
 const MAX_ATTEMPTS: usize = 3;
 /// Coordinates are deduplicated at 10 nm resolution.
 const KEY_SCALE: f64 = 1.0e8;
+/// Default grid-density factor: the leaf diagonal is at most
+/// `DEFAULT_CELL_FACTOR * size`.
+///
+/// The product contract is "mesh at the requested size", so the default is
+/// `1.5`: its effective edge is `1.06 * size` and its element counts match
+/// the paving route at the nominal size.  The paper's "diagonal at most the
+/// size" is the conservative `1.0` (edge `0.71 * size`).  The sweep in
+/// `examples/alt_quadtree.rs` shows that quality does **not** collapse when
+/// the grid is coarsened: `2.0` is the largest swept factor that still keeps
+/// the whole corpus all-quad, gap-free, `min angle >= 30` and `SJ >= 0.2`,
+/// and it removes a further 1.7x elements (e.g. 8 459 quads on the 0.6 mm
+/// part instead of 14 900), at an effective edge of about `1.41 * size`.  It
+/// remains available as the documented **coarse option** through
+/// [`mesh_with_cell_factor`].
+pub const DEFAULT_CELL_FACTOR: f64 = 1.5;
+
 /// `delta = repelling fraction * local square side`.  The paper analyzes 1/4;
 /// 0.40 was selected empirically: it lifts the measured minimum corner angle
 /// from the paper's 24.3-degree band above the 30-degree gate while keeping
@@ -75,12 +110,30 @@ const MIN_SPLIT_ANGLE_DEG: f64 = 12.0;
 const EPS: f64 = 1.0e-9;
 /// Upper bound on diagonal splits per cut cell.
 const MAX_SPLITS: usize = 32;
-/// A chain turn gentler than this is smoothed away: the run is represented by
-/// a single node at its arc-length midpoint instead of a flat polygon vertex.
+/// A chain turn gentler than this is smoothed away: the run becomes one chord
+/// whose subdivision midpoint is snapped to the run's arc-length point, instead
+/// of one flat polygon vertex per sampling point.
 const SMOOTH_TURN_DEG: f64 = 25.0;
 
 /// Mesh a planar domain with the cleanup-free quadtree route.
+///
+/// Uses [`DEFAULT_CELL_FACTOR`].
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
+    mesh_with_cell_factor(domain, sizing, DEFAULT_CELL_FACTOR)
+}
+
+/// Mesh with an explicit grid-density factor: every leaf diagonal is at most
+/// `cell_factor * sizing.size`.  `1.0` is the paper's density; larger values
+/// coarsen the mesh.  The factor also scales the repelling distance, so the
+/// quality band is preserved as far as the corpus allows.
+pub fn mesh_with_cell_factor(
+    domain: &Domain,
+    sizing: &Sizing,
+    cell_factor: f64,
+) -> Result<Mesh, String> {
+    if !cell_factor.is_finite() || !(0.25..=4.0).contains(&cell_factor) {
+        return Err("the cell factor must be in [0.25, 4]".to_string());
+    }
     if !sizing.size.is_finite() || sizing.size <= 0.0 {
         return Err("the element size must be positive and finite".to_string());
     }
@@ -106,7 +159,7 @@ pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
     // keep the best mesh; refine the whole grid only if every alignment fails
     // to assemble a conforming mesh.
     for level in 0..MAX_ATTEMPTS {
-        let target = sizing.size / std::f64::consts::SQRT_2 / (1u32 << level) as f64;
+        let target = cell_factor * sizing.size / std::f64::consts::SQRT_2 / (1u32 << level) as f64;
         let mut best: Option<(f64, Mesh)> = None;
         for variant in 0..ALIGNMENTS {
             let variant = level * ALIGNMENTS + variant;
@@ -2183,6 +2236,28 @@ mod tests {
             mesh.volume()
         );
         assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
+    }
+
+    #[test]
+    fn a_larger_cell_factor_coarsens_the_mesh_and_stays_all_quad() {
+        let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
+        let sizing = Sizing::uniform(4.0).unwrap();
+        let fine = mesh_with_cell_factor(&domain, &sizing, 1.0).unwrap();
+        let coarse = mesh_with_cell_factor(&domain, &sizing, 2.0).unwrap();
+        assert!(
+            coarse.cells.len() * 2 < fine.cells.len(),
+            "coarse {} vs fine {}",
+            coarse.cells.len(),
+            fine.cells.len()
+        );
+        assert_eq!(quad_count(&coarse), coarse.cells.len());
+        let gate = verify::gate(&coarse);
+        assert_eq!(gate.triangles, 0);
+        assert_eq!(gate.cracks, 0, "{gate:?}");
+        assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
+        assert!(verify::boundary_offset(&domain, &coarse) < 1.0e-6);
+        assert!(mesh_with_cell_factor(&domain, &sizing, 0.0).is_err());
+        assert!(mesh_with_cell_factor(&domain, &sizing, 5.0).is_err());
     }
 
     #[test]
