@@ -1,9 +1,49 @@
-//! One configuration for every quad route.
+//! The shipped configuration API: one [`MeshConfig`] selects a [`Route`],
+//! carries that route's own `Options`, and runs the shared smoothing stage after
+//! the generator.
 //!
-//! [`MeshConfig`] follows the `russell_nonlin` pattern — defaults that reproduce
-//! the measured tables, plus chainable setters — and it is also
-//! `Serialize`/`Deserialize`, so the same configuration can be loaded from JSON,
-//! recorded with a study, and passed across the wasm boundary.
+//! [`generate`] is the product entry point: it dispatches to the route, measures
+//! the result, runs [`smooth::smooth`], and keeps the smoothed mesh only when
+//! the smoother accepted it (otherwise the generator's mesh and its statistics
+//! are returned). [`generate_quad`] adapts the same run to the legacy
+//! [`crate::quad::QuadMesh`] view: a mesh that fails the gate is
+//! [`crate::quad::QuadError::Unsupported`], and a route that cannot generate at
+//! all is [`crate::quad::QuadError::Route`].
+//!
+//! Nine routes are shipped behind this enum. Each is implemented from the public
+//! paper named on its variant and measured on the crate corpus (six planar parts
+//! plus the 0.6 mm performance part); the alternative routes' `Options` defaults
+//! reproduce the constants they were measured with. The papers are cited by
+//! corpus id (`owen-1999`, `blacker-1991`, ...), never copied as code; see
+//! `AGENTS.md` for the clean-room rules.
+//!
+//! The design follows the `russell_nonlin` pattern: defaults reproduce the
+//! measured tables, the setters are chainable, and `Serialize`/`Deserialize`
+//! makes the same configuration loadable from JSON, recordable with a study, and
+//! passable across the wasm boundary.
+//!
+//! Shipping pattern (the quadtree is the default route):
+//!
+//! ```
+//! use pedroso_mesher::config::{generate, generate_quad, MeshConfig, Route};
+//! use pedroso_mesher::two_d::{Domain, Sizing};
+//!
+//! # fn main() -> Result<(), String> {
+//! let domain = Domain::rectangle(2.0, 2.0).map_err(|e| e.to_string())?;
+//! let sizing = Sizing::uniform(0.5).map_err(|e| e.to_string())?;
+//!
+//! // One config, one call. `statistics.passes` is the acceptance gate; the
+//! // generator's own numbers are in `before`.
+//! let config = MeshConfig::new(Route::Quadtree);
+//! let out = generate(&domain, &sizing, &config)?;
+//! assert!(out.statistics.passes);
+//!
+//! // The legacy view returns the same mesh with the conversion statistics.
+//! let quad = generate_quad(&domain, &sizing, &config).map_err(|e| e.to_string())?;
+//! assert_eq!(quad.generator, Route::Quadtree);
+//! # Ok(())
+//! # }
+//! ```
 
 use serde::{Deserialize, Serialize};
 
@@ -12,32 +52,104 @@ use crate::smooth::{self, SmoothOptions, SmoothOutcome};
 use crate::stats::MeshStatistics;
 use crate::two_d::{Domain, Sizing};
 
-/// Which quad generator to run.
+/// Which quad generator [`MeshConfig::route`] selects.
+///
+/// The variants are in shipping order ([`Route::ALL`]). Each doc names the
+/// paper (by corpus id), the route's character (direct, indirect, grid or
+/// post-pass, and whether it promises all-quad), and the measured table that
+/// its example program prints. Measurements are on the crate corpus
+/// (six planar parts plus the 0.6 mm performance part) with the route's default
+/// `Options`; `raw` is the route output and `post` is after the common
+/// smoothing/swap/perturbation post-pass.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Route {
-    /// The shipped Q-Morph conversion (supported on 4 of the 7 corpus parts).
+    /// **Q-Morph** — indirect. Paper `owen-1999` (advancing front over a
+    /// triangle substrate), with `sun-2015`/`sun-2016` closing the residual
+    /// triangles. Character: the gate-checked shipped conversion; it returns a
+    /// mesh only if it passes the 30 degree / SJ 0.2 gate, so 4 of the 7 corpus
+    /// parts are supported.
+    /// Measured table: `examples/qmorph.rs` (raw gate rows; `UNSUPPORTED` rows
+    /// are the carried failures, not shipped meshes).
     Qmorph,
-    /// Blacker's direct all-quad advancing front plus a matched core.
+
+    /// **Paving** — direct. Paper `blacker-1991` (advancing rows, with the
+    /// §2.8 seam). Character: all-quad boundary rows towards the interior; the
+    /// residual core is closed by the shared CDT + matching fallback.
+    /// Measured table: `examples/alt_paving.rs`; 7/7 PASS raw and post, raw SJ
+    /// 0.62–0.70 and corner 38–44 degrees, about 15k quads at 0.6 mm.
     Paving,
-    /// Right-angled triangles plus bipartite labelling (all-quad by construction).
+
+    /// **Bipartite** — indirect. Paper `georgiadis-2022` (bipartite topological
+    /// labelling). Character: a right-angled triangle mesh is 2-coloured so the
+    /// monochromatic edges are a perfect matching; all-quad by construction.
+    /// Measured table: `examples/alt_bipartite.rs`; 7/7 PASS raw and post, post
+    /// SJ 0.69–0.82 and corner 47.5–61.8 degrees (0.6 mm post about 11 s).
     Bipartite,
-    /// Cleanup-free strongly balanced quadtree (the general default).
+
+    /// **Quadtree** — grid-based, the general default. Papers `rushdi-2017` and
+    /// its precursor `rushdi-2015` (cleanup-free strongly balanced quadtree).
+    /// Character: grid/geometry intersection plus 2-refinement templates;
+    /// all-quad with no cleanup, but the mesh stays grid-aligned (no boundary
+    /// layer, curved boundaries become chords).
+    /// Measured table: `examples/alt_quadtree.rs`; 7/7 PASS raw and post, post
+    /// SJ 0.63–1.00 and corner 42.9–90 degrees, 14 900 quads at 0.6 mm in
+    /// 0.16 s raw.
     #[default]
     Quadtree,
-    /// 4-sided patch decomposition with transfinite templates.
+
+    /// **Decompose** — decomposition and templates. Papers `yang-2024`
+    /// (boundary-constrained decomposition) and `miranda-2017` (T0/T1/T2
+    /// transfinite templates). Character: recursive chords until every patch
+    /// has four corners, then a discrete Coons map; exact on axis-aligned
+    /// parts, but the 8-patch O-grid ring around a hole limits quality.
+    /// Measured table: `examples/alt_decompose.rs`; all-quad and watertight
+    /// 7/7, raw 7/7 PASS; after the common post-pass the plate-hole 1 mm and
+    /// 0.6 mm rows can fall below the 30 degree gate on that ring.
     Decompose,
-    /// Quad-dominant: Blossom boundary band plus greedy interior.
+
+    /// **Hybrid** — indirect, quad-dominant. Paper `zint-2021`, using the
+    /// shipped Blossom-Quad matching (`remacle-2012`) on the boundary band.
+    /// Character: fast Blossom band plus greedy interior merging and a residual
+    /// triangle walk; it does not promise all-quad, and trades leftover
+    /// triangles for speed. Measured table: `examples/alt_hybrid.rs`; 0.6 mm
+    /// raw in about 0.8 s with 190 triangles left (FAIL), an order of magnitude
+    /// faster than the matching routes.
     Hybrid,
-    /// Cross-field-aligned boundary rows plus a matched core.
+
+    /// **Crossfield** — direct-ish. Papers `pellenard-2014`, `pellenard-2011`
+    /// and `remacle-2013` §3. Character: a cross field on a background grid
+    /// drives field-aligned paving rows; the interior is closed by the
+    /// Q-Morph/matching stage. Measured table: `examples/alt_crossfield.rs`;
+    /// all-quad 7/7 and all seven PASS after the common post-pass (post SJ
+    /// 0.23–0.78, corner 30–55 degrees); the 0.6 mm part needs the pre-walk
+    /// fallback and gains about 5.1k quads (20 586).
     Crossfield,
-    /// The product pipeline plus the log-barrier untangler (a post-pass route).
+
+    /// **Untangle** — post-pass over the product pipeline. Papers `sastry-2014`
+    /// (log-barrier untangling) and `verma-2017`/`verma-2018` (singularity
+    /// reduction by edge swaps). Character: keeps the mesh a failing gate
+    /// returned, then moves interior nodes and swaps interior edges; it cannot
+    /// create or remove cells, so leftover triangles stay.
+    /// Measured table: `examples/alt_untangle.rs`; 4/7 PASS; the plate-hole
+    /// 1 mm boundary doublet (SJ 0) and the ring/performance triangles stay
+    /// failing, while the valence-4 share rises by 1–6 points on passing parts.
     Untangle,
-    /// Frontal Delaunay in the L∞ (Chebyshev) norm.
+
+    /// **L1** — indirect (frontal Delaunay plus recombination). Paper
+    /// `remacle-2013`; the paper's "L-norm" is the infinity (Chebyshev) norm,
+    /// as `alt_l1` explains. Character: cross-field-driven L-infinity point
+    /// placement, then maximum-weight Blossom matching of triangles into quads
+    /// (exact below `EXACT_MATCHING_TRIANGLES`, blocked plus greedy above it).
+    /// Measured table: `examples/alt_l1.rs`; all-quad 7/7 and post PASS 7/7
+    /// with the best quality of the shipped routes (post SJ 0.66–0.98, corner
+    /// 41.6–78.7 degrees; the 0.6 mm row uses the blocked matching path).
     L1,
 }
 
 impl Route {
-    /// All routes, in shipping order.
+    /// All nine routes, in shipping order (the order the tables and the
+    /// configuration examples use). Every route in this array is callable by
+    /// [`generate`]; not every route passes the gate on every part.
     pub const ALL: [Route; 9] = [
         Route::Qmorph,
         Route::Paving,
@@ -50,7 +162,10 @@ impl Route {
         Route::L1,
     ];
 
-    /// The name used in tables, JSON and logs.
+    /// The stable lowercase name used in tables, JSON and logs.
+    ///
+    /// These strings are the command-line route names accepted by
+    /// `examples/generate.rs`; changing one breaks saved configurations.
     pub fn name(self) -> &'static str {
         match self {
             Route::Qmorph => "qmorph",
@@ -66,26 +181,63 @@ impl Route {
     }
 }
 
-/// The configuration of one mesh generation: the route, its own options, and
-/// the shared smoothing stage.
+/// One complete mesh generation request: the route, that route's own options,
+/// and the shared post-generation smoother.
+///
+/// The defaults are the constants each route was measured with, so
+/// `MeshConfig::default()` is the default product configuration: the quadtree
+/// route with smoothing on. The struct is `Serialize`/`Deserialize`; the route
+/// options are embedded by value, so a saved JSON file is a complete recipe.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MeshConfig {
-    /// Which generator to run.
+    /// Which generator to run. See [`Route`] for the paper, character and
+    /// measured table of each variant.
     pub route: Route,
-    /// The smoother applied after the generator (on by default).
+
+    /// The shared smoother applied after the generator (on by default). It
+    /// moves interior nodes only and is rejected when it does not improve the
+    /// gate margin; its fields are documented on [`SmoothOptions`].
     pub smoothing: SmoothOptions,
+
+    /// Options of the `quadtree` route: grid density, number of alignments,
+    /// repelling distance and retry budget.
     pub quadtree: crate::alt_quadtree::Options,
+
+    /// Options of the `paving` route: corner margin, minimum edge, front gap,
+    /// row budget and §2.8 seaming.
     pub paving: crate::alt_paving::Options,
+
+    /// Options of the `bipartite` route: right-angle flip, labelling, repair
+    /// and Steiner budgets.
     pub bipartite: crate::alt_bipartite::Options,
+
+    /// Options of the `l1` route: the resolution threshold `h_max` and the
+    /// minimum insertion spacing.
     pub l1: crate::alt_l1::Options,
+
+    /// Options of the `crossfield` route: Gauss-Seidel sweeps of the field.
     pub crossfield: crate::alt_crossfield::Options,
+
+    /// Options of the `hybrid` route: boundary-band depth and the augmenting
+    /// path / triangle-walk budgets.
     pub hybrid: crate::alt_hybrid::Options,
+
+    /// Options of the `untangle` route: coordinate-search rounds, accepted-swap
+    /// cap and evaluation budget.
     pub untangle: crate::alt_untangle::Options,
+
+    /// Options of the `decompose` route: corner threshold (degrees) and the
+    /// recursion-depth safety limit.
     pub decompose: crate::alt_decompose::Options,
 }
 
 impl MeshConfig {
-    /// A configuration for one route, everything else at its default.
+    /// A configuration for one route, with that route's options, the smoother
+    /// and every other route's options at their defaults.
+    ///
+    /// This is the recommended constructor: it keeps the non-selected option
+    /// blocks at the measured defaults, which is what `MeshConfig::default()`
+    /// also does.
     pub fn new(route: Route) -> Self {
         Self {
             route,
@@ -93,61 +245,110 @@ impl MeshConfig {
         }
     }
 
-    /// Select the route.
+    /// Select the route and return `self` for chaining.
+    ///
+    /// The other fields, including all option blocks, are unchanged; switching
+    /// route therefore keeps defaults for the new route.
     pub fn set_route(&mut self, route: Route) -> &mut Self {
         self.route = route;
         self
     }
 
-    /// Replace the smoothing options.
+    /// Replace the shared smoothing options and return `self` for chaining.
     pub fn set_smoothing(&mut self, smoothing: SmoothOptions) -> &mut Self {
         self.smoothing = smoothing;
         self
     }
 
-    /// Serialise to pretty JSON.
+    /// Serialise the whole configuration to pretty JSON.
+    ///
+    /// Serialisation of this plain struct cannot fail; the fallback `"{}"` only
+    /// keeps the return type infallible (a caller that needs the error should
+    /// use `serde_json` directly).
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
     }
 
-    /// Parse the JSON form.
+    /// Parse a configuration from JSON produced by [`Self::to_json`].
+    ///
+    /// The error is the parser's message as text; a missing field is an error
+    /// (there are no serde defaults on [`MeshConfig`]), so a saved file must
+    /// come from a compatible version.
     pub fn from_json(text: &str) -> Result<Self, String> {
         serde_json::from_str(text).map_err(|e| e.to_string())
     }
 }
 
-/// What one generation produced.
+/// What one [`generate`] call produced.
+///
+/// `statistics` describes `mesh`; `before` is the same measurement immediately
+/// after the route and before smoothing. Keeping both makes the effect of the
+/// smoother explicit, and `smoothing` retains the full outcome (including a
+/// candidate the smoother rejected).
 #[derive(Clone, Debug)]
 pub struct MeshOutput {
-    /// The returned mesh (smoothed when the smoother was accepted).
+    /// The returned mesh: the smoothed mesh when the smoother accepted it,
+    /// otherwise the generator's mesh unchanged. Coordinates are in the
+    /// domain's units (millimetres for the corpus).
     pub mesh: Mesh,
-    /// Statistics of the returned mesh.
+
+    /// Statistics of [`Self::mesh`]: after the accepted smoothing, if any, and
+    /// otherwise equal to [`Self::before`].
     pub statistics: MeshStatistics,
-    /// Statistics right after the generator, before smoothing.
+
+    /// Statistics immediately after the route and before smoothing. This is
+    /// the mesh the route's measured table is computed on.
     pub before: MeshStatistics,
-    /// The route that ran.
+
+    /// The route that ran, copied from [`MeshConfig::route`].
     pub route: Route,
-    /// The smoothing run, if it was attempted.
+
+    /// The smoothing run, if it was attempted. `Some` even when the smoother
+    /// was disabled or rejected the candidate; [`SmoothOutcome::accepted`]
+    /// says whether it replaced the mesh.
     pub smoothing: Option<SmoothOutcome>,
-    /// Wall time of the whole generation.
+
+    /// Wall-clock seconds for the route and the smoother together (not the
+    /// caller's domain or size setup).
     pub seconds: f64,
 }
 
-/// Run `config.route` and then the shared smoother.
+/// Ship one mesh: run the configured route, measure it, run the shared
+/// smoother, and return the accepted result.
 ///
-/// `Ok` does not imply that the mesh passes the gate: inspect
-/// [`MeshOutput::statistics`] (or `generate_quad` for the
-/// `Unsupported` error). `Err` means the route itself could not produce a mesh.
+/// The order is fixed:
+///
+/// 1. dispatch on [`MeshConfig::route`] and generate with that route's options.
+///    [`Route::Qmorph`] runs the gate-checked [`crate::quad::mesh_quads`] and
+///    keeps the mesh carried by `QuadError::Unsupported` (the carried mesh is
+///    exactly what the measurement and the smoother need);
+/// 2. measure the generator result with [`MeshStatistics::of`] (`before`);
+/// 3. run [`smooth::smooth`] with [`MeshConfig::smoothing`];
+/// 4. return the smoothed mesh and its statistics when the smoother accepted
+///    them, otherwise the generator mesh and `before` unchanged.
+///
+/// [`Sizing::size`] is the target edge length in domain units; both the
+/// generator and the smoother use it. `Ok` does not imply that the gate
+/// passes: inspect [`MeshOutput::statistics`] (`passes`) or use
+/// [`generate_quad`] for the gate-as-error contract. `Err` means a route could
+/// not produce a mesh at all; the string is that route's error (for the
+/// Q-Morph route, an input or conversion error).
 pub fn generate(
     domain: &Domain,
     sizing: &Sizing,
     config: &MeshConfig,
 ) -> Result<MeshOutput, String> {
     let started = std::time::Instant::now();
+    // The route is the only branch in this function; each arm either returns
+    // its own error type (converted by `?`) or a Mesh. The Q-Morph arm is the
+    // only one whose error can still carry a usable mesh.
     let mesh = match config.route {
         Route::Qmorph => match crate::quad::mesh_quads(domain, sizing) {
             Ok(q) => q.mesh,
+            // The shipped route refuses a mesh below the gate; the carried mesh
+            // is still a valid geometry and is what the smoother can improve.
             Err(crate::quad::QuadError::Unsupported(u)) => u.mesh,
+            // Input/route errors have no usable mesh, so they propagate.
             Err(e) => return Err(e.to_string()),
         },
         Route::Paving => crate::alt_paving::mesh_with_options(domain, sizing, &config.paving)?,
@@ -169,8 +370,16 @@ pub fn generate(
         }
         Route::L1 => crate::alt_l1::mesh_with_options(domain, sizing, &config.l1)?,
     };
+    // Step 2: the generator's own row. Measuring before smoothing is what lets
+    // a caller compare a route against its measured table and see the smoother's
+    // contribution separately.
     let before = MeshStatistics::of(domain, &mesh);
+    // Step 3: one smoother for every route. It moves interior nodes only;
+    // `reject_if_worse` decides whether its candidate replaces the input.
     let outcome = smooth::smooth(domain, &mesh, sizing.size, &config.smoothing);
+    // Step 4: only an accepted smoothing replaces the mesh. A rejected candidate
+    // stays in `smoothing` for diagnostics, but the returned statistics stay the
+    // generator's.
     let (mesh, statistics) = if outcome.accepted {
         (outcome.smoothed.clone(), outcome.after.clone())
     } else {
@@ -182,23 +391,46 @@ pub fn generate(
         before,
         route: config.route,
         smoothing: Some(outcome),
+        // The clock starts before the dispatch, so this includes every stage
+        // from route generation through the smoother.
         seconds: started.elapsed().as_secs_f64(),
     })
 }
 
-/// Run any route and wrap the result in the quad module's [`crate::quad::QuadMesh`].
+/// Run any route through [`generate`] and adapt the result to the legacy
+/// [`crate::quad::QuadMesh`] view.
 ///
-/// A mesh that does not pass the gate is returned as
-/// [`crate::quad::QuadError::Unsupported`] carrying the mesh, exactly like the
-/// shipped Q-Morph entry point.
+/// The two failure classes are deliberately distinct:
+///
+/// * a route that cannot generate at all is [`crate::quad::QuadError::Route`];
+///   the string is the route's own error, e.g. an unusable domain;
+/// * a generated mesh that does not pass the gate is
+///   [`crate::quad::QuadError::Unsupported`], carrying the mesh, the measured
+///   gate and the statistics, exactly like [`crate::quad::mesh_quads`].
+///
+/// The front-only counters (`rounds`, `cavity_closures`, `low_repairs`, ...) are
+/// zero for the alternative routes; the quality fields come from the statistics
+/// of the accepted mesh. The conversion route is reported as
+/// [`crate::quad::Route::Front`] because this adapter only wraps the front
+/// pipeline, while the new `generator` field records the actual [`Route`].
+///
+/// Note: unlike [`crate::quad::mesh_quads`], this adapter enforces the mesh gate
+/// but not its separate boundary/corner offset checks. The offsets are carried
+/// in [`crate::quad::Stats`], so a caller that needs the full geometry contract
+/// must test them or call the front route directly.
 pub fn generate_quad(
     domain: &Domain,
     sizing: &Sizing,
     config: &MeshConfig,
 ) -> Result<crate::quad::QuadMesh, crate::quad::QuadError> {
     use crate::quad::{QuadError, QuadMesh, Route as Conversion, Stats, Timing, Unsupported};
+    // Route failures stay distinct from gate failures: only the latter carry a
+    // mesh and a measured gate to diagnose.
     let out = generate(domain, sizing, config).map_err(QuadError::Route)?;
     let gate = out.statistics.gate;
+    // The front's own counters do not exist for the alternative routes. The
+    // quality fields are genuine measurements, so a report can still compare
+    // shapes; `two_stage` stays None because no two-stage conversion ran.
     let stats = Stats {
         rounds: 0,
         cavity_closures: 0,
@@ -213,6 +445,9 @@ pub fn generate_quad(
         corner_offset: out.statistics.corner_offset,
         two_stage: None,
     };
+    // Only the total time is known at this level; the route did not report its
+    // own triangulation/conversion split (the Q-Morph front's `Timing` is not
+    // preserved by `generate`).
     let timing = Timing {
         triangulation: 0.0,
         conversion: 0.0,
@@ -220,6 +455,10 @@ pub fn generate_quad(
     };
     let refusals = crate::qmorph::Refusals::default();
     if !gate.passes() {
+        // Carry the mesh, exactly as `mesh_quads` does: the caller may draw or
+        // inspect the failure, but must not ship it as an accepted result.
+        // `raw_gate` is the same measurement here because this adapter has no
+        // post-conversion gate separate from the accepted-mesh gate.
         return Err(QuadError::Unsupported(Box::new(Unsupported {
             gate,
             raw_gate: gate,
