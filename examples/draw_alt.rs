@@ -141,10 +141,19 @@ fn main() {
             continue;
         };
         let corner_before = verify::corner_offset(&domain, &mesh);
-        post_pass(&domain, &mut mesh, size);
+        // Show the route's intended output: its raw mesh when that passes the
+        // gate, otherwise the shared post-pass (some routes rely on it, and for
+        // the structured O-grid the post-pass is harmful).
+        let raw_gate = verify::gate(&mesh);
+        let applied = if raw_gate.passes() {
+            "raw"
+        } else {
+            post_pass(&domain, &mut mesh, size);
+            "post"
+        };
         let gate = verify::gate(&mesh);
         let title = format!(
-            "{name} — {label}: {} quads, {} tri, SJ {:.3}, {:.1}°, off {:.1e}, corner {:.1e}",
+            "{name} — {label} ({applied}): {} quads, {} tri, SJ {:.3}, {:.1}°, off {:.1e}, corner {:.1e}",
             gate.quads,
             gate.triangles,
             gate.min_scaled_jacobian,
@@ -161,7 +170,7 @@ fn main() {
         let path = format!("figures/alts/{name}-{label}.png");
         draw::draw_domain_with_mesh(&domain, &mesh, &path, &opts).unwrap();
         println!(
-            "{label:8} q {:5} tri {:3} SJ {:.3} ang {:.1} off {:.1e} corner {:.1e} (was {:.1e}) {} -> {path}",
+            "{label:8} {applied:4} q {:5} tri {:3} SJ {:.3} ang {:.1} off {:.1e} corner {:.1e} (was {:.1e}) {} -> {path}",
             gate.quads,
             gate.triangles,
             gate.min_scaled_jacobian,
