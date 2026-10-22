@@ -108,6 +108,9 @@ pub enum QuadError {
     /// The pipeline finished but the mesh cannot meet the gate. This
     /// configuration is outside the supported set for now.
     Unsupported(Box<Unsupported>),
+    /// An alternative route (see [`crate::config::MeshConfig`]) could not
+    /// produce a mesh at all; the string is its error.
+    Route(String),
 }
 
 impl std::fmt::Display for QuadError {
@@ -115,6 +118,7 @@ impl std::fmt::Display for QuadError {
         match self {
             QuadError::Input(e) => write!(f, "{e}"),
             QuadError::Unsupported(u) => write!(f, "not supported yet: {}", u.reason),
+            QuadError::Route(e) => write!(f, "route failed: {e}"),
         }
     }
 }

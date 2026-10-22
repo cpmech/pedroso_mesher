@@ -15,8 +15,10 @@ use crate::sun;
 use crate::two_d::{smooth_mesh, Domain};
 
 /// Options for [`smooth`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SmoothOptions {
+    /// Run the smoother at all (default true).
+    pub enabled: bool,
     /// Node-relaxation sweeps (interior nodes only).
     pub iterations: usize,
     /// Also let boundary nodes slide along the polyline (off by default).
@@ -34,6 +36,7 @@ pub struct SmoothOptions {
 impl Default for SmoothOptions {
     fn default() -> Self {
         Self {
+            enabled: true,
             iterations: 10,
             move_boundary: false,
             improve_angles: true,
@@ -58,6 +61,16 @@ pub struct SmoothOutcome {
 /// Smooth a mesh after a generator.
 pub fn smooth(domain: &Domain, mesh: &Mesh, size: f64, options: &SmoothOptions) -> SmoothOutcome {
     let before = MeshStatistics::of(domain, mesh);
+    if !options.enabled
+        || (options.iterations == 0 && !options.improve_angles && options.perturb_rounds == 0)
+    {
+        return SmoothOutcome {
+            before: before.clone(),
+            after: before,
+            smoothed: mesh.clone(),
+            accepted: true,
+        };
+    }
     let mut work = mesh.clone();
     if options.move_boundary {
         smooth_mesh(&mut work, domain, options.iterations.max(1), size);
