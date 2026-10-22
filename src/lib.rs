@@ -18,6 +18,7 @@
 //! ```
 
 pub mod bench;
+pub mod grid;
 pub mod io;
 pub mod mesh;
 pub mod msh;
