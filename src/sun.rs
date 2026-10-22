@@ -1201,7 +1201,12 @@ impl WalkMesh {
                 return false;
             }
         };
-        let region_ids: Vec<usize> = region.iter().copied().collect();
+        // Deterministic: the ids are removed in this order, and `remove` leaves a
+        // hole that later cells' ids are measured against. Sorting keeps the
+        // removal order (and therefore the cell ids) independent of `HashSet`
+        // iteration order; the area sum is commutative either way.
+        let mut region_ids: Vec<usize> = region.iter().copied().collect();
+        region_ids.sort_unstable();
         let mut original_area = 0.0;
         for &id in &region_ids {
             if let Some(cell) = self.cell(id) {
@@ -2050,9 +2055,14 @@ pub fn perturb_low_quads(
         score
     };
     let mut moved = 0usize;
+    // Deterministic: when two nodes have the same best score the first one visited
+    // wins, so the visit order must not come from the `HashMap` seed. Ascending
+    // node id is the canonical order; the score rule itself is unchanged.
+    let mut nodes: Vec<usize> = incident.keys().copied().collect();
+    nodes.sort_unstable();
     for _ in 0..rounds {
         let mut best: Option<(f64, usize, [f64; 2])> = None;
-        for &v in incident.keys() {
+        for &v in &nodes {
             let current = margin(&pts, v);
             if current >= 1.0 {
                 continue;

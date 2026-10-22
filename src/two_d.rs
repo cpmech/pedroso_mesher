@@ -599,7 +599,16 @@ fn cleanup(mesh: &mut Mesh, max_rounds: usize) -> usize {
                 .sum()
         };
 
-        for ((a, b), owners) in edges.clone() {
+        // Deterministic: `HashMap` iteration order is randomised per process, and
+        // each swap mutates the mesh the next candidate is measured on. Visiting
+        // the keys in ascending order makes the same binary produce the same mesh;
+        // it changes only the order equal-cost swaps are considered in.
+        let mut keys: Vec<(usize, usize)> = edges.keys().copied().collect();
+        keys.sort_unstable();
+        for (a, b) in keys {
+            let Some(owners) = edges.get(&(a, b)).cloned() else {
+                continue;
+            };
             if owners.len() != 2 {
                 continue;
             }
@@ -1001,8 +1010,17 @@ pub fn pair_triangles_with(
         }
     }
 
+    // Deterministic: the blossom matching takes the edges in insertion order, and
+    // the result among equal-weight candidates depends on it. Collecting the keys
+    // and sorting them makes the edge list independent of `HashMap` order; the
+    // matching rule itself is unchanged.
+    let mut keys: Vec<(usize, usize)> = edge_to_tris.keys().copied().collect();
+    keys.sort_unstable();
     let mut edges: Vec<(usize, usize, i32)> = Vec::new();
-    for owners in edge_to_tris.values() {
+    for key in keys {
+        let Some(owners) = edge_to_tris.get(&key) else {
+            continue;
+        };
         if owners.len() != 2 {
             continue;
         }
@@ -1248,7 +1266,12 @@ fn leftover_components(unpaired: &[[usize; 3]]) -> Vec<Vec<[usize; 3]>> {
         let root = find(&mut parent, i);
         groups.entry(root).or_default().push(unpaired[i]);
     }
-    groups.into_values().collect()
+    // Deterministic: components are closed in this order and appended to the
+    // mesh, so `HashMap` order would reorder the cells. Lowest component root
+    // (the smallest triangle index) first.
+    let mut groups: Vec<(usize, Vec<[usize; 3]>)> = groups.into_iter().collect();
+    groups.sort_unstable_by_key(|(root, _)| *root);
+    groups.into_iter().map(|(_, group)| group).collect()
 }
 
 /// The cascade for one triangle, or `None` if it cannot be completed.

@@ -309,4 +309,67 @@ mod tests {
         assert!(out.smoothing.is_some());
         assert_eq!(out.statistics.quads, out.before.quads);
     }
+
+    /// The stepped part of the route measurements (the one whose quad count used
+    /// to alternate between 2197 and 2198).
+    fn stepped() -> Domain {
+        Domain::new(
+            vec![
+                [0.0, 0.0],
+                [60.0, 0.0],
+                [60.0, 40.0],
+                [30.0, 40.0],
+                [30.0, 30.0],
+                [20.0, 30.0],
+                [20.0, 40.0],
+                [0.0, 40.0],
+            ],
+            vec![],
+        )
+        .unwrap()
+    }
+
+    /// Two runs of the same configuration, in the same process, must produce
+    /// identical meshes.
+    ///
+    /// The hash collections in the shared stages are iterated in a canonical
+    /// (sorted-key) order precisely so that this holds: before that, the process
+    /// hash seed changed cavity/removal order, matching edge order and node
+    /// perturbation order, and the same binary returned 2197 or 2198 quads on the
+    /// stepped part depending on the run.
+    #[test]
+    fn two_generations_in_one_process_are_identical() {
+        // The all-quad cascade is the most order-sensitive two_d path.
+        let plate = Domain::plate_with_hole(20.0, 12.0, 3.0, 16).unwrap();
+        let sizing = Sizing::uniform(2.0).unwrap().all_quad();
+        let first = crate::two_d::mesh_2d(&plate, &sizing).unwrap();
+        let again = crate::two_d::mesh_2d(&plate, &sizing).unwrap();
+        assert_eq!(
+            first.mesh.points, again.mesh.points,
+            "two_d::mesh_2d moved its points between in-process runs"
+        );
+        assert_eq!(
+            first.mesh.cells, again.mesh.cells,
+            "two_d::mesh_2d changed its cells between in-process runs"
+        );
+
+        let stepped = stepped();
+        // Coarse enough to keep the test quick; at this size the matching used to
+        // pick different equal-weight pairs under two hash seeds.
+        let sizing = Sizing::uniform(1.75).unwrap();
+        let mut config = MeshConfig::new(Route::Crossfield);
+        // The generator is what the hash order reaches; the smoother is a fixed
+        // Jacobi/objective sweep and only multiplies the test's cost.
+        config.smoothing.enabled = false;
+        let first = generate(&stepped, &sizing, &config).unwrap();
+        let again = generate(&stepped, &sizing, &config).unwrap();
+        assert_eq!(
+            first.mesh.points, again.mesh.points,
+            "crossfield moved its points between in-process runs"
+        );
+        assert_eq!(
+            first.mesh.cells, again.mesh.cells,
+            "crossfield changed its cells between in-process runs"
+        );
+    }
 }
