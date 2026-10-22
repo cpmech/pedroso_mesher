@@ -87,3 +87,5 @@ pub mod simons_sizefamily;
 pub mod simons_channel;
 
 pub mod sized;
+
+pub mod simons_smooth;

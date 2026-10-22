@@ -14,10 +14,13 @@
 //! interior. Feeding the GODF/QGP interior into the channel is the remaining
 //! integration step, documented in the vault.
 //!
-//! Supported: rectangle-like domains, including one or more holes, where the
-//! surviving interior grid is large enough for the channel ribbon to span.
-//! Non-convex domains whose grid interior degenerates to a thin staircase (the
-//! l-bracket is the corpus example) return a clean `Err`.
+//! Supported: rectangle-like domains, including holes (the plate-with-hole
+//! family, 4/2/1 mm), and the rectilinear non-convex parts (l-bracket, stepped)
+//! where the adaptive channel width (thesis 1.4 h, then 1.0 h, then 0.7 h) lets
+//! the interior grid reach close enough to the boundary for the cover to close
+//! the remaining band. The quarter-annulus ring still fails: its curved
+//! staircase channel leaves a leftover that neither the ribbon nor the template
+//! cover can close, and it returns a clean `Err`.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,9 +31,9 @@ use crate::two_d::{Domain, Sizing};
 /// Options for the size-driven route.
 ///
 /// The thesis exposes the channel width, the grid orientation/offset and the
-/// patch-cover search as knobs. The current implementation fixes the channel
-/// width at the thesis's 1.4 h and the grid at the domain's axes; the struct is
-/// kept so that the config layer has a stable type to extend.
+/// patch-cover search as knobs. The current implementation tries the channel
+/// widths 1.4 h, 1.0 h and 0.7 h and keeps the domain axes; the struct is kept
+/// so that the config layer has a stable type to extend.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Options {}
 

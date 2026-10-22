@@ -148,12 +148,13 @@ pub enum Route {
     /// **Sized** — direct (the Simons 2024 thesis pipeline). Chapter 2 grid and
     /// boundary channel (`simons_channel`); Chapters 3–5 are available as
     /// `simons_godf`, `simons_sizefamily` and `simons_qgp`. Character: a
-    /// regular grid interior, a carved channel and a boundary ribbon, all-quad
-    /// and exactly on the boundary. Measured table: `examples/alt_*` do not
-    /// cover it; `src/sized.rs` tests a 10 x 10 square (60 quads, SJ 0.707,
-    /// 45–135 degrees, cracks 0) and `simons_channel` a square with a hole.
-    /// Non-convex domains whose grid interior degenerates (l-bracket) return a
-    /// clean error.
+    /// regular grid interior, a carved channel and a boundary ribbon (or the
+    /// template cover), all-quad and exactly on the boundary. Measured table
+    /// (`generate -- sized <part>`, with the shared smoother): plate-hole 4 mm
+    /// 262 quads SJ 0.440 / 44.6 degrees, 2 mm 1240 / 0.456 / 44.6,
+    /// 1 mm 5324 / 0.495 / 44.8; l-bracket 600 / 1.000 / 90 degrees and stepped
+    /// 2300 / 1.000 / 90 (perfect grids). The ring returns a clean error: its
+    /// curved staircase channel cannot be closed by the current cover.
     Sized,
 }
 

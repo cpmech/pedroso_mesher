@@ -63,11 +63,23 @@
 //!   1.4e-14, quality verdict Acceptable (PASS). At h = 2: 1240 quads (1040 +
 //!   200), min SJ 0.2868, angles 19.81°–163.33°, aspect 6.15, cracks 0,
 //!   offset 1.4e-14, Acceptable.
-//! * L-bracket, h = 1: the grid + channel construction works (2 loops), but
-//!   the cull leaves only a thin staircase-shaped interior grid strip, so the
-//!   matched ribbon cannot span the wide legs and the mesher returns an error.
-//!   Corner fans (the 3/4/5-quad stitches) and the thesis' patch cover are what
-//!   this case needs; they are not finished.
+//! * **Corpus l-bracket** (80×60 section, size 2): 600 quads (464 interior
+//!   grid + 136 channel) at an adaptive channel width δ = 1.0h, min SJ 1.0000,
+//!   angles 90°–90°, aspect 1.00, cracks 0, boundary offset 0, verdict
+//!   Acceptable. The thesis-default δ = 1.4h leaves only a thin staircase grid
+//!   strip and fails; at δ = 1.0h the template/greedy path closes the channel
+//!   with perfect grid quads. `build` therefore tries δ = 1.4h, 1.0h, 0.7h in
+//!   order (see `ADAPTIVE_DELTAS`).
+//! * **Corpus stepped section** (60×40 with a notch, size 1): 2300 quads
+//!   (2084 interior + 216 channel), same δ = 1.0h path, min SJ 1.0000,
+//!   angles 90°–90°, aspect 1.00, cracks 0, offset 0, Acceptable.
+//! * **Corpus ring section** (quarter annulus, R20/R10, size 1): **not
+//!   meshed**. The curved staircase channel leaves a leftover region that
+//!   neither the ribbon nor the greedy-cover fallback can close at δ = 1.4h,
+//!   1.0h or 0.7h. This is the remaining corpus failure.
+//! * The small 10×10 L-bracket of the earlier tests still has a thin staircase
+//!   grid strip at every tried δ and remains unmarshalled; the corpus L (wide
+//!   legs, size 2) is the case that now passes.
 //!
 //! * **Covering (§2.2.7–2.2.9)**: the full megapatch/widest-path search is not
 //!   implemented. Patches are scored and selected by a greedy cover: repeatedly
@@ -79,12 +91,24 @@
 //!   domain-perimeter split when a leftover polygon has an odd number of sides.
 //!   The statistics report the fraction of the channel area the greedy cover
 //!   filled and the number of fallback regions/quads.
-//! * **Odd-sided patches (5 and 7 sides)** are kept as candidates, as the
-//!   thesis requires, but they are not used by the cover: the thesis meshes
-//!   them by splitting a long cross edge at its midpoint, and this
-//!   implementation does not split cross edges (that would require every
-//!   neighbouring patch to agree on the split). Their area therefore goes to
-//!   the fallback.
+//! * **Cross-edge midpoint splits (§2.2.5) are not implemented.** Odd-sided
+//!   patches (5 and 7 sides) are kept as candidates but not quadrangulated:
+//!   splitting a shared cross edge would require every neighbouring patch to
+//!   agree on the split. Their area goes to the fallback.
+//! * **Megapatches and the widest-path cover (§2.2.7–2.2.8) are not
+//!   implemented.** The widest-path machinery exists only as the A/B/C ribbon
+//!   dynamic program (`dp_ribbon`): strip quads plus caps that absorb a
+//!   loop-count mismatch. Its caps are degenerate when three consecutive
+//!   boundary vertices are collinear, which is exactly the common case on a
+//!   straight run, so it does not close the wide-leg corpus channels. What
+//!   unlocked the corpus L and stepped sections instead was the adaptive
+//!   channel width above, which keeps the regular grid close enough to the
+//!   boundary that the ordinary template cover closes the remaining thin band.
+//! * **Adaptive channel width**: `build` tries δ = 1.4h, then 1.0h, then 0.7h,
+//!   returning the first valid all-quad mesh. This deviates from the thesis'
+//!   fixed δ = 1.4h, but it is what lets the corpus L and stepped sections
+//!   pass while preserving the thesis-default results on the square and plate
+//!   family.
 //! * **6-sided, 3-Steiner template**: for a *convex* hexagon this topology is
 //!   necessarily degenerate — the only two combinatorial configurations are a
 //!   doublet (two quads sharing two edges) or a central triangular hole. The
@@ -130,6 +154,11 @@ use crate::two_d::Domain;
 pub const DELTA_FACTOR: f64 = 1.4;
 /// Maximum length of a candidate cross edge, in units of `h` (§2.2.3).
 pub const CROSS_REACH_FACTOR: f64 = 4.0;
+
+/// Channel widths tried, in order, when the default 1.4h channel cannot be
+/// closed. Narrower channels leave the regular grid closer to the boundary,
+/// which is what the wide-leg sections of the corpus need.
+pub const ADAPTIVE_DELTAS: [f64; 3] = [1.4, 1.0, 0.7];
 /// Maximum number of joining steps when growing a patch (§2.2.4).
 const MAX_GLUES: usize = 3;
 
@@ -171,6 +200,8 @@ pub struct ChannelStats {
     /// Which construction produced the mesh: "boundary-ribbon" or
     /// "templates+greedy".
     pub method: &'static str,
+    /// Channel-width factor used (1.4 is the thesis default).
+    pub delta_factor: f64,
     /// Grid vertices that survived the cull.
     pub grid_vertices: usize,
     /// Quads promoted from the regular grid.
@@ -219,6 +250,7 @@ pub struct ChannelStats {
 #[derive(Clone, Debug, Default)]
 pub struct CaseNumbers {
     pub method: String,
+    pub delta_factor: f64,
     pub quads: usize,
     pub interior_quads: usize,
     pub channel_quads: usize,
@@ -271,7 +303,7 @@ pub fn mesh_with_stats(domain: &Domain, size: f64) -> Result<(Mesh, ChannelStats
 /// plus the inner grid edges walked in the opposite direction. Loops are
 /// ordered with the channel on their left.
 pub fn channel(domain: &Domain, size: f64) -> Result<Vec<ChannelLoop>, String> {
-    let prepared = prepare(domain, size)?;
+    let prepared = prepare(domain, size, DELTA_FACTOR)?;
     let mut loops = Vec::with_capacity(prepared.loops.len());
     for raw in &prepared.loops {
         let mut points = Vec::with_capacity(raw.points.len());
@@ -339,6 +371,7 @@ fn case_numbers(domain: &Domain, size: f64) -> Result<CaseNumbers, String> {
     let (_, stats) = mesh_with_stats(domain, size)?;
     Ok(CaseNumbers {
         method: stats.method.to_string(),
+        delta_factor: stats.delta_factor,
         quads: stats.quads,
         interior_quads: stats.interior_quads,
         channel_quads: stats.channel_quads,
@@ -406,7 +439,7 @@ impl Prepared {
     }
 }
 
-fn prepare(domain: &Domain, size: f64) -> Result<Prepared, String> {
+fn prepare(domain: &Domain, size: f64, delta: f64) -> Result<Prepared, String> {
     let h = check_request(domain, size)?;
     let mut pos: Vec<[f64; 2]> = Vec::new();
     let (boundary_loops, domain_edges) = discretize_boundary(domain, h, &mut pos)?;
@@ -422,7 +455,7 @@ fn prepare(domain: &Domain, size: f64) -> Result<Prepared, String> {
     for j in -1..=ny {
         for i in -1..=nx {
             let p = [ox + i as f64 * h, oy + j as f64 * h];
-            if domain.contains(p) && domain.distance_to_boundary(p) + 1.0e-9 >= DELTA_FACTOR * h {
+            if domain.contains(p) && domain.distance_to_boundary(p) + 1.0e-9 >= delta * h {
                 let id = pos.len();
                 pos.push(p);
                 vertex.insert((i, j), id);
@@ -1906,7 +1939,9 @@ fn fix_component(
     pos: &mut Vec<[f64; 2]>,
     domain_edges: &HashSet<(usize, usize)>,
 ) -> Result<(), String> {
-    let loops = component_loops(component, faces, splits)?;
+    // A degenerate leftover (for example a triangle) cannot be looped; skip
+    // straight to absorbing a neighbour, which grows it into a fillable region.
+    let loops = component_loops(component, faces, splits).unwrap_or_default();
     // A parity fix is the only thing a perimeter split can contribute: an even
     // region that the fan could not fill is concave, and adding a collinear
     // point does not help it. Grow the region by absorbing a neighbour instead.
@@ -1994,16 +2029,20 @@ struct BuildOutput {
 /// If it fails, the thesis path (grid + cross-edge patches + greedy cover) is
 /// attempted.
 fn build(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
-    let ribbon_error = match build_ribbon(domain, size) {
-        Ok(output) => return Ok(output),
-        Err(error) => error,
-    };
-    match build_templates(domain, size) {
-        Ok(output) => Ok(output),
-        Err(template_error) => Err(format!(
-            "boundary ribbon failed: {ribbon_error}; template channel failed: {template_error}"
-        )),
+    let mut last_error = String::new();
+    for delta in ADAPTIVE_DELTAS {
+        match build_ribbon_with_delta(domain, size, delta) {
+            Ok(output) => return Ok(output),
+            Err(error) => last_error = format!("delta={delta:.2}h ribbon: {error}"),
+        }
+        match build_templates_with_delta(domain, size, delta) {
+            Ok(output) => return Ok(output),
+            Err(error) => last_error.push_str(&format!("; delta={delta:.2}h templates: {error}")),
+        }
     }
+    Err(format!(
+        "the channel could not be closed at any tried width ({last_error})"
+    ))
 }
 
 struct GridLoop {
@@ -2012,62 +2051,58 @@ struct GridLoop {
     area: f64,
 }
 
-fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
-    let prepared = prepare(domain, size)?;
+fn build_ribbon_with_delta(domain: &Domain, size: f64, delta: f64) -> Result<BuildOutput, String> {
+    let prepared = prepare(domain, size, delta)?;
+    let mut boundary: Vec<LoopData> = Vec::new();
     let mut grid: Vec<GridLoop> = Vec::new();
-    for raw in prepared
-        .loops
-        .iter()
-        .filter(|raw| raw.source == LoopSource::Grid)
-    {
+    for raw in &prepared.loops {
         let mut points = Vec::with_capacity(raw.points.len());
         for &id in &raw.points {
             let Some(&point) = prepared.pos.get(id) else {
-                return Err("internal error: grid loop point missing".into());
+                return Err("internal error: loop point missing".into());
             };
             points.push(point);
         }
-        let area = polygon_area_points(&points);
-        grid.push(GridLoop {
-            points,
-            ids: raw.points.clone(),
-            area,
-        });
+        match raw.source {
+            LoopSource::Boundary => boundary.push(LoopData {
+                points,
+                ids: raw.points.clone(),
+            }),
+            LoopSource::Grid => {
+                let area = polygon_area_points(&points);
+                grid.push(GridLoop {
+                    points,
+                    ids: raw.points.clone(),
+                    area,
+                });
+            }
+        }
+    }
+    if boundary.is_empty() {
+        return Err("the domain has no boundary loop".into());
     }
 
     let mut pos = prepared.pos.clone();
     let mut channel_quads: Vec<[usize; 4]> = Vec::new();
     let mut ribbons = 0usize;
     let mut worst_rank = f64::INFINITY;
+    let outer_loop = &boundary[0];
 
     if grid.is_empty() {
         // No interior grid: one ribbon between the outer boundary and the
-        // (single) domain hole, as before.
-        if domain.holes.len() != 1 {
+        // (single) domain hole.
+        if domain.holes.len() != 1 || boundary.len() != 2 {
             return Err(
                 "the boundary ribbon with an empty grid supports exactly one domain hole".into(),
             );
         }
-        let hole_raw = match prepared
-            .loops
-            .iter()
-            .filter(|raw| raw.source == LoopSource::Boundary)
-            .nth(1)
-        {
-            Some(raw) => raw,
-            None => return Err("internal error: missing domain hole loop".into()),
-        };
-        let mut hole_points = Vec::with_capacity(hole_raw.points.len());
-        for &id in &hole_raw.points {
-            let Some(&point) = prepared.pos.get(id) else {
-                return Err("internal error: hole loop point missing".into());
-            };
-            hole_points.push(point);
-        }
+        let hole_loop = &boundary[1];
         let (count, rank) = add_ribbon(
             &domain.outer,
-            &hole_points,
-            &hole_raw.points,
+            &outer_loop.points,
+            &outer_loop.ids,
+            &hole_loop.points,
+            &hole_loop.ids,
             true,
             "outer boundary <-> domain hole",
             &mut pos,
@@ -2083,6 +2118,8 @@ fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
         }
         let (count, rank) = add_ribbon(
             &domain.outer,
+            &outer_loop.points,
+            &outer_loop.ids,
             &grid[0].points,
             &grid[0].ids,
             true,
@@ -2093,8 +2130,8 @@ fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
         ribbons += count;
         worst_rank = worst_rank.min(rank);
     } else {
-        // The channel has several loops: pair the largest grid loop (the outer
-        // grid boundary) with the domain outer loop, and each remaining grid
+        // Several channel loops: the largest grid loop (the outer grid
+        // boundary) pairs with the domain outer loop, every remaining grid
         // loop (a grid hole) with the domain hole it surrounds.
         let mut order: Vec<usize> = (0..grid.len()).collect();
         order.sort_by(|&a, &b| {
@@ -2107,6 +2144,8 @@ fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
         let outer_index = order[0];
         let (count, rank) = add_ribbon(
             &domain.outer,
+            &outer_loop.points,
+            &outer_loop.ids,
             &grid[outer_index].points,
             &grid[outer_index].ids,
             true,
@@ -2122,8 +2161,13 @@ fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
             let hole_index =
                 choose_hole_for_grid_loop(&domain.holes, &used_holes, &grid[grid_index].points)?;
             used_holes[hole_index] = true;
+            let Some(hole_loop) = boundary.get(hole_index + 1) else {
+                return Err("internal error: missing prepared domain hole loop".into());
+            };
             let (count, rank) = add_ribbon(
                 &domain.holes[hole_index],
+                &hole_loop.points,
+                &hole_loop.ids,
                 &grid[grid_index].points,
                 &grid[grid_index].ids,
                 false,
@@ -2176,6 +2220,7 @@ fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
     quads.extend(channel_quads.iter().copied());
     let mut stats = ChannelStats {
         method: "boundary-ribbon",
+        delta_factor: delta,
         grid_vertices: prepared.grid_vertex_count,
         interior_quads: prepared.quads.len(),
         channel_loops: prepared.loops.len(),
@@ -2193,6 +2238,11 @@ fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
         ..ChannelStats::default()
     };
     finish_mesh(pos, quads, domain, &mut stats)
+}
+
+struct LoopData {
+    points: Vec<[f64; 2]>,
+    ids: Vec<usize>,
 }
 
 /// Choose the domain hole nested inside a grid hole loop.
@@ -2243,14 +2293,255 @@ fn choose_hole_for_grid_loop(
     }
 }
 
-/// Add one ribbon between a `free` domain boundary loop (which may be
-/// re-discretized) and a `fixed` grid loop whose vertex ids must be preserved.
+/// Widest-path ribbon between a full-resolution outer loop and an inner grid
+/// loop (§2.2.7–2.2.8 in miniature).
 ///
-/// `free_is_outer` says whether the domain loop is the outer side of the band
-/// (the domain outer boundary around the grid) or the inner side (a domain hole
-/// inside a grid hole loop).
+/// States are cross edges `(i, j)`: outer vertex `i` joined to inner vertex
+/// `j`. Three quad types move between states and consume boundary edges:
+/// * `A` — a strip quad, one outer edge + one inner edge, `(i,j)->(i+1,j+1)`;
+/// * `B` — an outer cap/fan quad (three outer vertices + one inner vertex),
+///   two outer edges, `(i,j)->(i+2,j)`;
+/// * `C` — an inner cap/fan quad (one outer vertex + three inner vertices),
+///   two inner edges, `(i,j)->(i,j+2)`.
+///
+/// A path from `(0,0)` to `(m,n)` covers the annulus exactly once and absorbs
+/// the loop-count mismatch at the caps. The path is chosen by a widest-path
+/// (max-min rank) dynamic program, which is the role of the thesis' widest
+/// path. Different rotational offsets between the loops are tried.
+fn dp_ribbon(
+    outer: &[usize],
+    inner: &[usize],
+    pos: &[[f64; 2]],
+    expected_area: f64,
+) -> Result<(Vec<[usize; 4]>, f64), String> {
+    let m = outer.len();
+    let n = inner.len();
+    if m < 3 || n < 3 {
+        return Err("the ribbon loops are too short".into());
+    }
+    if !(m + n).is_multiple_of(2) {
+        return Err("the ribbon loops have odd total length".into());
+    }
+    let width = n + 1;
+    let states = (m + 1) * width;
+    if states > 4_000_000 {
+        return Err("the ribbon DP state space is too large".into());
+    }
+
+    let mut offsets: Vec<usize> = Vec::new();
+    let mut add_offset = |value: i64| {
+        let offset = value.rem_euclid(n as i64) as usize;
+        if !offsets.contains(&offset) {
+            offsets.push(offset);
+        }
+    };
+    let nearest_inner = |point: [f64; 2]| -> usize {
+        let mut best = 0usize;
+        let mut best_distance = f64::INFINITY;
+        for (index, &id) in inner.iter().enumerate() {
+            if let Some(&p) = pos.get(id) {
+                let d = point_distance(point, p);
+                if d < best_distance {
+                    best_distance = d;
+                    best = index;
+                }
+            }
+        }
+        best
+    };
+    if let Some(&first) = outer.first().and_then(|&id| pos.get(id)) {
+        let near = nearest_inner(first) as i64;
+        for delta in -3..=3 {
+            add_offset(near + delta);
+        }
+    }
+    // Align corners: for sampled outer vertices, the offset that maps them to
+    // their nearest inner vertex.
+    let stride = if m <= 80 { 1 } else { m / 40 + 1 };
+    for i in (0..m).step_by(stride) {
+        if let Some(&point) = outer.get(i).and_then(|&id| pos.get(id)) {
+            let j = nearest_inner(point) as i64;
+            add_offset(j + i as i64);
+        }
+    }
+    if n <= 80 {
+        for offset in 0..n {
+            add_offset(offset as i64);
+        }
+    }
+    if offsets.len() > 64 {
+        offsets.truncate(64);
+    }
+
+    let tolerance = 1.0e-6 * expected_area.max(1.0);
+    let mut best: Option<(f64, Vec<[usize; 4]>)> = None;
+
+    for &offset in &offsets {
+        let mut value = vec![f64::NEG_INFINITY; states];
+        let mut previous: Vec<Option<(usize, usize, u8)>> = vec![None; states];
+        let mut previous_quad: Vec<[usize; 4]> = vec![[0; 4]; states];
+        value[0] = f64::INFINITY;
+
+        for i in 0..=m {
+            for j in 0..=n {
+                let index = i * width + j;
+                let current = value[index];
+                if current == f64::NEG_INFINITY {
+                    continue;
+                }
+                // A: strip quad. The inner loop is walked backwards (its
+                // stored orientation is the inner side of the band), so the
+                // two cross edges of the quad do not cross each other.
+                if i < m && j < n {
+                    let a = (offset + n - j % n) % n;
+                    let g0 = inner[a];
+                    let g1 = inner[(a + 1) % n];
+                    let quad = [outer[i], outer[(i + 1) % m], g0, g1];
+                    if let Some(rank) = dp_quad_rank(&quad, pos) {
+                        relax_dp(
+                            &mut value,
+                            &mut previous,
+                            &mut previous_quad,
+                            width,
+                            (i, j),
+                            (i + 1, j + 1),
+                            current.min(rank),
+                            1,
+                            quad,
+                        );
+                    }
+                }
+                // B: outer cap (two outer edges, one inner vertex).
+                if i + 2 <= m {
+                    let a = (offset + n - j % n) % n;
+                    let g = inner[a];
+                    let quad = [outer[i], outer[(i + 1) % m], outer[(i + 2) % m], g];
+                    if let Some(rank) = dp_quad_rank(&quad, pos) {
+                        relax_dp(
+                            &mut value,
+                            &mut previous,
+                            &mut previous_quad,
+                            width,
+                            (i, j),
+                            (i + 2, j),
+                            current.min(rank),
+                            2,
+                            quad,
+                        );
+                    }
+                }
+                // C: inner cap (one outer vertex, two inner edges).
+                if j + 2 <= n {
+                    let o = outer[i % m];
+                    let a = (offset + n - j % n) % n;
+                    let g0 = inner[a];
+                    let g1 = inner[(a + 1) % n];
+                    let g2 = inner[(a + 2) % n];
+                    let quad = [o, g0, g1, g2];
+                    if let Some(rank) = dp_quad_rank(&quad, pos) {
+                        relax_dp(
+                            &mut value,
+                            &mut previous,
+                            &mut previous_quad,
+                            width,
+                            (i, j),
+                            (i, j + 2),
+                            current.min(rank),
+                            3,
+                            quad,
+                        );
+                    }
+                }
+            }
+        }
+
+        let end = m * width + n;
+        let rank = value[end];
+        if rank == f64::NEG_INFINITY {
+            continue;
+        }
+        // Reconstruct.
+        let mut quads: Vec<[usize; 4]> = Vec::new();
+        let mut cursor = (m, n);
+        let mut guard = 0usize;
+        while cursor != (0, 0) {
+            let index = cursor.0 * width + cursor.1;
+            let Some((pi, pj, _action)) = previous[index] else {
+                break;
+            };
+            quads.push(previous_quad[index]);
+            cursor = (pi, pj);
+            guard += 1;
+            if guard > m + n + 4 {
+                break;
+            }
+        }
+        if cursor != (0, 0) {
+            continue;
+        }
+        quads.reverse();
+        let total: f64 = quads
+            .iter()
+            .map(|quad| quad_area([pos[quad[0]], pos[quad[1]], pos[quad[2]], pos[quad[3]]]))
+            .sum();
+        if (total - expected_area).abs() > tolerance {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((current, _)) => rank > *current,
+        };
+        if better {
+            best = Some((rank, quads));
+        }
+    }
+    match best {
+        Some((rank, quads)) => Ok((quads, rank)),
+        None => Err("the widest-path ribbon found no valid cover".into()),
+    }
+}
+
+fn dp_quad_rank(quad: &[usize; 4], pos: &[[f64; 2]]) -> Option<f64> {
+    let corners = [
+        *pos.get(quad[0])?,
+        *pos.get(quad[1])?,
+        *pos.get(quad[2])?,
+        *pos.get(quad[3])?,
+    ];
+    quad_angle_rank(corners)
+}
+
+fn relax_dp(
+    value: &mut [f64],
+    previous: &mut [Option<(usize, usize, u8)>],
+    previous_quad: &mut [[usize; 4]],
+    width: usize,
+    origin: (usize, usize),
+    next: (usize, usize),
+    candidate: f64,
+    action: u8,
+    quad: [usize; 4],
+) {
+    let index = next.0 * width + next.1;
+    let better = candidate > value[index] + 1.0e-12
+        || (value[index] == f64::NEG_INFINITY && candidate.is_finite());
+    if better {
+        value[index] = candidate;
+        previous[index] = Some((origin.0, origin.1, action));
+        previous_quad[index] = quad;
+    }
+}
+
+/// Add one ribbon between a `free` domain boundary loop and a `fixed` grid
+/// loop whose vertex ids must be preserved.
+///
+/// Both the full-resolution loops (widest-path DP with caps) and the
+/// equal-count resampled strips are tried; the best-ranked valid result wins.
+/// `free_is_outer` says whether the domain loop is the outer side of the band.
 fn add_ribbon(
+    free_original: &[[f64; 2]],
     free_points: &[[f64; 2]],
+    free_ids: &[usize],
     fixed_points: &[[f64; 2]],
     fixed_ids: &[usize],
     free_is_outer: bool,
@@ -2258,59 +2549,82 @@ fn add_ribbon(
     pos: &mut Vec<[f64; 2]>,
     out: &mut Vec<[usize; 4]>,
 ) -> Result<(usize, f64), String> {
+    let (_free, free_ids) = clean_loop_with_ids(free_points, free_ids)?;
+    let free_original = clean_loop_points(free_original)?;
     let (fixed, fixed_ids) = clean_loop_with_ids(fixed_points, fixed_ids)?;
-    let n = fixed.len();
-    if n < 4 || !n.is_multiple_of(2) {
+    let fixed_len = fixed.len();
+    if fixed_len < 4 || !fixed_len.is_multiple_of(2) {
         return Err(format!(
-            "{label}: the fixed grid loop has {n} vertices, which cannot carry a ribbon"
+            "{label}: the fixed grid loop has {fixed_len} vertices, which cannot carry a ribbon"
         ));
     }
-    let free = clean_loop_points(free_points)?;
-    if free.len() > n {
-        return Err(format!(
-            "{label}: the domain loop has {} corners but the grid loop only {n} edges; \
-             preserving every domain vertex would need a fan",
-            free.len()
-        ));
+
+    let (mut outer_ids, mut inner_ids) = if free_is_outer {
+        (free_ids.clone(), fixed_ids.clone())
+    } else {
+        (fixed_ids.clone(), free_ids.clone())
+    };
+    if polygon_area_ids(pos, &outer_ids) < 0.0 {
+        outer_ids.reverse();
     }
-    let fixed_ccw = !free_is_outer;
+    if polygon_area_ids(pos, &inner_ids) > 0.0 {
+        inner_ids.reverse();
+    }
+    let band_area = polygon_area_ids(pos, &outer_ids) + polygon_area_ids(pos, &inner_ids);
+    if band_area <= EPS {
+        return Err(format!("{label}: the ribbon band has no area"));
+    }
 
     let mut best: Option<(f64, Vec<[usize; 4]>)> = None;
-    for candidate in [resample_polyline(&free, n), resample_matched(&free, &fixed)] {
-        let Ok(mut points) = candidate else {
-            continue;
-        };
-        if (polygon_area_points(&points) > 0.0) != free_is_outer {
-            points.reverse();
-        }
-        let mut fixed_sequence = fixed_ids.clone();
-        if (polygon_area_points(&fixed) > 0.0) != fixed_ccw {
-            fixed_sequence.reverse();
-        }
-        let mut free_ids: Vec<usize> = Vec::with_capacity(n);
-        for point in &points {
-            free_ids.push(pos.len());
-            pos.push(*point);
-        }
-        let (outer, inner) = if free_is_outer {
-            (free_ids.clone(), fixed_sequence.clone())
-        } else {
-            (fixed_sequence.clone(), free_ids.clone())
-        };
-        let pair_area = polygon_area_ids(pos, &outer) + polygon_area_ids(pos, &inner);
-        if pair_area <= EPS {
-            continue;
-        }
-        if let Ok((quads, rank)) = ribbon_quads(&outer, &inner, pos, pair_area) {
-            let better = match &best {
-                None => true,
-                Some((current, _)) => rank > *current,
+    // 1. Full-resolution loops with corner caps / fans (widest path).
+    if let Ok((quads, rank)) = dp_ribbon(&outer_ids, &inner_ids, pos, band_area) {
+        best = Some((rank, quads));
+    }
+
+    // 2. Equal-count resampled strips (the simple square/plate path).
+    if free_original.len() <= fixed_len {
+        for candidate in [
+            resample_polyline(&free_original, fixed_len),
+            resample_matched(&free_original, &fixed),
+        ] {
+            let Ok(mut points) = candidate else {
+                continue;
             };
-            if better {
-                best = Some((rank, quads));
+            if (polygon_area_points(&points) > 0.0) != free_is_outer {
+                points.reverse();
+            }
+            let mut fresh_ids: Vec<usize> = Vec::with_capacity(fixed_len);
+            for point in &points {
+                fresh_ids.push(pos.len());
+                pos.push(*point);
+            }
+            let (candidate_outer, candidate_inner) = if free_is_outer {
+                (fresh_ids.clone(), fixed_ids.clone())
+            } else {
+                (fixed_ids.clone(), fresh_ids.clone())
+            };
+            let mut candidate_outer = candidate_outer;
+            let mut candidate_inner = candidate_inner;
+            if polygon_area_ids(pos, &candidate_outer) < 0.0 {
+                candidate_outer.reverse();
+            }
+            if polygon_area_ids(pos, &candidate_inner) > 0.0 {
+                candidate_inner.reverse();
+            }
+            if let Ok((quads, rank)) =
+                ribbon_quads(&candidate_outer, &candidate_inner, pos, band_area)
+            {
+                let better = match &best {
+                    None => true,
+                    Some((current, _)) => rank > *current,
+                };
+                if better {
+                    best = Some((rank, quads));
+                }
             }
         }
     }
+
     match best {
         Some((rank, quads)) => {
             let count = quads.len();
@@ -2318,7 +2632,7 @@ fn add_ribbon(
             Ok((count, rank))
         }
         None => Err(format!(
-            "{label}: no rotation/direction of the resampled loops produced a valid ribbon"
+            "{label}: neither the width-path DP nor the resampled strip produced a valid ribbon"
         )),
     }
 }
@@ -2335,12 +2649,8 @@ fn clean_loop_points(points: &[[f64; 2]]) -> Result<Vec<[f64; 2]>, String> {
         out.push(point);
     }
     while out.len() > 1 {
-        let Some(first) = out.first().copied() else {
-            break;
-        };
-        let Some(last) = out.last().copied() else {
-            break;
-        };
+        let first = out[0];
+        let last = out[out.len() - 1];
         if (first[0] - last[0]).abs() <= EPS && (first[1] - last[1]).abs() <= EPS {
             out.pop();
         } else {
@@ -2673,8 +2983,12 @@ fn finish_mesh(
     })
 }
 
-fn build_templates(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
-    let prepared = prepare(domain, size)?;
+fn build_templates_with_delta(
+    domain: &Domain,
+    size: f64,
+    delta: f64,
+) -> Result<BuildOutput, String> {
+    let prepared = prepare(domain, size, delta)?;
     let cross_edges = build_cross_edges(&prepared, domain)?;
     let faces = build_faces(&prepared, &cross_edges, domain)?;
 
@@ -2910,6 +3224,7 @@ fn build_templates(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
 
     let stats = ChannelStats {
         method: "templates+greedy",
+        delta_factor: delta,
         grid_vertices: prepared.grid_vertex_count,
         interior_quads: prepared.quads.len(),
         channel_loops: prepared.loops.len(),
@@ -3369,6 +3684,105 @@ mod tests {
         assert!(stats.greedy_covered_fraction > 0.5);
         assert!(min_sj > 0.05, "min SJ too low: {min_sj}");
         assert!(min_angle > 10.0, "min angle too low: {min_angle}");
+    }
+
+    fn corpus_l_bracket() -> Domain {
+        valid_domain(vec![
+            [0.0, 0.0],
+            [80.0, 0.0],
+            [80.0, 20.0],
+            [20.0, 20.0],
+            [20.0, 60.0],
+            [0.0, 60.0],
+        ])
+    }
+
+    fn corpus_ring() -> Domain {
+        let mut outer: Vec<[f64; 2]> = (0..=24)
+            .map(|i| {
+                let a = std::f64::consts::FRAC_PI_2 * i as f64 / 24.0;
+                [20.0 * a.cos(), 20.0 * a.sin()]
+            })
+            .collect();
+        outer.extend((0..=12).map(|i| {
+            let a = std::f64::consts::FRAC_PI_2 * (1.0 - i as f64 / 12.0);
+            [10.0 * a.cos(), 10.0 * a.sin()]
+        }));
+        valid_domain(outer)
+    }
+
+    fn corpus_stepped() -> Domain {
+        valid_domain(vec![
+            [0.0, 0.0],
+            [60.0, 0.0],
+            [60.0, 40.0],
+            [30.0, 40.0],
+            [30.0, 30.0],
+            [20.0, 30.0],
+            [20.0, 40.0],
+            [0.0, 40.0],
+        ])
+    }
+
+    #[test]
+    fn dp_ribbon_smoke() {
+        let pos = vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 10.0],
+            [0.0, 10.0],
+            [2.0, 2.0],
+            [2.0, 8.0],
+            [8.0, 8.0],
+            [8.0, 2.0],
+        ];
+        let outer = [0usize, 1, 2, 3];
+        let inner = [4usize, 5, 6, 7];
+        println!("outer area {}", polygon_area_ids(&pos, &outer));
+        println!("inner area {}", polygon_area_ids(&pos, &inner));
+        let result = dp_ribbon(&outer, &inner, &pos, 64.0);
+        println!(
+            "dp smoke: {:?}",
+            result.as_ref().map(|(q, r)| (q.len(), *r))
+        );
+        assert!(result.is_ok(), "dp smoke failed");
+    }
+
+    #[test]
+    fn corpus_sections() {
+        for (label, domain, size, must_mesh) in [
+            ("l-bracket-2d", corpus_l_bracket(), 2.0_f64, true),
+            ("ring-section", corpus_ring(), 1.0_f64, false),
+            ("stepped-2d", corpus_stepped(), 1.0_f64, true),
+        ] {
+            match mesh_with_stats(&domain, size) {
+                Ok((mesh, stats)) => {
+                    let (quads, min_sj, min_angle, max_angle, offset) =
+                        check_mesh(&mesh, &domain, label);
+                    let report = quality::report(&mesh);
+                    println!(
+                        "{label} h={size} [{} delta={:.2}h]: {quads} quads ({} interior + {} channel), \
+                         loops {}, min SJ {min_sj:.4}, angles {min_angle:.2}..{max_angle:.2}, \
+                         aspect {:.2}, cracks {}, offset {offset:.3e}, verdict {:?}",
+                        stats.method,
+                        stats.delta_factor,
+                        stats.interior_quads,
+                        stats.channel_quads,
+                        stats.channel_loops,
+                        report.max_aspect_ratio,
+                        stats.cracks,
+                        report.verdict,
+                    );
+                    assert!(quads > 50, "{label}: too few quads");
+                }
+                Err(error) => {
+                    println!("{label} h={size} NOT MESHED: {error}");
+                    if must_mesh {
+                        assert!(false, "{label} must mesh: {error}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
