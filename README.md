@@ -3,9 +3,20 @@
 Unstructured **quad** and **hex** mesh generation for finite element analysis, in
 Rust, MIT licensed. No GPL, LGPL or AGPL dependency, and no external binary.
 
-> **Status: P0.** The data model, the quality contract and the benchmark corpus
-> exist and are tested. The meshing algorithms (P1 onward) are not written yet —
-> this crate is the ground they are measured against.
+> **Status: P1 in progress.** P0 (model, quality contract, corpus) is complete.
+> P1 produces planar meshes end to end — constrained Delaunay triangulation,
+> Ruppert-style refinement, and Blossom-Quad-style matching into quads — but the
+> gate is **not met yet**: the meshes are quad-dominant (87–95 % quads) with
+> 24–33° minimum angles, against the target of all-quad at 45°.
+>
+> | Part | Quads / triangles | min SJ | min angle |
+> |---|---|---|---|
+> | plate-hole 4 mm | 313 / 84 | 0.42 | 24.5° |
+> | plate-hole 2 mm | 1139 / 212 | 0.48 | 28.9° |
+> | plate-hole 1 mm | 4278 / 486 | 0.46 | 27.1° |
+> | l-bracket 2 mm | 483 / 80 | 0.50 | 32.9° |
+> | ring 1 mm | 226 / 62 | 0.46 | 27.5° |
+> | stepped 1 mm | 1732 / 210 | 0.47 | 28.2° |
 
 ## What P0 provides
 
