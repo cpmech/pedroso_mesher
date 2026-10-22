@@ -11,15 +11,40 @@ Rust, MIT licensed. No GPL, LGPL or AGPL dependency, and no external binary.
 >
 > | Part | Quads / triangles | min SJ | min angle | Report | Time |
 > |---|---|---|---|---|---|
-> | plate-hole 4 mm | 301 / 2 | 0.40 | 35.1° | Acceptable | 0.04 s |
-> | plate-hole 2 mm | 1301 / 34 | 0.35 | 28.1° | Acceptable | 0.1 s |
-> | plate-hole 1 mm | 5132 / 234 | 0.34 | 27.4° | Acceptable | 1.8 s |
-> | l-bracket 2 mm | 561 / 34 | 0.37 | 23.2° | Acceptable | 0.04 s |
-> | ring 1 mm | 251 / 46 | 0.44 | 29.3° | Acceptable | 0.03 s |
-> | stepped 1 mm | 1910 / 168 | 0.34 | 26.1° | Acceptable | 0.2 s |
+> | plate-hole 4 mm | 301 / 2 | 0.71 | 44.9° | Acceptable | 0.04 s |
+> | plate-hole 2 mm | 1301 / 34 | 0.59 | 36.2° | BelowTarget | 0.3 s |
+> | plate-hole 1 mm | 5132 / 234 | 0.53 | 33.0° | BelowTarget | 2.4 s |
+> | l-bracket 2 mm | 561 / 34 | 0.55 | 33.3° | Acceptable | 0.04 s |
+> | ring 1 mm | 251 / 46 | 0.66 | 46.8° | Acceptable | 0.03 s |
+> | stepped 1 mm | 1910 / 168 | 0.39 | 22.7° | BelowTarget | 0.5 s |
 >
-> The scaled Jacobian now clears the 0.2 target everywhere; the 45° angle target
-> is met by the ring and nearly by the plate at 4 mm and the l-bracket.
+> The scaled Jacobian clears the 0.2 target everywhere with a wide margin. The
+> 45° angle target is met by the ring and nearly by the plate at 4 mm.
+>
+> **P2, first two packages (2026-10-22).**
+>
+> - *W2, optimisation smoother* — the boolean accept/reject was replaced by a
+>   single objective in the spirit of Knupp (2000): per corner,
+>   `(1 - sin θ)²`, plus a logarithmic barrier that grows as an element collapses.
+>   Candidates are the ring centroid, two rings of eight directions, and six
+>   positions along a boundary node's segment; a candidate is taken only if it
+>   lowers the objective and keeps every incident quad strictly convex. Measured
+>   effect: min SJ 0.35 → 0.71 and min angle 28° → 45° on the plate at 2 mm;
+>   0.34 → 0.53 and 27° → 33° at 1 mm; the ring went from 29° to 47°.
+> - *W1, topological clean-up* — two quads sharing an edge form a hexagon;
+>   replacing the shared edge with another diagonal changes four valences. The
+>   pass accepts a swap only when it lowers `Σ|valence − 4|` over the interior
+>   nodes it touches, keeps both new quads convex with a usable Jacobian, and
+>   does not lower the quality of the quads it replaces.
+>
+>   It barely fires: across the corpus it takes 0–6 swaps and moves the
+>   valence-4 share by at most one point (65 → 66 %). The measurement says why —
+>   of the edges with two quads, only **11 % admit a geometrically valid swap**
+>   (the hexagon is usually non-convex), and of those almost none improve
+>   valence without lowering quality. The irregularity is **not** caused by the
+>   leftover triangles either: only 2–15 % of irregular nodes touch one. It is
+>   inherent to the matching, which is one more reason the all-quad route is
+>   Q-Morph's front conversion rather than post-processing.
 >
 > **What made the difference.** Two changes, both measured:
 >

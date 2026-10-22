@@ -34,6 +34,19 @@ fn report(name: &str, d: &Domain, size: f64) {
             *hist.entry(n).or_insert(0) += 1;
         }
     }
+    // how many irregular nodes are touched by a leftover triangle?
+    let mut touched: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for c in &r.mesh.cells {
+        if c.kind == pedroso_mesher::mesh::Kind::Tri3 {
+            touched.extend(c.nodes.iter().copied());
+        }
+    }
+    let irregular: Vec<usize> = valence
+        .iter()
+        .filter(|(v, &n)| !boundary.contains(v) && n != 4)
+        .map(|(&v, _)| v)
+        .collect();
+    let near_tri = irregular.iter().filter(|v| touched.contains(v)).count();
     let interior: usize = hist.values().sum();
     let regular = hist.get(&4).copied().unwrap_or(0);
     let mut parts: Vec<String> = hist
@@ -46,6 +59,13 @@ fn report(name: &str, d: &Domain, size: f64) {
         r.mesh.cells.len(),
         100.0 * regular as f64 / interior.max(1) as f64,
         parts.join(" ")
+    );
+    println!("               clean-up swaps {}", r.stats.cleanup_swaps);
+    println!(
+        "               irregular interior nodes {}  of which touched by a triangle {} ({:.0}%)",
+        irregular.len(),
+        near_tri,
+        100.0 * near_tri as f64 / irregular.len().max(1) as f64
     );
 }
 

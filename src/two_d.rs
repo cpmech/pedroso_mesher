@@ -234,6 +234,8 @@ pub struct TwoDStats {
     pub unpaired_triangles: usize,
     /// Reserved for the closure pass (not yet enabled); always zero.
     pub absorbed_triangles: usize,
+    /// Edge swaps taken by the valence-driven clean-up.
+    pub cleanup_swaps: usize,
 }
 
 impl TwoDStats {
@@ -255,6 +257,9 @@ pub struct TwoDResult {
     pub unpaired: Vec<[usize; 3]>,
     pub stats: TwoDStats,
 }
+
+/// Passes of the valence-driven clean-up.
+const CLEANUP_ROUNDS: usize = 20;
 
 /// Longest cascade allowed for one triangle. Beyond this the triangle is kept:
 /// a chain that crosses the whole mesh costs more than the triangle it removes.
@@ -404,18 +409,20 @@ pub fn mesh_2d(domain: &Domain, sizing: &Sizing) -> Result<TwoDResult, TwoDError
     } else {
         (quads, points.clone(), unpaired.clone())
     };
-    let stats = TwoDStats {
+    let mut stats = TwoDStats {
         points: points.len(),
         triangles: tris.len(),
         quads: quads.len(),
         unpaired_triangles: leftover.len(),
         absorbed_triangles: quads.len().saturating_sub(base_quads),
+        cleanup_swaps: 0,
     };
     // Leftover triangles stay in the mesh as triangles: dropping them would
     // leave a hole, which is worse than a quad-dominant result.
     let mut cells: Vec<Cell> = quads.into_iter().map(Cell::quad4).collect();
     cells.extend(leftover.iter().map(|t| Cell::tri3(*t)));
     let mut mesh = Mesh::new(points, cells);
+    stats.cleanup_swaps = cleanup(&mut mesh, CLEANUP_ROUNDS);
     smooth(&mut mesh, domain, SMOOTHING_ITERATIONS, sizing.size);
     Ok(TwoDResult {
         mesh,
@@ -518,6 +525,138 @@ fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
             break;
         }
     }
+}
+
+/// Topological clean-up of a quad mesh, driven by node valence.
+///
+/// Two quads sharing an edge form a hexagon. Replacing the shared edge with one
+/// of the hexagon's other diagonals keeps two quads and changes four valences:
+/// the ends of the old edge lose one, the new corners gain one. A swap is taken
+/// only when it strictly lowers the irregularity `sum |valence - 4|` over the
+/// interior nodes it touches and both new quads stay convex with a usable
+/// Jacobian. This is the cheap half of Q-Morph's clean-up — edge swaps only, no
+/// face opens or closes.
+fn cleanup(mesh: &mut Mesh, max_rounds: usize) -> usize {
+    let mut swaps = 0usize;
+    for _ in 0..max_rounds {
+        let mut changed = 0usize;
+        let quad_ids: Vec<usize> = (0..mesh.cells.len())
+            .filter(|&c| mesh.cells[c].kind == Kind::Quad4)
+            .collect();
+        let mut edges: std::collections::HashMap<(usize, usize), Vec<usize>> =
+            std::collections::HashMap::new();
+        for &c in &quad_ids {
+            let q = &mesh.cells[c].nodes;
+            for i in 0..4 {
+                let (a, b) = (q[i], q[(i + 1) % 4]);
+                edges.entry((a.min(b), a.max(b))).or_default().push(c);
+            }
+        }
+        let boundary: std::collections::HashSet<usize> = edges
+            .iter()
+            .filter(|(_, v)| v.len() == 1)
+            .flat_map(|(&(a, b), _)| [a, b])
+            .collect();
+        let mut valence: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for &c in &quad_ids {
+            for &v in &mesh.cells[c].nodes {
+                *valence.entry(v).or_insert(0) += 1;
+            }
+        }
+        let cost = |nodes: &[usize], valence: &std::collections::HashMap<usize, usize>| -> i64 {
+            nodes
+                .iter()
+                .filter(|v| !boundary.contains(v))
+                .map(|v| (valence.get(v).copied().unwrap_or(0) as i64 - 4).abs())
+                .sum()
+        };
+
+        for ((a, b), owners) in edges.clone() {
+            if owners.len() != 2 {
+                continue;
+            }
+            let (c1, c2) = (owners[0], owners[1]);
+            let q1 = mesh.cells[c1].nodes.clone();
+            let q2 = mesh.cells[c2].nodes.clone();
+            let Some(i1) = (0..4)
+                .find(|&i| (q1[i].min(q1[(i + 1) % 4]), q1[i].max(q1[(i + 1) % 4])) == (a, b))
+            else {
+                continue;
+            };
+            // q1 in the direction a -> b
+            let (x, y) = (q1[i1], q1[(i1 + 1) % 4]);
+            let p = q1[(i1 + 2) % 4];
+            let q = q1[(i1 + 3) % 4];
+            // q2 must traverse the same edge the other way
+            let Some(i2) = (0..4).find(|&i| q2[i] == y && q2[(i + 1) % 4] == x) else {
+                continue;
+            };
+            let r = q2[(i2 + 2) % 4];
+            let s = q2[(i2 + 3) % 4];
+
+            let options: [[[usize; 4]; 2]; 2] =
+                [[[p, q, x, r], [p, r, s, y]], [[q, x, r, s], [q, s, y, p]]];
+            let before = cost(&[x, y, p, r, q, s], &valence);
+            let old_quality = quad_min_sj(&coords_of(&q1, &mesh.points))
+                .min(quad_min_sj(&coords_of(&q2, &mesh.points)));
+            let mut best: Option<([[usize; 4]; 2], i64)> = None;
+            for pair in options {
+                let valid = pair.iter().all(|quad| {
+                    let coords = [
+                        [mesh.points[quad[0]][0], mesh.points[quad[0]][1]],
+                        [mesh.points[quad[1]][0], mesh.points[quad[1]][1]],
+                        [mesh.points[quad[2]][0], mesh.points[quad[2]][1]],
+                        [mesh.points[quad[3]][0], mesh.points[quad[3]][1]],
+                    ];
+                    convex_ccw(&coords) && quad_min_sj(&coords) > 0.05
+                });
+                if !valid {
+                    continue;
+                }
+                let new_quality = pair
+                    .iter()
+                    .map(|quad| quad_min_sj(&coords_of(quad, &mesh.points)))
+                    .fold(f64::INFINITY, f64::min);
+                // A swap that buys regularity by making the elements worse is a
+                // bad trade: the smoother has to live with the result.
+                if new_quality < old_quality - 1e-6 {
+                    continue;
+                }
+                let mut v = valence.clone();
+                *v.entry(x).or_insert(0) -= 1;
+                *v.entry(y).or_insert(0) -= 1;
+                *v.entry(p).or_insert(0) += 1;
+                *v.entry(r).or_insert(0) += 1;
+                let after = cost(&[x, y, p, r, q, s], &v);
+                if after < before && best.as_ref().is_none_or(|(_, c)| after < *c) {
+                    best = Some((pair, after));
+                }
+            }
+            if let Some((pair, _)) = best {
+                mesh.cells[c1] = Cell::quad4(pair[0]);
+                mesh.cells[c2] = Cell::quad4(pair[1]);
+                *valence.entry(x).or_insert(0) -= 1;
+                *valence.entry(y).or_insert(0) -= 1;
+                *valence.entry(p).or_insert(0) += 1;
+                *valence.entry(r).or_insert(0) += 1;
+                changed += 1;
+                swaps += 1;
+            }
+        }
+        if changed == 0 {
+            break;
+        }
+    }
+    swaps
+}
+
+fn coords_of(quad: &[usize], points: &[Node]) -> [[f64; 2]; 4] {
+    [
+        [points[quad[0]][0], points[quad[0]][1]],
+        [points[quad[1]][0], points[quad[1]][1]],
+        [points[quad[2]][0], points[quad[2]][1]],
+        [points[quad[3]][0], points[quad[3]][1]],
+    ]
 }
 
 /// Nodally based quality objective, in the spirit of Knupp (2000).
