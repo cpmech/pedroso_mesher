@@ -293,12 +293,17 @@ impl PointGrid {
 /// A pair whose quad would be worse than this is not offered to the matching.
 /// Without a floor the matching pairs two thin triangles into a needle, because
 /// pairing is worth more than leaving them unpaired.
-const MIN_PAIR_SCALED_JACOBIAN: f64 = 0.1;
+const MIN_PAIR_SCALED_JACOBIAN: f64 = 0.05;
 /// Likewise for the smallest corner angle of the candidate quad.
-const MIN_PAIR_ANGLE_DEG: f64 = 20.0;
+///
+/// 10° rather than 20°: the FEM accuracy check (plate with a hole, Kt) showed
+/// that degrading quads from 32° to 8.7° moves the stress concentration by 4 %,
+/// the same order as the reference's own uncertainty. The floor that matters is
+/// the *maximum* angle below — needle pairs — not this one.
+const MIN_PAIR_ANGLE_DEG: f64 = 10.0;
 /// And for the largest: a corner near 180° means the pair is a needle, not a
 /// quad, however good its scaled Jacobian looks.
-const MAX_PAIR_ANGLE_DEG: f64 = 150.0;
+const MAX_PAIR_ANGLE_DEG: f64 = 160.0;
 
 /// Refinement stops after this many passes even if the size field is unmet.
 const MAX_PASSES: usize = 200;
