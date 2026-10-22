@@ -14,7 +14,7 @@ use crate::mesh::{Kind, Mesh};
 use crate::quality;
 
 /// The W3 acceptance gate, measured on one mesh.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Gate {
     /// Quads and triangles in the mesh.
     pub quads: usize,

@@ -29,6 +29,8 @@ pub mod quad;
 pub mod quadify;
 pub mod quality;
 pub mod recovery;
+pub mod smooth;
+pub mod stats;
 pub mod sun;
 pub mod two_d;
 pub mod twostage;
