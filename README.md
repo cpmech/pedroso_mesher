@@ -4,19 +4,32 @@ Unstructured **quad** and **hex** mesh generation for finite element analysis, i
 Rust, MIT licensed. No GPL, LGPL or AGPL dependency, and no external binary.
 
 > **Status: P1 in progress.** P0 (model, quality contract, corpus) is complete.
-> P1 produces planar meshes end to end — constrained Delaunay triangulation,
-> Ruppert-style refinement, and Blossom-Quad-style matching into quads — but the
-> gate is **not met yet**: the meshes are quad-dominant (87–95 % quads) with
-> 24–33° minimum angles, against the target of all-quad at 45°.
+> P1 produces **quad-dominant, watertight** planar meshes end to end:
+> constrained Delaunay triangulation, Ruppert refinement, and Blossom-Quad-style
+> matching into quads. The P1 gate — all-quad at 45° — is **not met**.
 >
-> | Part | Quads / triangles | min SJ | min angle |
-> |---|---|---|---|
-> | plate-hole 4 mm | 313 / 84 | 0.42 | 24.5° |
-> | plate-hole 2 mm | 1139 / 212 | 0.48 | 28.9° |
-> | plate-hole 1 mm | 4278 / 486 | 0.46 | 27.1° |
-> | l-bracket 2 mm | 483 / 80 | 0.50 | 32.9° |
-> | ring 1 mm | 226 / 62 | 0.46 | 27.5° |
-> | stepped 1 mm | 1732 / 210 | 0.47 | 28.2° |
+> | Part | Quads / triangles | min SJ | min angle | Report | Time |
+> |---|---|---|---|---|---|
+> | plate-hole 4 mm | 341 / 84 | 0.40 | 23.7° | Acceptable | 0.04 s |
+> | plate-hole 2 mm | 1236 / 166 | 0.50 | 30.4° | Acceptable | 0.1 s |
+> | plate-hole 1 mm | 4780 / 774 | 0.50 | 30.0° | Acceptable | 1.3 s |
+> | l-bracket 2 mm | 496 / 164 | 0.53 | 36.0° | Acceptable | 0.04 s |
+> | ring 1 mm | 249 / 50 | 0.51 | 31.2° | Acceptable | 0.03 s |
+> | stepped 1 mm | 1834 / 320 | 0.38 | 22.4° | Acceptable | 0.2 s |
+>
+> **What is not done, and why.**
+>
+> - *All-quad closure.* A pentagon split (triangle + adjacent quad + centroid
+>   → two quads) was implemented. It produced holes through a bookkeeping error
+>   (one triangle unaccounted for per run) and was reverted; the leftover
+>   triangles are kept in the mesh so the output is watertight. A correct closer
+>   is the next task.
+> - *45° angles.* The worst quads sit at the boundary and in closure pockets.
+>   Interior-node smoothing was implemented and reverted: it raised the smallest
+>   angle by ~1° while dropping the smallest scaled Jacobian from 0.40 to 0.03,
+>   a net loss. It needs an objective that protects both.
+> - *Performance* was fixed: inserting every candidate per refinement pass
+>   instead of 64 cut the plate-hole 1 mm case from 6.4 s to 1.3 s (release).
 
 ## What P0 provides
 

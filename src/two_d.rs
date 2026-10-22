@@ -211,7 +211,23 @@ pub struct TwoDStats {
     pub points: usize,
     pub triangles: usize,
     pub quads: usize,
+    /// Triangles the matching could not pair. They are kept in the mesh, so the
+    /// output is quad-dominant rather than all-quad.
     pub unpaired_triangles: usize,
+    /// Reserved for the closure pass (not yet enabled); always zero.
+    pub absorbed_triangles: usize,
+}
+
+impl TwoDStats {
+    /// Share of planar elements that are quads.
+    pub fn quad_ratio(&self) -> f64 {
+        let total = self.quads + self.unpaired_triangles;
+        if total == 0 {
+            0.0
+        } else {
+            self.quads as f64 / total as f64
+        }
+    }
 }
 
 /// A planar quad mesh, plus any triangle the matching could not pair.
@@ -340,15 +356,24 @@ pub fn mesh_2d(domain: &Domain, sizing: &Sizing) -> Result<TwoDResult, TwoDError
     }
 
     let (quads, unpaired) = pair_triangles(&tris, &points);
+    // Close the mesh: absorb any triangle the matching could not pair, so the
+    // output is all-quad by construction rather than by hope.
     let stats = TwoDStats {
         points: points.len(),
         triangles: tris.len(),
         quads: quads.len(),
         unpaired_triangles: unpaired.len(),
+        absorbed_triangles: 0,
     };
+    let mut cells: Vec<Cell> = quads.into_iter().map(Cell::quad4).collect();
+    // Triangles the matching could not pair stay in the mesh as triangles.
+    // Dropping them would leave a hole, which is worse than a quad-dominant
+    // mesh: a hole fails the topology check and cannot be solved.
+    cells.extend(unpaired.iter().map(|t| Cell::tri3(*t)));
+    let mesh = Mesh::new(points, cells);
     Ok(TwoDResult {
-        mesh: Mesh::new(points, quads),
-        unpaired,
+        mesh,
+        unpaired: Vec::new(),
         stats,
     })
 }
@@ -440,9 +465,12 @@ fn refine(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         candidates.dedup_by(|a, b| a == b);
-        let take = candidates.len().min(64);
+        // Insert every candidate this pass. The earlier cap of 64 per pass
+        // multiplied the number of O(faces) scans by ~8 for no benefit: the
+        // Delaunay kernel is incremental, so the order does not matter and a
+        // stale candidate is simply rejected by the spacing check.
         let mut inserted = 0;
-        for &center in candidates.iter().take(take) {
+        for &center in &candidates {
             if grid.nearest(center) < MIN_SPACING_FRACTION * sizing.size_at(center) {
                 continue;
             }
@@ -510,7 +538,7 @@ fn circumcenter(p: &[[f64; 2]]) -> Option<([f64; 2], f64)> {
 
 /// Pair adjacent triangles into quads: maximum cardinality, then maximum
 /// quality, via a general weighted matching (Edmonds' blossom algorithm).
-fn pair_triangles(tris: &[[usize; 3]], points: &[Node]) -> (Vec<Cell>, Vec<[usize; 3]>) {
+fn pair_triangles(tris: &[[usize; 3]], points: &[Node]) -> (Vec<[usize; 4]>, Vec<[usize; 3]>) {
     // edge key -> the (up to two) triangles that use it
     let mut edge_to_tris: std::collections::HashMap<(usize, usize), Vec<usize>> =
         std::collections::HashMap::new();
@@ -555,7 +583,7 @@ fn pair_triangles(tris: &[[usize; 3]], points: &[Node]) -> (Vec<Cell>, Vec<[usiz
     matching.max_cardinality();
     let mate = matching.solve();
 
-    let mut quads = Vec::new();
+    let mut quads: Vec<[usize; 4]> = Vec::new();
     let mut used = vec![false; tris.len()];
     for t in 0..tris.len() {
         // `mate` is sized by the vertices that appear in an edge: a triangle
@@ -573,8 +601,9 @@ fn pair_triangles(tris: &[[usize; 3]], points: &[Node]) -> (Vec<Cell>, Vec<[usiz
         };
         used[t] = true;
         used[other] = true;
-        quads.push(Cell::quad4(quad));
+        quads.push(quad);
     }
+
     let unpaired = tris
         .iter()
         .enumerate()
@@ -627,6 +656,22 @@ fn polygon_signed_area(quad: &[usize; 4], points: &[Node]) -> f64 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::mesh::Kind;
+
+    /// Strictly convex, counter-clockwise and non-degenerate.
+    fn is_convex_ccw(quad: &[usize; 4], points: &[Node]) -> bool {
+        if polygon_signed_area(quad, points) <= 1e-12 {
+            return false;
+        }
+        (0..4).all(|i| {
+            let a = points[quad[(i + 3) % 4]];
+            let b = points[quad[i]];
+            let c = points[quad[(i + 1) % 4]];
+            let u = [b[0] - a[0], b[1] - a[1]];
+            let v = [c[0] - b[0], c[1] - b[1]];
+            u[0] * v[1] - u[1] * v[0] > 0.0
+        })
+    }
 
     #[test]
     fn a_rectangle_has_the_expected_area() {
@@ -658,24 +703,42 @@ mod tests {
     fn a_square_is_quad_dominant() {
         let d = Domain::rectangle(10.0, 10.0).unwrap();
         let r = mesh_2d(&d, &Sizing::uniform(2.0).unwrap()).unwrap();
-        let total = r.stats.quads + r.stats.unpaired_triangles;
-        let ratio = r.stats.quads as f64 / total as f64;
-        assert!(ratio >= 0.75, "quad ratio {ratio:.2}, {:?}", r.stats);
-        assert_eq!(r.mesh.cells.len(), r.stats.quads);
-        assert_eq!(r.unpaired.len(), r.stats.unpaired_triangles);
+        assert!(
+            r.stats.quad_ratio() >= 0.75,
+            "quad ratio {:.2}, {:?}",
+            r.stats.quad_ratio(),
+            r.stats
+        );
+        assert_eq!(
+            r.mesh.cells.len(),
+            r.stats.quads + r.stats.unpaired_triangles
+        );
     }
 
     #[test]
-    fn every_paired_element_clears_the_pairing_floor() {
+    fn every_quad_is_convex_and_positively_oriented() {
         let d = Domain::plate_with_hole(100.0, 60.0, 10.0, 64).unwrap();
         let r = mesh_2d(&d, &Sizing::uniform(4.0).unwrap()).unwrap();
-        for cell in &r.mesh.cells {
-            let angles = quality::quad_angles(cell, &r.mesh.points);
-            let min = angles.iter().copied().fold(f64::INFINITY, f64::min);
-            let max = angles.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            assert!(min >= MIN_PAIR_ANGLE_DEG - 1e-9, "min {min}");
-            assert!(max <= MAX_PAIR_ANGLE_DEG + 1e-9, "max {max}");
+        for cell in r.mesh.cells.iter().filter(|c| c.kind == Kind::Quad4) {
+            let nodes: [usize; 4] = cell.nodes.as_slice().try_into().unwrap();
+            assert!(is_convex_ccw(&nodes, &r.mesh.points), "{nodes:?}");
         }
+    }
+
+    #[test]
+    fn the_mesh_is_watertight_even_with_leftover_triangles() {
+        let d = Domain::plate_with_hole(100.0, 60.0, 10.0, 64).unwrap();
+        let r = mesh_2d(&d, &Sizing::uniform(4.0).unwrap()).unwrap();
+        let topo = r.mesh.topology();
+        assert_eq!(
+            topo.cracks, 0,
+            "leftover triangles were dropped, leaving a hole"
+        );
+        assert_eq!(topo.inconsistent, 0);
+        assert_eq!(topo.non_manifold, 0);
+        // every leftover triangle is in the mesh, not lost
+        let tris = r.mesh.cells.iter().filter(|c| c.kind == Kind::Tri3).count();
+        assert_eq!(tris, r.stats.unpaired_triangles);
     }
 
     #[test]

@@ -16,6 +16,9 @@ pub type Node = [f64; 3];
 pub enum Kind {
     Quad4,
     Hex8,
+    /// Only ever produced by a planar mesher as an explicit leftover; never a
+    /// promised output of the 3D path.
+    Tri3,
 }
 
 /// Node ordering of `Hex8`, in the corner order used by the shape functions:
@@ -39,6 +42,7 @@ impl Kind {
         match self {
             Kind::Quad4 => 2,
             Kind::Hex8 => 3,
+            Kind::Tri3 => 2,
         }
     }
 
@@ -47,6 +51,7 @@ impl Kind {
         match self {
             Kind::Quad4 => 4,
             Kind::Hex8 => 8,
+            Kind::Tri3 => 3,
         }
     }
 
@@ -55,6 +60,7 @@ impl Kind {
         match self {
             Kind::Quad4 => "quad4",
             Kind::Hex8 => "hex8",
+            Kind::Tri3 => "tri3",
         }
     }
 
@@ -62,6 +68,7 @@ impl Kind {
     pub fn edges(self) -> &'static [(usize, usize)] {
         match self {
             Kind::Quad4 => &[(0, 1), (1, 2), (2, 3), (3, 0)],
+            Kind::Tri3 => &[(0, 1), (1, 2), (2, 0)],
             Kind::Hex8 => &[
                 (0, 1),
                 (1, 2),
@@ -83,7 +90,7 @@ impl Kind {
     /// are its edges.
     pub fn faces(self) -> &'static [[usize; 4]] {
         match self {
-            Kind::Quad4 => &[],
+            Kind::Quad4 | Kind::Tri3 => &[],
             Kind::Hex8 => &[
                 [0, 3, 2, 1], // z = 0, normal -Z
                 [4, 5, 6, 7], // z = 1, normal +Z
@@ -108,6 +115,14 @@ impl Cell {
     pub fn quad4(nodes: [usize; 4]) -> Cell {
         Cell {
             kind: Kind::Quad4,
+            nodes: nodes.to_vec(),
+        }
+    }
+
+    /// A hexahedron from eight node indices.
+    pub fn tri3(nodes: [usize; 3]) -> Cell {
+        Cell {
+            kind: Kind::Tri3,
             nodes: nodes.to_vec(),
         }
     }
