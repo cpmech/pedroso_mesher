@@ -104,7 +104,13 @@ fn main() {
     }
     let (domain, size) = part(&part_name);
     let sizing = Sizing::uniform(size).unwrap();
-    let out = generate(&domain, &sizing, &config).unwrap();
+    let out = match generate(&domain, &sizing, &config) {
+        Ok(out) => out,
+        Err(e) => {
+            println!("{} on {}: error: {e}", config.route.name(), part_name);
+            return;
+        }
+    };
     println!(
         "{} on {}: {} in {:.2}s",
         config.route.name(),

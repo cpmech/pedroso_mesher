@@ -40,20 +40,29 @@
 //! # Implementation status and deviations (documented)
 //!
 //! **The default construction is a boundary ribbon, not the thesis' patch
-//! cover.** `mesh` first meshes the channel as a strip with one quad per outer
-//! boundary edge, joining the domain boundary to the inner grid loop. The
-//! boundary is re-discretized to the same number of vertices as the inner loop
-//! (keeping every input corner and every new point on the polyline), and the
-//! best rotation/direction is chosen by quad validity and angle rank. This is
-//! much simpler than §2.2.3–2.2.9: no cross edges, no templates, no covering.
-//! The template + greedy-cover path described below is implemented and is
-//! attempted only if the ribbon fails.
+//! cover.** `mesh` first meshes the channel as one or more strips, each with one
+//! quad per edge of a grid loop: the domain outer boundary is joined to the
+//! outer grid loop, and every domain hole is joined to the grid hole loop that
+//! surrounds it (two ribbons for a rectangle with a circular hole). A domain
+//! loop is re-discretized to the same number of vertices as its grid loop
+//! (keeping every input corner and every new point on the polyline), the loop
+//! orientations are chosen so that the ribbon quads have positive area, and the
+//! best rotation/direction of each pair is chosen by quad validity and angle
+//! rank. This is much simpler than §2.2.3–2.2.9: no cross edges, no templates,
+//! no covering. The template + greedy-cover path described below is implemented
+//! and is attempted only if the ribbon fails.
 //!
 //! Results of this file:
 //! * 10×10 square, h = 1: 60 quads (36 interior grid + 24 ribbon), min SJ
 //!   0.7071, corner angles 45°–135°, cracks 0, boundary offset ~1.8e-15.
 //! * square with a square hole, h = 1: 16 quads (no interior grid survives the
 //!   cull), min SJ 0.7071, angles 45°–135°, cracks 0, offset 0.
+//! * 100×60 plate with a circular 24-gon hole (r = 10), h = 4: 262 quads (162
+//!   interior grid + 100 ribbon over two ribbons), 4 channel loops, min SJ
+//!   0.3964, angles 28.16°–156.64°, aspect 8.12, cracks 0, boundary offset
+//!   1.4e-14, quality verdict Acceptable (PASS). At h = 2: 1240 quads (1040 +
+//!   200), min SJ 0.2868, angles 19.81°–163.33°, aspect 6.15, cracks 0,
+//!   offset 1.4e-14, Acceptable.
 //! * L-bracket, h = 1: the grid + channel construction works (2 loops), but
 //!   the cull leaves only a thin staircase-shaped interior grid strip, so the
 //!   matched ribbon cannot span the wide legs and the mesher returns an error.
@@ -1977,13 +1986,13 @@ struct BuildOutput {
 
 /// Build a mesh for `domain`.
 ///
-/// The thesis path (grid + cross-edge patches + greedy cover) is attempted
-/// first; if it cannot close the channel, the much simpler **boundary ribbon**
-/// is used: the domain boundary is re-discretized to the same number of
-/// vertices as the inner grid loop, and one quad per boundary edge joins the
-/// two loops. The ribbon is a documented simplification of §2.2.3–2.2.9: it
-/// always produces one quad per outer edge and needs no templates, cross edges
-/// or covering search, at the cost of not adapting to complex channels.
+/// The **boundary ribbon** is tried first: one quad per edge of each grid
+/// loop, joining the domain outer boundary to the outer grid loop and each
+/// domain hole to the grid hole loop that surrounds it. The ribbon is a
+/// documented simplification of §2.2.3–2.2.9: it needs no templates, cross
+/// edges or covering search, at the cost of not adapting to complex channels.
+/// If it fails, the thesis path (grid + cross-edge patches + greedy cover) is
+/// attempted.
 fn build(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
     let ribbon_error = match build_ribbon(domain, size) {
         Ok(output) => return Ok(output),
@@ -1997,31 +2006,43 @@ fn build(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
     }
 }
 
+struct GridLoop {
+    points: Vec<[f64; 2]>,
+    ids: Vec<usize>,
+    area: f64,
+}
+
 fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
     let prepared = prepare(domain, size)?;
-    let grid_loops: Vec<&RawLoop> = prepared
+    let mut grid: Vec<GridLoop> = Vec::new();
+    for raw in prepared
         .loops
         .iter()
         .filter(|raw| raw.source == LoopSource::Grid)
-        .collect();
-
-    // Which pair of loops does the ribbon connect?
-    let (boundary_points, partner_points, partner_ids) = if grid_loops.len() == 1 {
-        if !domain.holes.is_empty() {
-            return Err(
-                "the boundary ribbon supports one simple outer boundary and one grid loop".into(),
-            );
-        }
-        let grid = grid_loops[0];
-        let mut partner: Vec<[f64; 2]> = Vec::with_capacity(grid.points.len());
-        for &id in &grid.points {
+    {
+        let mut points = Vec::with_capacity(raw.points.len());
+        for &id in &raw.points {
             let Some(&point) = prepared.pos.get(id) else {
                 return Err("internal error: grid loop point missing".into());
             };
-            partner.push(point);
+            points.push(point);
         }
-        (domain.outer.clone(), partner, grid.points.clone())
-    } else if grid_loops.is_empty() {
+        let area = polygon_area_points(&points);
+        grid.push(GridLoop {
+            points,
+            ids: raw.points.clone(),
+            area,
+        });
+    }
+
+    let mut pos = prepared.pos.clone();
+    let mut channel_quads: Vec<[usize; 4]> = Vec::new();
+    let mut ribbons = 0usize;
+    let mut worst_rank = f64::INFINITY;
+
+    if grid.is_empty() {
+        // No interior grid: one ribbon between the outer boundary and the
+        // (single) domain hole, as before.
         if domain.holes.len() != 1 {
             return Err(
                 "the boundary ribbon with an empty grid supports exactly one domain hole".into(),
@@ -2036,35 +2057,98 @@ fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
             Some(raw) => raw,
             None => return Err("internal error: missing domain hole loop".into()),
         };
-        let mut partner: Vec<[f64; 2]> = Vec::with_capacity(hole_raw.points.len());
+        let mut hole_points = Vec::with_capacity(hole_raw.points.len());
         for &id in &hole_raw.points {
             let Some(&point) = prepared.pos.get(id) else {
                 return Err("internal error: hole loop point missing".into());
             };
-            partner.push(point);
+            hole_points.push(point);
         }
-        (domain.outer.clone(), partner, hole_raw.points.clone())
+        let (count, rank) = add_ribbon(
+            &domain.outer,
+            &hole_points,
+            &hole_raw.points,
+            true,
+            "outer boundary <-> domain hole",
+            &mut pos,
+            &mut channel_quads,
+        )?;
+        ribbons += count;
+        worst_rank = worst_rank.min(rank);
+    } else if grid.len() == 1 {
+        if !domain.holes.is_empty() {
+            return Err(
+                "one interior grid loop with domain holes is not supported by the ribbon".into(),
+            );
+        }
+        let (count, rank) = add_ribbon(
+            &domain.outer,
+            &grid[0].points,
+            &grid[0].ids,
+            true,
+            "outer boundary <-> grid loop",
+            &mut pos,
+            &mut channel_quads,
+        )?;
+        ribbons += count;
+        worst_rank = worst_rank.min(rank);
     } else {
-        return Err(format!(
-            "the boundary ribbon supports at most one interior grid loop, found {}",
-            grid_loops.len()
-        ));
-    };
+        // The channel has several loops: pair the largest grid loop (the outer
+        // grid boundary) with the domain outer loop, and each remaining grid
+        // loop (a grid hole) with the domain hole it surrounds.
+        let mut order: Vec<usize> = (0..grid.len()).collect();
+        order.sort_by(|&a, &b| {
+            grid[b]
+                .area
+                .abs()
+                .total_cmp(&grid[a].area.abs())
+                .then_with(|| a.cmp(&b))
+        });
+        let outer_index = order[0];
+        let (count, rank) = add_ribbon(
+            &domain.outer,
+            &grid[outer_index].points,
+            &grid[outer_index].ids,
+            true,
+            "outer boundary <-> grid outer loop",
+            &mut pos,
+            &mut channel_quads,
+        )?;
+        ribbons += count;
+        worst_rank = worst_rank.min(rank);
 
-    let (mut partner, mut partner_ids) = clean_loop_with_ids(&partner_points, &partner_ids)?;
-    let n = partner.len();
-    if n < 4 || !n.is_multiple_of(2) {
-        return Err("the ribbon partner loop has an unusable number of vertices".into());
-    }
-    // The partner is the inner side of the channel; it must run clockwise.
-    if polygon_area_points(&partner) > 0.0 {
-        partner.reverse();
-        partner_ids.reverse();
+        let mut used_holes = vec![false; domain.holes.len()];
+        for &grid_index in order.iter().skip(1) {
+            let hole_index =
+                choose_hole_for_grid_loop(&domain.holes, &used_holes, &grid[grid_index].points)?;
+            used_holes[hole_index] = true;
+            let (count, rank) = add_ribbon(
+                &domain.holes[hole_index],
+                &grid[grid_index].points,
+                &grid[grid_index].ids,
+                false,
+                "domain hole <-> grid hole loop",
+                &mut pos,
+                &mut channel_quads,
+            )?;
+            ribbons += count;
+            worst_rank = worst_rank.min(rank);
+        }
+        if used_holes.iter().any(|&used| !used) {
+            return Err(
+                "a domain hole has no matching grid hole loop; the ribbon cannot close it".into(),
+            );
+        }
     }
 
-    // Re-discretize the domain boundary to exactly `n` points.
-    let boundary = clean_loop_points(&boundary_points)?;
-    // The channel area the ribbon has to cover.
+    if channel_quads.is_empty() {
+        return Err("the boundary ribbon produced no quads".into());
+    }
+    if !worst_rank.is_finite() {
+        return Err("the boundary ribbon could not rank its quads".into());
+    }
+
+    // Every pair covered its own band; together they must cover the channel.
     let grid_area: f64 = prepared
         .quads
         .iter()
@@ -2078,49 +2162,25 @@ fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
         })
         .sum();
     let expected_area = domain.area() - grid_area;
-    if expected_area <= EPS {
-        return Err("the ribbon channel has no area".into());
+    let ribbon_area: f64 = channel_quads
+        .iter()
+        .map(|quad| quad_area([pos[quad[0]], pos[quad[1]], pos[quad[2]], pos[quad[3]]]))
+        .sum();
+    if (ribbon_area - expected_area).abs() > 1.0e-6 * expected_area.max(1.0) {
+        return Err(format!(
+            "the boundary ribbons cover {ribbon_area:.6} but the channel area is {expected_area:.6}"
+        ));
     }
-    let mut pos = prepared.pos.clone();
-    let mut best_ribbon: Option<(f64, Vec<[usize; 4]>)> = None;
-    for candidate in [
-        resample_polyline(&boundary, n),
-        resample_matched(&boundary, &partner),
-    ] {
-        let Ok(mut points) = candidate else {
-            continue;
-        };
-        if polygon_area_points(&points) < 0.0 {
-            points.reverse();
-        }
-        let mut ids: Vec<usize> = Vec::with_capacity(n);
-        for point in &points {
-            ids.push(pos.len());
-            pos.push(*point);
-        }
-        if let Ok((quads, rank)) = ribbon_quads(&ids, &partner_ids, &pos, expected_area) {
-            let better = match &best_ribbon {
-                None => true,
-                Some((current, _)) => rank > *current,
-            };
-            if better {
-                best_ribbon = Some((rank, quads));
-            }
-        }
-    }
-    let Some((_, ribbon)) = best_ribbon else {
-        return Err("no boundary resampling produced a valid ribbon".into());
-    };
 
     let mut quads: Vec<[usize; 4]> = prepared.quads.clone();
-    quads.extend(ribbon.iter().copied());
+    quads.extend(channel_quads.iter().copied());
     let mut stats = ChannelStats {
         method: "boundary-ribbon",
         grid_vertices: prepared.grid_vertex_count,
         interior_quads: prepared.quads.len(),
         channel_loops: prepared.loops.len(),
         cross_edges: 0,
-        faces: ribbon.len(),
+        faces: ribbons,
         triangle_faces: 0,
         patches: 0,
         usable_patches: 0,
@@ -2128,11 +2188,139 @@ fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
         greedy_covered_fraction: 1.0,
         fallback_regions: 0,
         fallback_quads: 0,
-        channel_quads: ribbon.len(),
+        channel_quads: channel_quads.len(),
         quads: quads.len(),
         ..ChannelStats::default()
     };
     finish_mesh(pos, quads, domain, &mut stats)
+}
+
+/// Choose the domain hole nested inside a grid hole loop.
+fn choose_hole_for_grid_loop(
+    holes: &[Vec<[f64; 2]>],
+    used: &[bool],
+    grid_points: &[[f64; 2]],
+) -> Result<usize, String> {
+    if holes.is_empty() {
+        return Err("a grid hole loop has no domain hole to pair with".into());
+    }
+    // A domain hole is nested inside its grid hole loop; test the hole centroid.
+    for (index, hole) in holes.iter().enumerate() {
+        if used.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        if let Some(centroid) = polygon_centroid(hole) {
+            if point_in_polygon(centroid, grid_points) {
+                return Ok(index);
+            }
+        }
+    }
+    // Fall back to the nearest unused hole (deterministic).
+    let grid_centre = match polygon_centroid(grid_points) {
+        Some(centre) => centre,
+        None => return Err("a grid hole loop is degenerate".into()),
+    };
+    let mut best: Option<(f64, usize)> = None;
+    for (index, hole) in holes.iter().enumerate() {
+        if used.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(centre) = polygon_centroid(hole) else {
+            continue;
+        };
+        let distance = point_distance(centre, grid_centre);
+        let better = match best {
+            None => true,
+            Some((current, _)) => distance < current,
+        };
+        if better {
+            best = Some((distance, index));
+        }
+    }
+    match best {
+        Some((_, index)) => Ok(index),
+        None => Err("no unused domain hole for a grid hole loop".into()),
+    }
+}
+
+/// Add one ribbon between a `free` domain boundary loop (which may be
+/// re-discretized) and a `fixed` grid loop whose vertex ids must be preserved.
+///
+/// `free_is_outer` says whether the domain loop is the outer side of the band
+/// (the domain outer boundary around the grid) or the inner side (a domain hole
+/// inside a grid hole loop).
+fn add_ribbon(
+    free_points: &[[f64; 2]],
+    fixed_points: &[[f64; 2]],
+    fixed_ids: &[usize],
+    free_is_outer: bool,
+    label: &str,
+    pos: &mut Vec<[f64; 2]>,
+    out: &mut Vec<[usize; 4]>,
+) -> Result<(usize, f64), String> {
+    let (fixed, fixed_ids) = clean_loop_with_ids(fixed_points, fixed_ids)?;
+    let n = fixed.len();
+    if n < 4 || !n.is_multiple_of(2) {
+        return Err(format!(
+            "{label}: the fixed grid loop has {n} vertices, which cannot carry a ribbon"
+        ));
+    }
+    let free = clean_loop_points(free_points)?;
+    if free.len() > n {
+        return Err(format!(
+            "{label}: the domain loop has {} corners but the grid loop only {n} edges; \
+             preserving every domain vertex would need a fan",
+            free.len()
+        ));
+    }
+    let fixed_ccw = !free_is_outer;
+
+    let mut best: Option<(f64, Vec<[usize; 4]>)> = None;
+    for candidate in [resample_polyline(&free, n), resample_matched(&free, &fixed)] {
+        let Ok(mut points) = candidate else {
+            continue;
+        };
+        if (polygon_area_points(&points) > 0.0) != free_is_outer {
+            points.reverse();
+        }
+        let mut fixed_sequence = fixed_ids.clone();
+        if (polygon_area_points(&fixed) > 0.0) != fixed_ccw {
+            fixed_sequence.reverse();
+        }
+        let mut free_ids: Vec<usize> = Vec::with_capacity(n);
+        for point in &points {
+            free_ids.push(pos.len());
+            pos.push(*point);
+        }
+        let (outer, inner) = if free_is_outer {
+            (free_ids.clone(), fixed_sequence.clone())
+        } else {
+            (fixed_sequence.clone(), free_ids.clone())
+        };
+        let pair_area = polygon_area_ids(pos, &outer) + polygon_area_ids(pos, &inner);
+        if pair_area <= EPS {
+            continue;
+        }
+        if let Ok((quads, rank)) = ribbon_quads(&outer, &inner, pos, pair_area) {
+            let better = match &best {
+                None => true,
+                Some((current, _)) => rank > *current,
+            };
+            if better {
+                best = Some((rank, quads));
+            }
+        }
+    }
+    match best {
+        Some((rank, quads)) => {
+            let count = quads.len();
+            out.extend(quads);
+            Ok((count, rank))
+        }
+        None => Err(format!(
+            "{label}: no rotation/direction of the resampled loops produced a valid ribbon"
+        )),
+    }
 }
 
 /// Remove a repeated closing point and consecutive duplicates.
@@ -3181,6 +3369,51 @@ mod tests {
         assert!(stats.greedy_covered_fraction > 0.5);
         assert!(min_sj > 0.05, "min SJ too low: {min_sj}");
         assert!(min_angle > 10.0, "min angle too low: {min_angle}");
+    }
+
+    #[test]
+    fn plate_with_circular_hole() {
+        let domain = match Domain::plate_with_hole(100.0, 60.0, 10.0, 24) {
+            Ok(domain) => domain,
+            Err(error) => {
+                assert!(false, "plate domain invalid: {error}");
+                return;
+            }
+        };
+        for size in [4.0_f64, 2.0_f64] {
+            let label = format!("plate-with-hole h={size}");
+            match mesh_with_stats(&domain, size) {
+                Ok((mesh, stats)) => {
+                    let (quads, min_sj, min_angle, max_angle, offset) =
+                        check_mesh(&mesh, &domain, &label);
+                    let report = quality::report(&mesh);
+                    println!(
+                        "{label} [{}]: {quads} quads ({} interior + {} channel, {} ribbons), \
+                         loops {}, min SJ {min_sj:.4}, angles {min_angle:.2}..{max_angle:.2}, \
+                         aspect {:.2}, cracks {}, offset {offset:.3e}, verdict {:?}",
+                        stats.method,
+                        stats.interior_quads,
+                        stats.channel_quads,
+                        stats.faces,
+                        stats.channel_loops,
+                        report.max_aspect_ratio,
+                        stats.cracks,
+                        report.verdict,
+                    );
+                    assert!(quads > 100);
+                    assert!(stats.channel_loops >= 4);
+                    assert!(min_sj > 0.05, "{label}: min SJ {min_sj}");
+                    assert_ne!(
+                        report.verdict,
+                        quality::Verdict::Refused,
+                        "{label}: refused"
+                    );
+                }
+                Err(error) => {
+                    assert!(false, "{label} failed: {error}");
+                }
+            }
+        }
     }
 
     #[test]
