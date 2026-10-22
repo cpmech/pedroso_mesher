@@ -11,12 +11,12 @@ Rust, MIT licensed. No GPL, LGPL or AGPL dependency, and no external binary.
 >
 > | Part | Quads / triangles | min SJ | min angle | Report | Time |
 > |---|---|---|---|---|---|
-> | plate-hole 4 mm | 282 / 40 | 0.54 | **43.3°** | Acceptable | 0.04 s |
-> | plate-hole 2 mm | 1253 / 130 | 0.53 | 41.1° | Acceptable | 0.1 s |
-> | plate-hole 1 mm | 4928 / 642 | 0.50 | 32.9° | Acceptable | 1.5 s |
-> | l-bracket 2 mm | 496 / 164 | 0.53 | 42.6° | Acceptable | 0.04 s |
-> | ring 1 mm | 249 / 50 | 0.59 | **44.3°** | Acceptable | 0.03 s |
-> | stepped 1 mm | 1834 / 320 | 0.44 | 26.1° | Acceptable | 0.2 s |
+> | plate-hole 4 mm | 301 / 2 | 0.40 | 35.1° | Acceptable | 0.04 s |
+> | plate-hole 2 mm | 1301 / 34 | 0.35 | 28.1° | Acceptable | 0.1 s |
+> | plate-hole 1 mm | 5132 / 234 | 0.34 | 27.4° | Acceptable | 1.8 s |
+> | l-bracket 2 mm | 561 / 34 | 0.37 | 23.2° | Acceptable | 0.04 s |
+> | ring 1 mm | 251 / 46 | 0.44 | 29.3° | Acceptable | 0.03 s |
+> | stepped 1 mm | 1910 / 168 | 0.34 | 26.1° | Acceptable | 0.2 s |
 >
 > The scaled Jacobian now clears the 0.2 target everywhere; the 45° angle target
 > is met by the ring and nearly by the plate at 4 mm and the l-bracket.
@@ -36,14 +36,35 @@ Rust, MIT licensed. No GPL, LGPL or AGPL dependency, and no external binary.
 >   discretisation has to suit the size field**; the mesher cannot fix a boundary
 >   that is already too fine.
 >
-> **What is still missing: all-quad.** The matching leaves 8–15 % of the
-> triangles unpaired; they are kept as `Tri3` elements so the mesh stays
-> watertight. Two closure designs were implemented and rejected: a pentagon split
-> (triangle + adjacent quad + interior point → two quads) lost elements through a
-> bookkeeping error and, once fixed, still left cracks by consuming quads that
-> bordered a second leftover triangle. The reliable route is Blossom-Quad's local
-> repair — edge flips in the triangulation before matching — not a post-hoc
-> polygon split.
+> **What is still missing: all-quad.** With the floors relaxed to 0.05 / 10° /
+> 160° the matching leaves 2–234 triangles unpaired (3–4 %); they are kept as
+> `Tri3` elements so the mesh stays watertight.
+>
+> Three closure designs have now been implemented and rejected, and the third
+> attempt explains why the problem is hard:
+>
+> 1. **Pentagon split** (triangle + adjacent quad + interior point → two quads):
+>    lost elements through a bookkeeping error, and once fixed still left cracks
+>    by consuming a quad that bordered a second leftover triangle.
+> 2. **Pocket fan** (a connected pocket of leftovers, an even polygon, fanned
+>    into `n/2` quads around one interior point): correct, but nearly useless.
+>    The leftovers are *isolated single triangles* — 423 of the 234 at 1 mm are
+>    pockets of size one — and a triangle is an odd polygon.
+> 3. **The parity wall.** An odd polygon cannot be quadrangulated round one
+>    interior point: with a fan, the centre ends up on the boundary. Adding an
+>    adjacent quad makes it worse (odd + 2 is still odd), and splitting a
+>    neighbouring quad at the new edge midpoint puts a 180° corner in the quad,
+>    which is degenerate. The clean fix is a *conforming refinement cascade*
+>    (triangle → three quads, each neighbour quad split at the midpoint of its
+>    opposite edge, propagating until a boundary), or edge flips in the
+>    triangulation before matching as Blossom-Quad does. Both change the
+>    triangulation; no post-hoc polygon surgery can do it.
+>
+> Whether it is worth it is now a measured question rather than a guess: the FEM
+> accuracy check showed that quad quality in the 9–32° range moves the stress
+> concentration by ~4 %, the order of the reference's own uncertainty, and that
+> resolution dominates. The triangles are a *robustness* concern (a sliver on the
+> stress path), not an accuracy one at this level.
 
 ## What P0 provides
 
