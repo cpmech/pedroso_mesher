@@ -37,11 +37,13 @@
 //!
 //! **Not implemented: the transition rules.** A front edge that disagrees with
 //! the field is not split or merged, and two fronts that meet are not stitched
-//! with a seam. The measured consequence is in the record: the front fragments
-//! into small loops (many of them one triangle, three front edges) and those
-//! cannot be quadrangulated without changing the loop's parity. That is the
-//! remaining gap, not the side-node rule; on the six parts 64–1080 triangles
-//! remain, and their front edges are not size-mismatched.
+//! with a seam. The front fragments into small loops (many of them one
+//! triangle, three front edges) and those cannot be quadrangulated without
+//! changing the loop's parity. The leftover triangles are then handed to
+//! [`crate::sun::close_residuals`], Sun's residual-triangle walk. On the six
+//! parts that walk removes 83–97 % of them (68→10, 292→24, 962→52, 78→10,
+//! 64→12, 382→34) but its boundary template cannot finish the last boundary
+//! slivers; the module documentation there records the geometric reason.
 //!
 //! **The policy is not enforced by this code.** Nothing here refuses a run that
 //! ignores it; measure the mesh that came out with [`crate::verify::gate`].
@@ -844,6 +846,8 @@ pub struct Refusals {
     pub mismatch_insertions: usize,
     /// Front edges examined.
     pub attempts: usize,
+    /// The Sun residual-triangle walk that closes the leftovers.
+    pub closure: crate::sun::CloseStats,
 }
 
 /// Convert a triangle mesh into quads.
@@ -948,7 +952,13 @@ pub fn convert_with_stats(
             _ => None,
         })
         .collect();
-    ((quads, leftover, mesh.points), refusals)
+    // Sun's residual-triangle walk closes the leftovers on the Q-Morph output.
+    // It keeps the placed quads; only quads on a moving triangle's path are
+    // destroyed and rebuilt.
+    let (points, quads, leftover, closure) =
+        crate::sun::close_residuals(&mesh.points, &quads, &leftover);
+    refusals.closure = closure;
+    ((quads, leftover, points), refusals)
 }
 
 fn loop_perimeter(points: &[Node], edges: &[(usize, usize)]) -> f64 {
