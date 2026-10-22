@@ -23,8 +23,12 @@
 //!    per patch is a necessary condition for a pure quad mesh.  The chord
 //!    parities solve a GF(2) system on the patch-adjacency tree, and the loop
 //!    totals are made even before the boundary is generated;
-//! 5. a domain with one hole is meshed as an O-grid of four patches, each
-//!    bounded by one outer side, one hole arc and two chords.
+//! 5. a domain with one hole is meshed as an O-grid of eight patches, one per
+//!    half outer side, with the hole split radially to those eight points;
+//! 6. the assembled mesh is relaxed by forty interior Laplacian sweeps and a
+//!    local interior-node polish (`sun::perturb_low_quads`, boundary nodes
+//!    fixed), which removes the small shear that the transition templates
+//!    leave inside the O-grid block corners.
 //!
 //! Implemented: boundary discretisation, recursive domain decomposition,
 //! transfinite mapping, T0/T1/T2 templates, one-hole O-grid, parity fixing.
@@ -33,17 +37,17 @@
 //! subregion whose four corners are not convex is passed to the templates and
 //! may fold; such a mesh is returned, and the gate is the judge.
 //!
-//! Measured limit: the four-block O-grid of a rectangle with a coarse
-//! polygonal hole puts a shallow corner where an outer side meets a chord.
-//! The mesh is all-quad, watertight and conforming with a high share of
-//! valence-4 nodes and a small aspect ratio, but the minimum corner angle at
-//! that O-grid corner is below the 30° gate (the raw plate rows fail on the
-//! angle, not on conformity).  The L-bracket, stepped and quarter-annulus
-//! parts are meshed with exact tensor/transition blocks and pass.
+//! Measured limit: the eight-block O-grid of a rectangle with a coarse
+//! polygonal hole still has its worst cells in the first ring outside the
+//! hole at the two extreme side points, where a radial chord meets a short
+//! hole arc.  The mesh is all-quad, watertight and conforming with a high
+//! share of valence-4 nodes and a small aspect ratio; the 4 mm and 2 mm plate
+//! rows clear the gate, while the 1 mm and performance rows stay at about
+//! 28-30° there.
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::mesh::{Cell, Mesh, Node};
+use crate::mesh::{Cell, Kind, Mesh, Node};
 use crate::two_d::{Domain, Sizing};
 
 /// A vertex is a corner when its boundary turns by more than this angle.
@@ -70,13 +74,107 @@ pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
         .iter()
         .map(|h| normalize_loop(h, false))
         .collect();
-    match holes.len() {
-        0 => mesh_simply_connected(&outer, size),
-        1 => mesh_one_hole(&outer, &holes[0], size),
-        n => Err(format!(
-            "not supported yet: {n} holes (the O-grid handles one hole)"
-        )),
+    let mesh = match holes.len() {
+        0 => mesh_simply_connected(&outer, size)?,
+        1 => mesh_one_hole(&outer, &holes[0], size)?,
+        n => {
+            return Err(format!(
+                "not supported yet: {n} holes (the O-grid handles one hole)"
+            ))
+        }
+    };
+    let mesh = relax(mesh, 40);
+    Ok(polish(mesh, size))
+}
+
+/// Local interior-node polish.
+///
+/// The four-point Laplacian is blind to the corner Jacobian, so a few nodes in
+/// the first ring outside the hole still sit at a 29-30° corner.  The library's
+/// [`crate::sun::perturb_low_quads`] moves only the nodes of quads that are
+/// below the gate margin; passing `None` for the domain keeps every boundary
+/// node fixed, so the geometry is untouched.  On the perfect tensor blocks the
+/// margin is already above one and no node moves.
+fn polish(mesh: Mesh, size: f64) -> Mesh {
+    let mut quads: Vec<[usize; 4]> = Vec::new();
+    let mut tris: Vec<[usize; 3]> = Vec::new();
+    for cell in &mesh.cells {
+        if cell.kind == Kind::Quad4 && cell.nodes.len() == 4 {
+            quads.push([cell.nodes[0], cell.nodes[1], cell.nodes[2], cell.nodes[3]]);
+        } else if cell.kind == Kind::Tri3 && cell.nodes.len() == 3 {
+            tris.push([cell.nodes[0], cell.nodes[1], cell.nodes[2]]);
+        }
     }
+    let (points, quads, tris, _) =
+        crate::sun::perturb_low_quads(&mesh.points, &quads, &tris, size, 200, None);
+    let mut cells = Vec::with_capacity(quads.len() + tris.len());
+    for q in &quads {
+        cells.push(Cell::quad4(*q));
+    }
+    for t in &tris {
+        cells.push(Cell::tri3(*t));
+    }
+    Mesh::new(points, cells)
+}
+
+/// Interior Laplacian relaxation of the assembled patches.
+///
+/// The transition templates are exact on the boundary but leave a little shear
+/// in the first rings inside the corners of an O-grid block.  Forty sweeps of
+/// the plain four-point Laplacian on the **interior** nodes remove it; boundary
+/// nodes are never moved, so the mesh stays on the geometry (the boundary
+/// offset is unchanged).
+fn relax(mut mesh: Mesh, sweeps: usize) -> Mesh {
+    use std::collections::HashMap;
+    let n = mesh.points.len();
+    let mut edge_use: HashMap<(usize, usize), usize> = HashMap::new();
+    for cell in &mesh.cells {
+        for i in 0..cell.nodes.len() {
+            let a = cell.nodes[i];
+            let b = cell.nodes[(i + 1) % cell.nodes.len()];
+            *edge_use.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    let mut boundary = vec![false; n];
+    for ((a, b), uses) in edge_use {
+        if uses == 1 {
+            boundary[a] = true;
+            boundary[b] = true;
+        }
+    }
+    let mut incident: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (ci, cell) in mesh.cells.iter().enumerate() {
+        for &v in &cell.nodes {
+            incident[v].push(ci);
+        }
+    }
+    for _ in 0..sweeps {
+        let old = mesh.points.clone();
+        for v in 0..n {
+            if boundary[v] || incident[v].is_empty() {
+                continue;
+            }
+            let mut ring: Vec<usize> = Vec::new();
+            for &ci in &incident[v] {
+                for &u in &mesh.cells[ci].nodes {
+                    if u != v && !ring.contains(&u) {
+                        ring.push(u);
+                    }
+                }
+            }
+            if ring.len() < 3 {
+                continue;
+            }
+            let mut x = 0.0;
+            let mut y = 0.0;
+            for &u in &ring {
+                x += old[u][0];
+                y += old[u][1];
+            }
+            mesh.points[v] = [x / ring.len() as f64, y / ring.len() as f64, 0.0];
+        }
+    }
+    mesh
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,14 +1634,26 @@ fn insert_side_midpoints(
     Ok((new_points, structure))
 }
 
-/// One hole: an O-grid of four blocks, each wrapping one rectangle corner.
+fn angle_diff(a: f64, b: f64) -> f64 {
+    let mut d = (a - b) % std::f64::consts::TAU;
+    if d > std::f64::consts::PI {
+        d -= std::f64::consts::TAU;
+    }
+    if d < -std::f64::consts::PI {
+        d += std::f64::consts::TAU;
+    }
+    d.abs()
+}
+
+/// One hole: an eight-block O-grid, one block per half outer side.
 ///
-/// The outer boundary is cut at the four side midpoints and the hole at four
-/// points facing those midpoints.  Block `i` is
-/// `M_{i-1} -> C_i -> M_i` (the L-shaped outer side) -> chord to `H_i` -> hole
-/// arc to `H_{i-1}` -> chord back.  Unlike cutting at the rectangle corners,
-/// every corner of these blocks is close to a right angle, so the transition
-/// templates do not have to absorb a sharp wedge.
+/// The outer boundary is cut at the four corners and the four side midpoints,
+/// and the hole at the eight nodes radially facing those points.  Block `s` is
+/// the straight half-side `S_s -> S_{s+1}`, a chord to `H_{s+1}`, the hole arc
+/// from `H_{s+1}` to `H_s`, and a chord back to `S_s`.  All sides are straight
+/// or a single hole arc, so the transfinite maps have no kink, and the corner
+/// chords are no longer tangent to the hole (the failure mode of the
+/// corner-to-hole four-block O-grid).
 fn mesh_one_hole(outer: &[[f64; 2]], hole: &[[f64; 2]], size: f64) -> Result<Mesh, String> {
     let scale = outer
         .iter()
@@ -1558,7 +1668,6 @@ fn mesh_one_hole(outer: &[[f64; 2]], hole: &[[f64; 2]], size: f64) -> Result<Mes
         ));
     }
     let (outer2, structure) = insert_side_midpoints(outer, &outer_corners)?;
-    let mids_xy: Vec<[f64; 2]> = (0..4).map(|k| outer2[structure[2 * k + 1]]).collect();
 
     let hole_corners = detect_corners(hole);
     let (hole_cycle, _) = if hole_corners.len() >= 3 {
@@ -1571,61 +1680,102 @@ fn mesh_one_hole(outer: &[[f64; 2]], hole: &[[f64; 2]], size: f64) -> Result<Mes
         return Err("the hole discretisation is too coarse for an O-grid".to_string());
     }
 
-    // Hole points facing the four outer side midpoints: quarters of the hole,
-    // with the rotation and the assignment chosen to minimise the total chord
-    // length over the valid partitions.
-    let mut best_assign: Option<(f64, [usize; 4], [usize; 4])> = None;
-    for offset in 0..nh {
-        let mut base = [0usize; 4];
-        for (k, b) in base.iter_mut().enumerate() {
-            *b = (offset + k * nh / 4) % nh;
+    // Eight hole points: the hole node nearest the radial direction of each of
+    // the eight structural outer points.  Their cyclic order is the reverse of
+    // the structural order, so the four corner chords enter the hole inside the
+    // corner's visible cone instead of running tangentially along the arc.
+    let centroid: [f64; 2] = {
+        let mut c = [0.0, 0.0];
+        for &node in &hole_cycle {
+            let p = d.p(node);
+            c[0] += p[0];
+            c[1] += p[1];
         }
-        if base[0] == base[1] || base[1] == base[2] || base[2] == base[3] || base[3] == base[0] {
-            continue;
+        [c[0] / nh as f64, c[1] / nh as f64]
+    };
+    let mut hidx = [0usize; 8];
+    let mut used = vec![false; nh];
+    for s in 0..8 {
+        let p = outer2[structure[s]];
+        let target = (p[1] - centroid[1]).atan2(p[0] - centroid[0]);
+        let mut best = (f64::INFINITY, 0usize);
+        for (j, &node) in hole_cycle.iter().enumerate() {
+            if used[j] {
+                continue;
+            }
+            let q = d.p(node);
+            let a = (q[1] - centroid[1]).atan2(q[0] - centroid[0]);
+            let diff = angle_diff(a, target);
+            if diff < best.0 {
+                best = (diff, j);
+            }
         }
-        for perm in permutations4() {
-            let hidx = [base[perm[0]], base[perm[1]], base[perm[2]], base[perm[3]]];
-            let mut total = 0usize;
-            let mut arcs = [0usize; 4];
+        used[best.1] = true;
+        hidx[s] = best.1;
+    }
+    // Block s uses the hole arc H[s+1] -> H[s] in stored order.  The eight arcs
+    // must partition the hole.
+    let mut arcs = [0usize; 8];
+    let mut valid = true;
+    let mut sum = 0usize;
+    for s in 0..8 {
+        let arc = (hidx[s] + nh - hidx[(s + 1) % 8]) % nh;
+        if arc == 0 {
+            valid = false;
+            break;
+        }
+        arcs[s] = arc;
+        sum += arc;
+    }
+    if !valid || sum != nh {
+        // Fallback: eight nearly-even points in the required cyclic order.
+        let mut best_cost = f64::INFINITY;
+        let mut best = [0usize; 8];
+        for base in 0..nh {
+            let mut cand = [0usize; 8];
+            for s in 0..8 {
+                cand[s] = (base + nh - (s * nh / 8) % nh) % nh;
+            }
             let mut ok = true;
-            for i in 0..4 {
-                // Block i uses the hole arc H_i -> H_{i-1} in stored order.
-                let from = hidx[i];
-                let to = hidx[(i + 3) % 4];
-                let arc = (to + nh - from) % nh;
+            let mut total = 0usize;
+            for s in 0..8 {
+                let arc = (cand[s] + nh - cand[(s + 1) % 8]) % nh;
                 if arc == 0 {
                     ok = false;
                     break;
                 }
-                arcs[i] = arc;
                 total += arc;
             }
             if !ok || total != nh {
                 continue;
             }
-            let mut length = 0.0;
-            for i in 0..4 {
-                length += dist(mids_xy[i], d.p(hole_cycle[hidx[i]]));
+            let mut cost = 0.0;
+            for s in 0..8 {
+                let p = outer2[structure[s]];
+                let q = d.p(hole_cycle[cand[s]]);
+                let a = (q[1] - centroid[1]).atan2(q[0] - centroid[0]);
+                let target = (p[1] - centroid[1]).atan2(p[0] - centroid[0]);
+                cost += angle_diff(a, target);
             }
-            if best_assign
-                .as_ref()
-                .is_none_or(|(best_len, _, _)| length < *best_len)
-            {
-                best_assign = Some((length, hidx, arcs));
+            if cost < best_cost {
+                best_cost = cost;
+                best = cand;
             }
         }
+        if !best_cost.is_finite() {
+            return Err("could not place the eight hole split points".to_string());
+        }
+        hidx = best;
+        for s in 0..8 {
+            arcs[s] = (hidx[s] + nh - hidx[(s + 1) % 8]) % nh;
+        }
     }
-    let Some((_len, hidx, arcs)) = best_assign else {
-        return Err("could not pair the outer side midpoints with the hole".to_string());
-    };
 
-    let mut chord_counts = [0usize; 4];
-    for i in 0..4 {
-        chord_counts[i] = count_for(dist(mids_xy[i], d.p(hole_cycle[hidx[i]])), size);
+    // One chord per structural point, one private outer half-side per block.
+    let mut chord_counts = [0usize; 8];
+    for s in 0..8 {
+        chord_counts[s] = count_for(dist(outer2[structure[s]], d.p(hole_cycle[hidx[s]])), size);
     }
-
-    // Nominal half-side counts, then one +1 per block fixes the parity of the
-    // block's total (each half-side belongs to exactly one block).
     let mut chain_len = [0.0f64; 8];
     for s in 0..8 {
         let from = structure[s];
@@ -1638,59 +1788,42 @@ fn mesh_one_hole(outer: &[[f64; 2]], hole: &[[f64; 2]], size: f64) -> Result<Mes
         }
     }
     let mut counts: Vec<usize> = chain_len.iter().map(|&l| count_for(l, size)).collect();
-    for i in 0..4 {
-        let h_prev = (2 * i + 7) % 8;
-        let h_cur = 2 * i;
-        let parity = (counts[h_prev]
-            + counts[h_cur]
-            + chord_counts[i]
-            + chord_counts[(i + 3) % 4]
-            + arcs[i])
-            % 2;
+    for s in 0..8 {
+        let parity = (counts[s] + chord_counts[s] + chord_counts[(s + 1) % 8] + arcs[s]) % 2;
         if parity != 0 {
-            if chain_len[h_prev] >= chain_len[h_cur] {
-                counts[h_prev] += 1;
-            } else {
-                counts[h_cur] += 1;
-            }
+            counts[s] += 1;
         }
     }
     let (outer_cycle, ids) = build_loop(&mut d, &outer2, &structure, size, Some(&counts))?;
-
-    for i in 0..4 {
+    for s in 0..8 {
         let key = (
-            ids[2 * i + 1].min(hole_cycle[hidx[i]]),
-            ids[2 * i + 1].max(hole_cycle[hidx[i]]),
+            ids[s].min(hole_cycle[hidx[s]]),
+            ids[s].max(hole_cycle[hidx[s]]),
         );
         if !d.chord_of.contains_key(&key) {
             let index = d.chords.len();
             d.chords.push(Chord {
                 a: key.0,
                 b: key.1,
-                count: chord_counts[i],
+                count: chord_counts[s],
             });
             d.chord_of.insert(key, index);
         }
     }
 
-    let mut patches: Vec<PatchSides> = Vec::with_capacity(4);
-    for i in 0..4 {
-        let m_prev = ids[(2 * i + 7) % 8];
-        let m_cur = ids[2 * i + 1];
-        let p0 = position_of(&outer_cycle, m_prev)?;
-        let p1 = position_of(&outer_cycle, m_cur)?;
-        let outer_arc = walk(&outer_cycle, p0, p1);
-        let h_cur = hole_cycle[hidx[i]];
-        let h_prev = hole_cycle[hidx[(i + 3) % 4]];
-        let hp = position_of(&hole_cycle, h_cur)?;
-        let hq = position_of(&hole_cycle, h_prev)?;
+    let mut patches: Vec<PatchSides> = Vec::with_capacity(8);
+    for s in 0..8 {
+        let s0 = ids[s];
+        let s1 = ids[(s + 1) % 8];
+        let p0 = position_of(&outer_cycle, s0)?;
+        let p1 = position_of(&outer_cycle, s1)?;
+        let outer_side = walk(&outer_cycle, p0, p1);
+        let h1 = hole_cycle[hidx[(s + 1) % 8]];
+        let h0 = hole_cycle[hidx[s]];
+        let hp = position_of(&hole_cycle, h1)?;
+        let hq = position_of(&hole_cycle, h0)?;
         let hole_arc = walk(&hole_cycle, hp, hq);
-        let walks = [
-            outer_arc,
-            vec![m_cur, h_cur],
-            hole_arc,
-            vec![h_prev, m_prev],
-        ];
+        let walks = [outer_side, vec![s1, h1], hole_arc, vec![h0, s0]];
         patches.push(PatchSides { walks });
     }
     finalize_ogrid(&d, &patches)
@@ -1732,26 +1865,6 @@ fn position_of(cycle: &[usize], node: usize) -> Result<usize, String> {
         .iter()
         .position(|&x| x == node)
         .ok_or_else(|| "a patch corner is missing from its boundary loop".to_string())
-}
-
-/// All 24 permutations of `0..4`.
-fn permutations4() -> Vec<[usize; 4]> {
-    let mut out = Vec::with_capacity(24);
-    for a in 0..4 {
-        for b in 0..4 {
-            if b == a {
-                continue;
-            }
-            for c in 0..4 {
-                if c == a || c == b {
-                    continue;
-                }
-                let d = 6 - a - b - c;
-                out.push([a, b, c, d]);
-            }
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1863,16 +1976,13 @@ mod tests {
     #[test]
     fn plate_with_hole_is_a_conforming_o_grid() {
         let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
-        // The raw O-grid corner angles are below the 30° gate for this coarse
-        // polygonal hole (see the module note); conformity and all-quad output
-        // are what this test can guarantee.
         let mesh = check_all_quads(&domain, 4.0);
         let gate = verify::gate(&mesh);
         assert_eq!(gate.cracks, 0);
         assert_eq!(gate.triangles, 0);
         assert_eq!(gate.inverted, 0);
         assert_eq!(gate.overlapping, 0);
-        assert!(gate.min_scaled_jacobian > 0.15);
+        assert!(gate.passes(), "{:?}", gate.reason());
     }
 
     #[test]
