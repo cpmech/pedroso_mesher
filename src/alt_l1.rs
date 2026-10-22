@@ -72,12 +72,34 @@
 //!   and keeps the insertion valid at every step (the Delaunay kernel maintains
 //!   a valid triangulation even when a candidate is rejected).
 //!
-//! The mesh returned is all-quad on the seven-part benchmark (raw and after the
-//! common post-pass); no triangle is silently dropped. The refinement cascade
-//! adds a small number of quads locally (e.g. +59 on plate-hole 2 mm, +269 on
-//! the 0.6 mm performance part) and can raise the local aspect ratio (measured
-//! post: p95 1.2–2.3, max ~8), which is the price of keeping every cell
-//! conforming and every new quad convex.
+//! # Measured result and cost
+//!
+//! The measured table (`examples/alt_l1.rs`) is all-quad 7/7 raw and 7/7 gate
+//! PASS after the common post-pass. Post-pass quality is the best of the
+//! shipped routes: min scaled Jacobian 0.66–0.98, min corner angle 41.6–78.7
+//! degrees and v4 77–100 %. Two raw rows still fail on the minimum scaled
+//! Jacobian (plate-hole 1 mm 0.102; the 0.6 mm performance part 0.091); the
+//! common post-pass lifts both. No triangle is silently dropped: the
+//! refinement cascade adds a small number of quads locally (e.g. +59 on
+//! plate-hole 2 mm, +269 on the 0.6 mm performance part) and can raise the
+//! local aspect ratio (measured post: p95 1.2–2.3, max ~8), which is the price
+//! of keeping every cell conforming and every new quad convex.
+//!
+//! **The 17x speedup.** The whole-graph weighted Blossom dominated the 0.6 mm
+//! raw row: 56.96 s. The blocked matching used above
+//! `EXACT_MATCHING_TRIANGLES` takes 3.32 s on the same part (17x) with the
+//! same 7/7 post result. Only that ~31k-triangle part crosses the threshold, so
+//! the six smaller parts still use the exact Blossom and reproduce their
+//! measured rows unchanged. The block solve is a maximum-weight, not
+//! maximum-cardinality, solve; the in-house Edmonds pass restores maximum
+//! cardinality globally (see `blocked_matching`).
+//!
+//! [`Options`] exposes the two paper knobs, `h_max` (adimensional size
+//! `2 R_inf / size`) and `min_spacing_fraction` (fraction of `size`); their
+//! defaults reproduce the measured table. Neither is validated: a non-positive
+//! `h_max` leaves every front unresolved until the round cap, and a negative
+//! spacing fraction disables the spacing filter. The insertion filter is the
+//! project's own approximation (see above), not the paper's eq. 12–14 clamping.
 
 use std::collections::HashMap;
 
@@ -152,22 +174,27 @@ fn rotate(v: [f64; 2], angle: f64) -> [f64; 2] {
     [v[0] * c - v[1] * s, v[0] * s + v[1] * c]
 }
 
+/// Vector difference `a - b` (length units).
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     [a[0] - b[0], a[1] - b[1]]
 }
 
+/// Vector sum `a + b` (length units).
 fn add(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     [a[0] + b[0], a[1] + b[1]]
 }
 
+/// Scalar-vector product `s * a`.
 fn scale(a: [f64; 2], s: f64) -> [f64; 2] {
     [a[0] * s, a[1] * s]
 }
 
+/// Euclidean dot product.
 fn dot(a: [f64; 2], b: [f64; 2]) -> f64 {
     a[0] * b[0] + a[1] * b[1]
 }
 
+/// Squared Euclidean length `a . a` (avoids a square root in comparisons).
 fn norm2(a: [f64; 2]) -> f64 {
     a[0] * a[0] + a[1] * a[1]
 }
@@ -183,16 +210,43 @@ fn norm2(a: [f64; 2]) -> f64 {
 /// Laplace problems with Dirichlet data on a layer around the boundary and
 /// interpolated bilinearly at query points.
 struct CrossField {
+    /// World x coordinate of grid node `(0, 0)` (length units). The grid extends
+    /// `2 * size` beyond the domain box so bilinear interpolation is defined at
+    /// every query point inside the domain.
     x0: f64,
+
+    /// World y coordinate of grid node `(0, 0)` (length units).
     y0: f64,
+
+    /// Grid spacing (length units), `max(0.5 * size, 1e-9)`.
     cell: f64,
+
+    /// Number of grid nodes in x; at least 2. The `a`/`b` arrays have
+    /// `nx * ny` entries.
     nx: usize,
+
+    /// Number of grid nodes in y; at least 2.
     ny: usize,
+
+    /// `cos(4 * theta)` at each grid node, row-major (`j * nx + i`). Together
+    /// with `b` this is the double-angle cross: a unit vector invariant under
+    /// the four branches `theta -> theta + k * pi/2`.
     a: Vec<f64>,
+
+    /// `sin(4 * theta)` at each grid node; second component of the double-angle
+    /// cross. Length `nx * ny`.
     b: Vec<f64>,
 }
 
 impl CrossField {
+    /// Build the cross field.
+    ///
+    /// Boundary conditions: every grid node starts with the tangent of its
+    /// nearest boundary segment, and a layer of about 1.5 grid cells keeps that
+    /// value fixed. The rest of the grid is smoothed by 300 Gauss-Seidel
+    /// Laplace sweeps on `(cos 4θ, sin 4θ)`; the double-angle form makes the
+    /// four branches of the cross the same value. A degenerate domain (no
+    /// finite point) yields an empty field whose [`CrossField::angle`] is 0.
     fn build(domain: &Domain, size: f64) -> CrossField {
         let segments = domain.segments();
         let mut xmin = f64::INFINITY;
@@ -327,6 +381,9 @@ impl CrossField {
     }
 }
 
+/// Euclidean distance from `p` to the closed segment `a..b` (length units);
+/// a zero-length segment reduces to the point distance. Used only to pick the
+/// nearest boundary tangent for the cross field.
 fn point_segment_distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     let ab = sub(b, a);
     let len2 = norm2(ab);
@@ -400,12 +457,26 @@ fn sample_boundary(domain: &Domain, size: f64) -> Vec<Vec<[f64; 2]>> {
 // A small point grid for spacing queries
 // ------------------------------------------------------------------------- //
 
+/// Uniform bucket grid for the "distance to the nearest existing node" query
+/// used by the spacing filter.
 struct PointGrid {
+    /// Bucket side (length units), `max(cell, 1e-9)`; the insertion query uses
+    /// `0.5 * size`, so with the default spacing fraction (0.5) a node closer
+    /// than the threshold always falls in one of the 3x3 neighbouring buckets.
+    /// A larger `min_spacing_fraction` is not guaranteed (see
+    /// [`PointGrid::nearest`]).
     cell: f64,
+
+    /// Bucket coordinates `(floor(x / cell), floor(y / cell))` -> point indices.
+    /// Every inserted point appears in exactly one bucket; buckets are created
+    /// lazily. The indices refer to the caller's `points` array.
     buckets: HashMap<(i64, i64), Vec<usize>>,
 }
 
 impl PointGrid {
+    /// A bucket grid with side `cell` (length units); a non-positive or
+    /// non-finite value is clamped to `1e-9` so [`PointGrid::key`] never
+    /// divides by zero.
     fn new(cell: f64) -> PointGrid {
         PointGrid {
             cell: cell.max(1.0e-9),
@@ -413,6 +484,8 @@ impl PointGrid {
         }
     }
 
+    /// Integer bucket coordinate `(floor(x / cell), floor(y / cell))`; `i64`
+    /// because the grid also holds points outside the domain box.
     fn key(&self, p: [f64; 2]) -> (i64, i64) {
         (
             (p[0] / self.cell).floor() as i64,
@@ -420,10 +493,22 @@ impl PointGrid {
         )
     }
 
+    /// Insert the point index `id` at `p`. The caller must not insert the same
+    /// id twice (a duplicate would only repeat the distance in a query).
     fn insert(&mut self, id: usize, p: [f64; 2]) {
         self.buckets.entry(self.key(p)).or_default().push(id);
     }
 
+    /// Distance from `p` to the nearest inserted point (length units), or
+    /// `+inf` when the 3x3 bucket neighbourhood is empty.
+    ///
+    /// The 3x3 neighbourhood is sufficient for the **default** spacing filter:
+    /// its threshold is `0.5 * size`, exactly one bucket side, and a point
+    /// closer than that cannot be two buckets away in either axis. With
+    /// `Options::min_spacing_fraction > 0.5` the true nearest point can lie
+    /// outside the searched buckets, so the returned value is only an upper
+    /// bound on the true nearest distance and the requested spacing is not
+    /// enforced (noted in the report; the measured table uses the default).
     fn nearest(&self, p: [f64; 2], points: &[[f64; 2]]) -> f64 {
         let (cx, cy) = self.key(p);
         let mut best = f64::INFINITY;
@@ -447,20 +532,41 @@ impl PointGrid {
 // CDT wrapper
 // ------------------------------------------------------------------------- //
 
+/// The `spade` constrained Delaunay triangulation used by the route; its
+/// vertices are [`Point2<f64>`] in world coordinates.
 type Cdt = ConstrainedDelaunayTriangulation<Point2<f64>>;
 
+/// Exact bit-pattern key of a point, used for vertex deduplication: two points
+/// are the same only when both coordinates have identical bits.
 fn point_key(p: [f64; 2]) -> (u64, u64) {
     (p[0].to_bits(), p[1].to_bits())
 }
 
+/// The triangulation plus the bookkeeping the frontal loop needs: a stable
+/// point vector (the CDT stores coordinates, not indices), a duplicate map and
+/// the spacing grid.
 struct CdtState {
+    /// The constrained Delaunay triangulation; its vertices are the same points
+    /// as `points`, in insertion order.
     cdt: Cdt,
+
+    /// Index -> coordinates (length units, z = 0 not stored). A point is
+    /// appended once and never removed, so an index is stable for the run.
     points: Vec<[f64; 2]>,
+
+    /// Exact bit-pattern key -> index into `points`. Exact keys (not a
+    /// tolerance) mean "duplicate" is the same coordinate, which is what
+    /// `spade` also treats as a duplicate vertex.
     index: HashMap<(u64, u64), usize>,
+
+    /// Uniform grid over `points` for the minimum-spacing query (bucket side
+    /// `0.5 * size`).
     grid: PointGrid,
 }
 
 impl CdtState {
+    /// An empty state with no vertices, an empty index and a spacing grid of
+    /// bucket side `0.5 * size`.
     fn new(size: f64) -> CdtState {
         CdtState {
             cdt: Cdt::new(),
@@ -486,11 +592,18 @@ impl CdtState {
         Ok(id)
     }
 
+    /// Index of the `CdtState` point at a `spade` position, or `None` when the
+    /// position is not one of the inserted vertices.
     fn id_of(&self, p: Point2<f64>) -> Option<usize> {
         self.index.get(&point_key([p.x, p.y])).copied()
     }
 
     /// Triangles of the domain, counter-clockwise, with `CdtState` indices.
+    ///
+    /// `spade` also returns the faces of the outer triangulation (outside the
+    /// constrained boundary); a face is kept only when its centroid is inside
+    /// the domain. The centroid test is sound here because every boundary edge
+    /// is a constraint, so no triangle straddles a domain edge.
     fn domain_triangles(&self, domain: &Domain) -> Vec<[usize; 3]> {
         let mut out = Vec::new();
         for face in self.cdt.inner_faces() {
@@ -502,6 +615,8 @@ impl CdtState {
             }
             let cx = (pos[0].x + pos[1].x + pos[2].x) / 3.0;
             let cy = (pos[0].y + pos[1].y + pos[2].y) / 3.0;
+            // The centroid test uses the domain's own contains(), which also
+            // handles holes and non-convex corners.
             if !domain.contains([cx, cy]) {
                 continue;
             }
@@ -519,6 +634,8 @@ impl CdtState {
             if !ok {
                 continue;
             }
+            // `spade` exposes the face orientation as it stores it; normalize to
+            // CCW so the matching and the quad construction see one convention.
             if area < 0.0 {
                 tri.swap(1, 2);
             }
@@ -545,16 +662,28 @@ const MIN_SPACING_FRACTION: f64 = 0.5;
 /// The defaults reproduce the measured benchmark table exactly.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Options {
-    /// `h_max` of the paper (`4/3`): a triangle is resolved when its
-    /// adimensional size `2 R∞ / size` is at most this.
+    /// `h_max` of the paper (default `H_MAX` = `4/3`, dimensionless): a
+    /// triangle is resolved when its adimensional size `2 R_inf / size` is at
+    /// most this. Lower values refine more (roughly quadrupling the triangle
+    /// count when halved); values near 1 leave almost nothing resolved, and the
+    /// insertion loop then stops at its round cap. Invariant: positive and
+    /// finite; the route does not validate it.
     pub h_max: f64,
-    /// A candidate point must be at least this fraction of the target size away
-    /// from every existing node, otherwise the insertion would only create a
-    /// sliver.
+
+    /// Minimum distance from a candidate point to every existing node, as a
+    /// fraction of the target `size` (default `MIN_SPACING_FRACTION` = 0.5,
+    /// dimensionless). It prevents an insertion that would only create a
+    /// sliver. `0` disables the filter; larger values make the front sparser.
+    /// Invariant: finite and non-negative; the route does not validate it.
+    /// Values above 0.5 are only partially enforced: the spacing query searches
+    /// the 3x3 bucket neighbourhood around the candidate (see
+    /// `PointGrid::nearest`), which covers one bucket side = `0.5 * size`.
     pub min_spacing_fraction: f64,
 }
 
 impl Default for Options {
+    /// The measured defaults (`H_MAX`, `MIN_SPACING_FRACTION`), which
+    /// reproduce the benchmark table.
     fn default() -> Self {
         Self {
             h_max: H_MAX,
@@ -567,8 +696,10 @@ impl Default for Options {
 ///
 /// The target is a triangle whose L∞ circumsquare has side `size`, i.e. the
 /// circumsquare radius is `size / 2` (this is the size of half a square cell of
-/// edge `size`). New points are placed at the far corner of the local
-/// cross-frame circumsquare of a front edge — the construction of Figure 13.
+/// edge `size`). The paper's `h_max = 4/3` accepts a triangle up to
+/// `R_inf = (2/3) * size`, so the target is the ideal, not the acceptance
+/// bound. New points are placed at the far corner of the local cross-frame
+/// circumsquare of a front edge — the construction of Figure 13.
 fn frontal_refine(
     state: &mut CdtState,
     domain: &Domain,
@@ -576,12 +707,17 @@ fn frontal_refine(
     size: f64,
     options: &Options,
 ) -> Result<(), String> {
+    // A safety cap, not a target: the loop exits as soon as a round inserts
+    // nothing. 4000 is well above the measured worst case on the corpus; a run
+    // that reaches it returns an error rather than looping forever.
     let max_rounds = 4000;
     for _round in 0..max_rounds {
         let tris = state.domain_triangles(domain);
         if tris.is_empty() {
             return Err("the frontal triangulation lost every triangle".to_string());
         }
+        // Classify every triangle by its adimensional L-infinity size
+        // `hi = 2 R_inf / size`; `hi <= h_max` means resolved.
         let n = tris.len();
         let mut hi = vec![0.0f64; n];
         let mut resolved = vec![false; n];
@@ -620,6 +756,10 @@ fn frontal_refine(
             }
         }
 
+        // An unresolved triangle is active only if one of its edges is a front
+        // edge: a boundary edge (one owner) or the edge of an already resolved
+        // triangle. A triangle surrounded by unresolved neighbours is waiting,
+        // not active, so its front will move when a neighbour is refined.
         let mut active = vec![false; n];
         for (t, tri) in tris.iter().enumerate() {
             if resolved[t] {
@@ -637,12 +777,16 @@ fn frontal_refine(
             }
         }
 
+        // Worst first: refining the largest active triangle keeps the front
+        // from being starved by a cluster of slightly-too-large neighbours.
         let mut order: Vec<usize> = (0..n).filter(|&t| active[t]).collect();
         order.sort_by(|&a, &b| hi[b].total_cmp(&hi[a]));
 
         let mut inserted = 0usize;
         for t in order {
             let tri = tris[t];
+            // Of the triangle's front edges, use the longest one: it is the one
+            // whose circumsquare is furthest from the target size.
             let mut front: Option<(f64, [f64; 2], [f64; 2], [f64; 2])> = None;
             for k in 0..3 {
                 let a = tri[k];
@@ -669,12 +813,15 @@ fn frontal_refine(
             let Some((_, pa, pb, pc)) = front else {
                 continue;
             };
+            // Figure 13's construction, in the local cross frame of the edge.
             let Some(candidate) = place_candidate(pa, pb, pc, field, size) else {
                 continue;
             };
             if !domain.contains(candidate) {
                 continue;
             }
+            // Spacing filter: a candidate closer than the fraction to any
+            // existing node would only create a sliver or a duplicate.
             let nearest = state.grid.nearest(candidate, &state.points);
             if nearest < options.min_spacing_fraction * size {
                 continue;
@@ -714,6 +861,8 @@ fn frontal_refine(
             }
             inserted += 1;
         }
+        // No insertion means every active front is now resolved or blocked by
+        // the domain/spacing filters: the refinement has converged.
         if inserted == 0 {
             return Ok(());
         }
@@ -788,14 +937,20 @@ fn place_candidate(
     best.map(|(corner, _)| to_world(corner, mid, theta))
 }
 
+/// 2D cross product, positive when `b` is counter-clockwise from `a`; used for
+/// the side-of-edge tests of [`place_candidate`].
 fn cross(a: [f64; 2], b: [f64; 2]) -> f64 {
     a[0] * b[1] - a[1] * b[0]
 }
 
+/// Exact-coordinate proximity with a `1e-12` tolerance (length units); used to
+/// avoid choosing a square corner that is already a triangle vertex.
 fn near(a: [f64; 2], b: [f64; 2]) -> bool {
     (a[0] - b[0]).abs() <= 1.0e-12 && (a[1] - b[1]).abs() <= 1.0e-12
 }
 
+/// Map a point from the local cross frame back to world coordinates: rotate by
+/// `theta` and translate by `origin`.
 fn to_world(p: [f64; 2], origin: [f64; 2], theta: f64) -> [f64; 2] {
     add(origin, rotate(p, theta))
 }
@@ -805,6 +960,13 @@ fn to_world(p: [f64; 2], origin: [f64; 2], theta: f64) -> [f64; 2] {
 // ------------------------------------------------------------------------- //
 
 /// Constrained Laplacian relaxation of interior triangle vertices.
+///
+/// Each interior node moves halfway towards the average of its neighbours, and
+/// a move is refused when it would make any incident triangle degenerate or
+/// clockwise. Boundary nodes (endpoints of an edge used by one triangle) are
+/// fixed, so the domain shape and the front's boundary points do not move. This
+/// is a project choice (the paper's §7 smoothing is centroidal Voronoi in Lp);
+/// it is used here only to remove the few flat triangles where the fronts meet.
 fn relax_points(points: &mut [[f64; 2]], tris: &[[usize; 3]], iterations: usize) {
     let n = points.len();
     let mut neighbors: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -830,6 +992,8 @@ fn relax_points(points: &mut [[f64; 2]], tris: &[[usize; 3]], iterations: usize)
         list.sort_unstable();
         list.dedup();
     }
+    // A boundary edge is used by exactly one triangle; both endpoints are
+    // fixed. Interior edges have two owners.
     let mut boundary = vec![false; n];
     for ((a, b), owners) in edge_owners {
         if owners == 1 {
@@ -841,6 +1005,9 @@ fn relax_points(points: &mut [[f64; 2]], tris: &[[usize; 3]], iterations: usize)
             }
         }
     }
+    // Jacobi-style sweeps: every move in a sweep is evaluated against the
+    // positions at the start of the sweep, so the result does not depend on
+    // node order.
     for _ in 0..iterations {
         let old = points.to_vec();
         for v in 0..n {
@@ -877,6 +1044,10 @@ fn relax_points(points: &mut [[f64; 2]], tris: &[[usize; 3]], iterations: usize)
 }
 
 /// Build a fresh constrained Delaunay triangulation from a fixed point set.
+///
+/// The points are re-inserted in their existing order (so indices stay stable)
+/// and every boundary edge is re-applied as a constraint; the relaxation can
+/// otherwise lose the constrained-Delaunay property at the boundary.
 fn rebuild_cdt(
     points: &[[f64; 2]],
     loops: &[Vec<[f64; 2]>],
@@ -900,6 +1071,11 @@ fn rebuild_cdt(
 }
 
 /// The quad formed by two triangles that share an edge, oriented CCW.
+///
+/// The shared edge must be traversed in opposite directions by the two
+/// triangles (`u -> v` in `t1`, `v -> u` in `t2`), which is the conforming
+/// neighbour relation. The four boundary nodes in order are the two shared
+/// endpoints and the two opposite corners. A zero-area pair yields `None`.
 fn pair_quad(t1: [usize; 3], t2: [usize; 3], points: &[Node]) -> Option<[usize; 4]> {
     for i in 0..3 {
         let u = t1[i];
@@ -915,6 +1091,8 @@ fn pair_quad(t1: [usize; 3], t2: [usize; 3], points: &[Node]) -> Option<[usize; 
                     let b = points[quad[(k + 1) % 4]];
                     area += a[0] * b[1] - b[0] * a[1];
                 }
+                // Normalize to CCW. The area is twice the polygon area; a
+                // numerically zero pair is not a quad and is refused.
                 if area < 0.0 {
                     quad.reverse();
                 }
@@ -928,6 +1106,9 @@ fn pair_quad(t1: [usize; 3], t2: [usize; 3], points: &[Node]) -> Option<[usize; 
     None
 }
 
+/// `(min corner scaled Jacobian, min corner angle in degrees, max corner angle
+/// in degrees)` of a quad. The recombination floor uses the first two; the max
+/// angle rejects a folded pair whose concave corner is near 180 degrees.
 fn quad_metrics(quad: [usize; 4], points: &[Node]) -> (f64, f64, f64) {
     let cell = Cell::quad4(quad);
     let sj = quality::scaled_jacobian(&cell, points)
@@ -949,7 +1130,7 @@ const UNMATCHED: usize = usize::MAX;
 /// Up to this many triangles the exact weighted Blossom ([`weighted_matching`])
 /// is affordable and is used unchanged, so the route's measured table is
 /// reproduced where its cost is small. Above it the mesh is matched block by
-/// block ([`blocked_matching`]).
+/// block (`blocked_matching`).
 const EXACT_MATCHING_TRIANGLES: usize = 12_000;
 
 /// Target number of triangles per block of the large-mesh matching. The exact
@@ -1070,23 +1251,53 @@ fn free_vertex_scores(tris: &[[usize; 3]], points: &[Node]) -> Vec<f64> {
 /// augments nothing makes the result maximum: a matching is maximum exactly
 /// when no augmenting path exists, and every augmenting path starts at a free
 /// vertex.
+///
+/// Edmonds' blossom state for the unweighted maximum-cardinality repair of the
+/// greedy matching.
+///
+/// The implementation is the classic alternating-tree BFS with odd-cycle
+/// contraction; it is in-house so the route has no external general-graph
+/// dependency for the hot path. All indices are triangle indices.
 struct Blossom<'a> {
+    /// Adjacency of the triangle dual graph (only recombination candidates);
+    /// `adj[t]` lists the partners of triangle `t`.
     adj: &'a [Vec<usize>],
+
+    /// `mate[t]` is the partner triangle of `t`, or [`UNMATCHED`]. The array is
+    /// symmetric (`mate[mate[t]] == t`) after every successful augmentation.
     mate: Vec<usize>,
-    /// Parent in the alternating tree (`UNMATCHED` when absent).
+
+    /// Parent in the alternating tree, [`UNMATCHED`] for a root or an unvisited
+    /// vertex. The parent of an outer vertex is an inner vertex and vice versa.
     parent: Vec<usize>,
-    /// Base vertex of the blossom a vertex belongs to.
+
+    /// Base vertex of the blossom a vertex currently belongs to (the
+    /// representative after odd-cycle contraction); `base[v] == v` outside a
+    /// blossom.
     base: Vec<usize>,
-    /// Outer vertex of the current tree.
+
+    /// Colour of a vertex in the current alternating tree: outer (true) or
+    /// inner/unvisited (false).
     outer: Vec<bool>,
-    /// Scratch set for `lca`, with a generation stamp to avoid O(n) clears.
+
+    /// Scratch marks for [`Blossom::lca`], with a generation `stamp` so the
+    /// array does not need an O(n) clear per search.
     seen: Vec<u32>,
+
+    /// Current generation for `seen`; wrapping, with a full clear on wrap.
     stamp: u32,
+
+    /// Scratch flags of the vertices on the blossom path in [`mark_path`].
     blossom: Vec<bool>,
+
+    /// BFS queue of outer vertices; a moving head index avoids O(n) pops.
     queue: Vec<usize>,
 }
 
 impl<'a> Blossom<'a> {
+    /// A blossom state for `n` triangles with the given adjacency and starting
+    /// matching; the working arrays are allocated once and reused by
+    /// [`Blossom::run`].
     fn new(n: usize, adj: &'a [Vec<usize>], mate: Vec<usize>) -> Self {
         Self {
             adj,
@@ -1276,6 +1487,8 @@ fn quads_from_mate(
 ) -> (Vec<[usize; 4]>, Vec<[usize; 3]>) {
     let mut used = vec![false; tris.len()];
     let mut quads = Vec::new();
+    // Handle each pair once (`partner > t`); a pair whose `pair_quad` fails
+    // (zero area, non-convex) leaves both triangles free for the cascade.
     for t in 0..tris.len() {
         let partner = mate.get(t).copied().unwrap_or(UNMATCHED);
         if used[t] || partner == UNMATCHED || partner >= tris.len() || used[partner] || partner <= t
@@ -1308,6 +1521,9 @@ fn weighted_matching(n: usize, edges: &[(usize, usize, i32)]) -> Vec<usize> {
     if edges.is_empty() {
         return vec![UNMATCHED; n];
     }
+    // `mwmatching` maximises cardinality first and total weight among those
+    // matchings; the weight is the quantized scaled Jacobian from
+    // [`recombination_edges`], so the result prefers the better-shaped quads.
     let mut matching = mwmatching::Matching::new(edges.to_vec());
     matching.max_cardinality();
     let mate = matching.solve();
@@ -1327,10 +1543,11 @@ fn block_count(n: usize) -> usize {
 /// thin interface band with the fast greedy + unweighted Blossom and restore
 /// global maximum cardinality.
 ///
-/// The weighted Blossom is super-linear (about 55 s on the 30k-triangle
-/// performance part), so the mesh is cut into spatial blocks whose interior is
-/// small enough to match exactly; only the band around the cuts, plus whatever
-/// the blocks leave free, is matched by the fast strategy.
+/// The weighted Blossom is super-linear (measured 56.96 s on the 30k-triangle
+/// 0.6 mm performance part), so the mesh is cut into spatial blocks whose
+/// interior is small enough to match exactly; only the band around the cuts,
+/// plus whatever the blocks leave free, is matched by the fast strategy. The
+/// blocked path measured 3.32 s on that part (17x).
 ///
 /// The block solve is deliberately a **maximum-weight** matching, not a
 /// maximum-cardinality one: forcing every block to pair all of its triangles
@@ -1353,6 +1570,9 @@ fn blocked_matching(
     if blocks <= 1 {
         return weighted_matching(n, edges);
     }
+    // The mesh is cut along x only. The measured parts are much wider than
+    // tall (100 x 60 plate), so x cuts give balanced blocks; a 2D kd-tree would
+    // divide unusual domains more evenly but is not needed for this corpus.
     let centroids: Vec<f64> = tris
         .iter()
         .map(|t| (points[t[0]][0] + points[t[1]][0] + points[t[2]][0]) / 3.0)
@@ -1366,6 +1586,9 @@ fn blocked_matching(
         let greedy = greedy_matching(n, edges);
         return Blossom::new(n, adj, greedy).run(scores);
     }
+    // Equal-width blocks; the cut positions themselves are fixed, and a
+    // triangle whose centroid is within `band_width` of any cut is left to the
+    // fast band pass.
     let width = (hi - lo) / blocks as f64;
     let cuts: Vec<f64> = (1..blocks).map(|i| lo + width * i as f64).collect();
     let in_band: Vec<bool> = centroids
@@ -1391,6 +1614,8 @@ fn blocked_matching(
         local_of[t] = block_vertices[b].len();
         block_vertices[b].push(t);
     }
+    // Each block's interior is matched by the weighted Blossom on local
+    // indices; cross-block edges are ignored here (the band pass handles them).
     for b in 0..blocks {
         if block_vertices[b].is_empty() {
             continue;
@@ -1438,18 +1663,30 @@ fn blocked_matching(
             mate[b] = a;
         }
     }
-    // Global maximum cardinality; only the band's free vertices can remain.
+    // Global maximum cardinality: the block solves are maximum-weight, not
+    // maximum-cardinality, so the band and the free vertices are repaired by
+    // the in-house Edmonds pass. Only the band's free vertices can remain
+    // unmatched; the all-quad closure needs none at all.
     Blossom::new(n, adj, mate).run(scores)
 }
 
 /// How the triangle dual graph is matched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MatchPlan {
-    /// The reference weighted Blossom (`mwmatching`) on the whole graph.
+    /// The reference weighted Blossom (`mwmatching`) on the whole graph; used
+    /// up to `EXACT_MATCHING_TRIANGLES`, where it is both cheap and the best
+    /// quality, so the measured table is reproduced exactly.
     Exact,
-    /// Weighted Blossom on spatial block interiors, fast matching on the band.
+
+    /// Weighted Blossom on spatial block interiors (~[`BLOCK_TRIANGLES`] each),
+    /// then greedy + in-house Edmonds on the interface band and the block-free
+    /// vertices; used above `EXACT_MATCHING_TRIANGLES` and measured 17x
+    /// faster than `Exact` on the 0.6 mm part.
     Blocked,
-    /// Quality-first greedy plus unweighted Blossom augmentation.
+
+    /// Quality-first greedy plus unweighted Blossom augmentation over the whole
+    /// graph; the fallback plan when the cascade cannot close a residual
+    /// triangle produced by a better plan.
     Fast,
 }
 
@@ -1461,13 +1698,19 @@ fn recombine_with(
 ) -> (Vec<[usize; 4]>, Vec<[usize; 3]>) {
     let edges = recombination_edges(tris, points);
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); tris.len()];
+    // The dual graph is undirected; every recombination edge is one candidate
+    // pairing.
     for &(a, b, _) in &edges {
         adj[a].push(b);
         adj[b].push(a);
     }
+    // The plan decides only the matching; the cascade closes whatever triangles
+    // remain afterwards.
     let mate = match plan {
         MatchPlan::Exact => weighted_matching(tris.len(), &edges),
         MatchPlan::Blocked => {
+            // Wide enough for the interface band to contain every edge that
+            // crosses a block cut, in mean edge lengths.
             let scores = free_vertex_scores(tris, points);
             let band_width = BAND_EDGES * edge_scale(tris, points);
             let blocks = block_count(tris.len());
@@ -1521,6 +1764,8 @@ fn recombine_and_close(
 // Local closure of residual triangles (refinement cascade)
 // ------------------------------------------------------------------------- //
 
+/// Index of the point at `p`, appending it to `points` when it is new; the
+/// exact-coordinate key makes a shared midpoint one node.
 fn point_id(index: &mut HashMap<(u64, u64), usize>, points: &mut Vec<Node>, p: [f64; 2]) -> usize {
     let key = point_key(p);
     if let Some(&id) = index.get(&key) {
@@ -1532,6 +1777,8 @@ fn point_id(index: &mut HashMap<(u64, u64), usize>, points: &mut Vec<Node>, p: [
     id
 }
 
+/// Index of the midpoint of nodes `a` and `b`, inserted on first use; the
+/// cascade relies on the same midpoint being reused when two closures meet.
 fn midpoint(
     index: &mut HashMap<(u64, u64), usize>,
     points: &mut Vec<Node>,
@@ -1545,6 +1792,9 @@ fn midpoint(
     point_id(index, points, p)
 }
 
+/// Is a quad acceptable for the cascade? Every corner scaled Jacobian must be
+/// finite and `>= 0.2`, and every corner angle in `[30, 179]` degrees. This is
+/// the gate's floor, so a triangle closure can never create a failing quad.
 fn quad_is_good(quad: [usize; 4], points: &[Node]) -> bool {
     let cell = Cell::quad4(quad);
     let sj = quality::scaled_jacobian(&cell, points);
@@ -1557,6 +1807,8 @@ fn quad_is_good(quad: [usize; 4], points: &[Node]) -> bool {
         .all(|&a| a.is_finite() && (30.0..=179.0).contains(&a))
 }
 
+/// `(min corner scaled Jacobian, min corner angle in degrees)` of a quad; the
+/// split guard compares children with their parent through these two values.
 fn quad_quality(quad: [usize; 4], points: &[Node]) -> (f64, f64) {
     let cell = Cell::quad4(quad);
     let sj = quality::scaled_jacobian(&cell, points)
@@ -1567,6 +1819,8 @@ fn quad_quality(quad: [usize; 4], points: &[Node]) -> (f64, f64) {
     (sj, min_angle)
 }
 
+/// Index of the first quad that has `{a, b}` as an edge (either direction), or
+/// `None`; used by the cascade to carry a hanging midpoint across an edge.
 fn find_quad_edge(quads: &[[usize; 4]], a: usize, b: usize) -> Option<usize> {
     quads.iter().position(|q| {
         (0..4).any(|i| {
@@ -1577,6 +1831,9 @@ fn find_quad_edge(quads: &[[usize; 4]], a: usize, b: usize) -> Option<usize> {
     })
 }
 
+/// Index of the first triangle that has `{a, b}` as an edge (either
+/// direction), or `None`; used when a cascade reaches another residual
+/// triangle.
 fn find_tri_edge(tris: &[[usize; 3]], a: usize, b: usize) -> Option<usize> {
     tris.iter().position(|t| {
         (0..3).any(|i| {
@@ -1588,8 +1845,15 @@ fn find_tri_edge(tris: &[[usize; 3]], a: usize, b: usize) -> Option<usize> {
 }
 
 /// Replace one triangle by three quads around its centroid, splitting its three
-/// edges at their midpoints. `known` carries a midpoint that already exists on
-/// one edge (a cascade that reached this triangle).
+/// edges at their midpoints.
+///
+/// `hanging` maps an edge to the midpoint that already exists on it (a cascade
+/// that reached this triangle), so a split never creates two nodes at the same
+/// place. Every new quad is checked by [`quad_is_good`] **before** the triangle
+/// is removed; on failure the function returns an error and the caller discards
+/// its per-plan copy (the shared `points`/`quads` of another plan are never
+/// touched). The three split edges are pushed to `queue` so the cascade can
+/// carry their midpoints across the neighbouring cells.
 fn close_triangle(
     index: usize,
     points: &mut Vec<Node>,
@@ -1617,6 +1881,8 @@ fn close_triangle(
             }
         };
     }
+    // Three quads, each with one triangle vertex, two edge midpoints and the
+    // centroid. This is the "triangle -> three quads" template of the cascade.
     let p = [
         (points[t[0]][0] + points[t[1]][0] + points[t[2]][0]) / 3.0,
         (points[t[0]][1] + points[t[1]][1] + points[t[2]][1]) / 3.0,
@@ -1645,6 +1911,13 @@ fn close_triangle(
 
 /// Split a quad that has a hanging midpoint on `edge`, joining it to the
 /// midpoint of the opposite edge.
+///
+/// This is the propagation step of the cascade: the hanging node enters one
+/// side, the opposite midpoint is created (or reused), and the opposite edge is
+/// queued for the next cell. The split is refused when a second cascade has
+/// already reached an adjacent edge of the same quad (this one template cannot
+/// handle two hanging edges) and when either child would be below the parent's
+/// quality floors.
 #[allow(clippy::too_many_arguments)]
 fn split_quad(
     index: usize,
@@ -1692,6 +1965,9 @@ fn split_quad(
             n
         }
     };
+    // Two children by the segment from the hanging midpoint `m` to the
+    // opposite midpoint `n`; `m` is already a node of the parent, so the quad
+    // count grows by one.
     let q1 = [v0, m, n, v3];
     let q2 = [m, v1, v2, n];
     // The split must not make the parent quad worse. Where the parent already
@@ -1714,6 +1990,15 @@ fn split_quad(
 }
 
 /// Close every residual triangle by the refinement cascade.
+///
+/// Each residual triangle is expanded to three quads, and every hanging
+/// midpoint is propagated across the neighbouring quad (or residual triangle)
+/// until the cascade reaches the boundary. `operations` is a safety cap: a
+/// non-terminating cascade (which should not happen) returns an error instead of
+/// looping.
+///
+/// On error the caller discards `points`, `quads` and `tris`; this function
+/// does not roll back a partial cascade.
 fn close_leftovers(
     points: &mut Vec<Node>,
     quads: &mut Vec<[usize; 4]>,
@@ -1725,6 +2010,8 @@ fn close_leftovers(
     }
     let mut hanging: HashMap<(usize, usize), usize> = HashMap::new();
     let mut operations = 0usize;
+    // `tris` is consumed one triangle at a time; the inner queue carries the
+    // hanging midpoints of the current cascade only.
     while !tris.is_empty() {
         let mut queue: Vec<((usize, usize), usize)> = Vec::new();
         close_triangle(0, points, quads, tris, &mut ids, &mut hanging, &mut queue)?;
@@ -1733,6 +2020,9 @@ fn close_leftovers(
             if operations > 20_000 {
                 return Err("the refinement cascade did not terminate".to_string());
             }
+            // A midpoint on a quad edge splits that quad; on a residual
+            // triangle edge it closes that triangle; an edge not found means
+            // the cascade has reached nothing it can refine, and it is dropped.
             if let Some(qid) = find_quad_edge(quads, edge.0, edge.1) {
                 split_quad(
                     qid,
@@ -1758,11 +2048,25 @@ fn close_leftovers(
 
 /// Mesh `domain` with the L-norm frontal Delaunay route (see the module docs),
 /// using the default [`Options`].
+///
+/// This is the public entry point: `mesh(domain, sizing)` is equivalent to
+/// [`mesh_with_options`] with `Options::default()`.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
     mesh_with_options(domain, sizing, &Options::default())
 }
 
-/// Mesh `domain` with the L-norm frontal Delaunay route and explicit [`Options`].
+/// Mesh `domain` with the L-norm frontal Delaunay route and explicit
+/// [`Options`].
+///
+/// Stages: validate the size and the outer loop, build the cross field
+/// (`CrossField::build`), sample and constrain the boundary
+/// (`sample_boundary`), refine the front (`frontal_refine`), relax the
+/// interior to remove flat triangles (`relax_points`), rebuild the
+/// constrained triangulation (`rebuild_cdt`), then recombine and close with
+/// the size-dependent plan list (`recombine_and_close`). The returned mesh is
+/// validated with [`Mesh::validate`] and is all-quad unless the cascade could
+/// not close a residual triangle on every plan; in that case the residual
+/// triangles are kept rather than silently dropped.
 pub fn mesh_with_options(
     domain: &Domain,
     sizing: &Sizing,
@@ -1781,6 +2085,8 @@ pub fn mesh_with_options(
         return Err("the boundary could not be discretized".to_string());
     }
 
+    // Insert the boundary points first, then constrain every boundary edge;
+    // the CDT below is built only from these constrained loops.
     let mut state = CdtState::new(size);
     for loop_points in &loops {
         for &p in loop_points {
@@ -1800,6 +2106,9 @@ pub fn mesh_with_options(
         }
     }
 
+    // The frontal loop inserts points until every front is resolved or blocked;
+    // the triangulation is a standard L2 Delaunay kernel (the paper observes
+    // that the L2 and L-infinity kernels give nearly the same triangulation).
     frontal_refine(&mut state, domain, &field, size, options)?;
 
     let base_tris = state.domain_triangles(domain);
@@ -1823,6 +2132,10 @@ pub fn mesh_with_options(
     // order: the matching decides where the residual triangles sit, and the
     // refinement cascade closes them; an unlucky pair can make the cascade's
     // first split poor, so the fast matching is kept as a fallback.
+    // The exact weighted Blossom is affordable only below the threshold; above
+    // it the blocked plan is the fast path. Both are retried with the fully
+    // greedy `Fast` plan if the cascade cannot close the first plan's
+    // leftovers.
     let plans: &[MatchPlan] = if final_tris.len() <= EXACT_MATCHING_TRIANGLES {
         &[MatchPlan::Exact, MatchPlan::Fast]
     } else {
@@ -1856,6 +2169,8 @@ mod tests {
     use crate::two_d::Sizing;
     use crate::verify;
 
+    /// The two implemented norms differ where it matters: Manhattan gives 7
+    /// and L-infinity 4 for the same vector.
     #[test]
     fn distances_are_the_two_norms() {
         let a = [0.0, 0.0];
@@ -1871,6 +2186,9 @@ mod tests {
         assert!((l1_distance(a, c) - std::f64::consts::SQRT_2).abs() < 1.0e-12);
     }
 
+    /// Eq. (10): the minimal axis-aligned square of a right isosceles triangle
+    /// with axis-aligned legs is the one with the hypotenuse as a diagonal, and
+    /// the circumcentre is the hypotenuse midpoint.
     #[test]
     fn the_circumsquare_of_a_right_isosceles_triangle() {
         // Legs along the axes: (-1,-1), (1,-1), (-1,1).
@@ -1891,6 +2209,9 @@ mod tests {
         assert!((centre[1] - hyp_mid[1]).abs() < 1.0e-12);
     }
 
+    /// §4.3: in the infinity norm the right isosceles triangle with
+    /// axis-aligned legs is equilateral, which is why the apex construction
+    /// produces the square the recombination wants.
     #[test]
     fn the_linf_equilateral_triangle_has_three_equal_sides() {
         // A right isosceles triangle with axis-aligned legs is equilateral in L∞.
@@ -1907,6 +2228,8 @@ mod tests {
         assert!((l3 - l1).abs() < 1.0e-12);
     }
 
+    /// On a rectangle every boundary tangent is axis aligned, so the smoothed
+    /// cross must be a multiple of `pi / 2` everywhere inside.
     #[test]
     fn the_cross_field_of_a_rectangle_is_axis_aligned() {
         let domain = Domain::rectangle(10.0, 6.0).unwrap();
@@ -1920,6 +2243,7 @@ mod tests {
         }
     }
 
+    /// End-to-end on a rectangle: no triangle survives and the gate passes.
     #[test]
     fn a_rectangle_becomes_all_quads_and_passes_the_gate() {
         let domain = Domain::rectangle(12.0, 8.0).unwrap();
@@ -1933,6 +2257,8 @@ mod tests {
         assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
     }
 
+    /// The two-loop case: the inner boundary must be constrained as well, and
+    /// the cascade must still close every residual triangle.
     #[test]
     fn the_plate_with_a_hole_is_quad_dominant() {
         let domain = Domain::plate_with_hole(20.0, 12.0, 2.0, 8).unwrap();
@@ -1946,6 +2272,8 @@ mod tests {
         assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
     }
 
+    /// The in-house blossom must repair the classic greedy failure on a
+    /// 4-vertex path (greedy takes the middle edge, leaving both ends free).
     #[test]
     fn the_greedy_matching_is_augmented_to_maximum_cardinality() {
         // A 4-vertex path whose heaviest edge is the middle one: greedy takes
@@ -1989,6 +2317,8 @@ mod tests {
         (points, tris)
     }
 
+    /// The block + interface-band path must still yield a perfect matching on
+    /// a regular triangle grid, where a perfect matching exists.
     #[test]
     fn the_blocked_matching_is_a_perfect_matching_on_a_triangle_grid() {
         let (points, tris) = triangle_grid(24);
@@ -2012,6 +2342,8 @@ mod tests {
         assert!(leftover.is_empty());
     }
 
+    /// The exact plan must pair every triangle of a regular grid and pass the
+    /// gate without invoking the cascade.
     #[test]
     fn the_recombination_makes_all_quads_on_a_triangle_grid() {
         let (points, tris) = triangle_grid(12);
@@ -2024,6 +2356,7 @@ mod tests {
         assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
     }
 
+    /// A non-positive size is refused before any triangulation work.
     #[test]
     fn a_bad_size_is_refused() {
         let domain = Domain::rectangle(1.0, 1.0).unwrap();
@@ -2033,6 +2366,9 @@ mod tests {
         assert!(mesh(&domain, &bad).is_err());
     }
 
+    /// Non-default [`Options`] refine differently but must still produce an
+    /// all-quad, gate-passing mesh on the rectangle; the test also checks that
+    /// the explicit values differ from the defaults.
     #[test]
     fn non_default_options_still_produce_a_valid_mesh() {
         let domain = Domain::rectangle(12.0, 8.0).unwrap();
