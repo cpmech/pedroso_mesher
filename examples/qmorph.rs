@@ -5,11 +5,17 @@
 //! triangles, inverted elements, min scaled Jacobian, min corner angle, cracks,
 //! pass/fail and the first reason. A "PASS" cannot be read off the intent; it is
 //! `verify::gate`.
+//!
+//! The conversion is followed by an alternating loop: W2 smoothing, then the
+//! Sun residual walk again. The smoother moves the nodes that made a pentagon
+//! recombination concave, so the last interior slivers can pair; the loop stops
+//! when the mesh is all-quad or two consecutive rounds make no progress.
 
-use pedroso_mesher::mesh::{Cell, Mesh};
+use pedroso_mesher::mesh::{Cell, Kind, Mesh};
 use pedroso_mesher::qmorph::convert_with_stats;
 use pedroso_mesher::quality;
-use pedroso_mesher::two_d::{triangulate, Domain, Sizing};
+use pedroso_mesher::sun;
+use pedroso_mesher::two_d::{smooth_mesh, triangulate, Domain, Sizing};
 use pedroso_mesher::verify;
 
 fn arc(cx: f64, cy: f64, r: f64, a0: f64, a1: f64, n: usize) -> Vec<[f64; 2]> {
@@ -60,6 +66,42 @@ fn stepped() -> Domain {
     .unwrap()
 }
 
+/// Total order on a float for the best-state comparison (values are finite).
+#[derive(Clone, Copy, PartialEq)]
+struct OrderedF64(f64);
+
+impl Eq for OrderedF64 {}
+
+impl PartialOrd for OrderedF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+fn quad_cells(mesh: &Mesh) -> Vec<[usize; 4]> {
+    mesh.cells
+        .iter()
+        .filter(|c| c.kind == Kind::Quad4)
+        .map(|c| [c.nodes[0], c.nodes[1], c.nodes[2], c.nodes[3]])
+        .collect()
+}
+
+fn tri_cells(mesh: &Mesh) -> Vec<[usize; 3]> {
+    mesh.cells
+        .iter()
+        .filter(|c| c.kind == Kind::Tri3)
+        .map(|c| [c.nodes[0], c.nodes[1], c.nodes[2]])
+        .collect()
+}
+
 fn run(name: &str, d: &Domain, size: f64) {
     let t0 = std::time::Instant::now();
     let (points, tris) = match triangulate(d, &Sizing::uniform(size).unwrap()) {
@@ -76,19 +118,80 @@ fn run(name: &str, d: &Domain, size: f64) {
 
     let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
     cells.extend(leftover.iter().map(|t| Cell::tri3(*t)));
-    let mut mesh = Mesh::new(points.clone(), cells);
+    let mut mesh = Mesh::new(points, cells);
     let gate_raw = verify::gate(&mesh);
 
-    // The shipped W2 smoother runs on the converted mesh, exactly as it does on
-    // the matching path.
-    pedroso_mesher::two_d::smooth_mesh(&mut mesh, d, 80, size);
-    let gate = verify::gate(&mesh);
+    // Alternate smoothing and the residual walk. The first round is the shipped
+    // W2 smoother on the conversion output; later rounds widen the smoother's
+    // search radius for the last slivers.
+    let mut remaining = leftover.len();
+    let mut rounds = 0usize;
+    let mut stale = 0usize;
+    let mut last_remaining = remaining;
+    // Each round leaves a valid mesh; keep the best one under the gate's own
+    // order (fewest triangles, then highest min angle, then min Jacobian). A
+    // wider smoothing pass helps closure but can coarsen a good mesh, and the
+    // best state is not always the last one.
+    let mut best: Option<(Mesh, verify::Gate)> = None;
+    let score = |g: &verify::Gate| {
+        (
+            g.triangles,
+            g.inverted,
+            g.cracks,
+            std::cmp::Reverse(OrderedF64(g.min_corner_angle_deg)),
+            std::cmp::Reverse(OrderedF64(g.min_scaled_jacobian)),
+        )
+    };
+    while remaining > 0 && rounds < 10 && stale < 3 {
+        let factor = match rounds {
+            0..=1 => 1.0,
+            _ => 4.0,
+        };
+        smooth_mesh(&mut mesh, d, 80, size * factor);
+        let q = quad_cells(&mesh);
+        let t = tri_cells(&mesh);
+        let (p2, q2, t2, _stats) = sun::close_residuals(&mesh.points, &q, &t);
+        let mut cells2: Vec<Cell> = q2.iter().map(|q| Cell::quad4(*q)).collect();
+        cells2.extend(t2.iter().map(|t| Cell::tri3(*t)));
+        mesh = Mesh::new(p2, cells2);
+        remaining = t2.len();
+        rounds += 1;
+        if remaining >= last_remaining {
+            stale += 1;
+        } else {
+            stale = 0;
+        }
+        last_remaining = remaining;
 
-    // Quality of the quads alone, so a leftover triangle does not hide whether
-    // the converter is producing usable elements.
+        let mut candidate = mesh.clone();
+        smooth_mesh(&mut candidate, d, 80, size);
+        let candidate_gate = verify::gate(&candidate);
+        let better = match &best {
+            None => true,
+            Some((_, current)) => score(&candidate_gate) < score(current),
+        };
+        if better {
+            best = Some((candidate, candidate_gate));
+        }
+    }
+    let t_total = t0.elapsed().as_secs_f64();
+
+    let (mesh, gate) = match best {
+        Some(best) => best,
+        None => {
+            smooth_mesh(&mut mesh, d, 80, size);
+            let gate = verify::gate(&mesh);
+            (mesh, gate)
+        }
+    };
+
     let quad_mesh = Mesh::new(
         mesh.points.clone(),
-        quads.iter().map(|q| Cell::quad4(*q)).collect::<Vec<_>>(),
+        mesh.cells
+            .iter()
+            .filter(|c| c.kind == Kind::Quad4)
+            .cloned()
+            .collect::<Vec<_>>(),
     );
     let quad_report = quality::report(&quad_mesh);
 
@@ -108,7 +211,7 @@ fn run(name: &str, d: &Domain, size: f64) {
         println!("      reason: {reason}");
     }
     println!(
-        "{:12} {:>4}  +W2 sm  quads {:5}  tri {:4}  inv {:3}  SJ {:.3}  ang {:5.1}  cracks {:3}  {:4}  | quads-only SJ {:.3} ang {:5.1}",
+        "{:12} {:>4}  +W2 sm  quads {:5}  tri {:4}  inv {:3}  SJ {:.3}  ang {:5.1}  cracks {:3}  {:4}  | quads-only SJ {:.3} ang {:5.1} | rounds {rounds} {:.2}s",
         "",
         "",
         gate.quads,
@@ -120,6 +223,7 @@ fn run(name: &str, d: &Domain, size: f64) {
         if gate.passes() { "PASS" } else { "FAIL" },
         quad_report.min_scaled_jacobian,
         quad_report.min_corner_angle_deg,
+        t_total,
     );
     if let Some(reason) = gate.reason() {
         println!("      reason: {reason}");

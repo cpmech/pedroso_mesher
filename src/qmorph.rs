@@ -40,10 +40,12 @@
 //! with a seam. The front fragments into small loops (many of them one
 //! triangle, three front edges) and those cannot be quadrangulated without
 //! changing the loop's parity. The leftover triangles are then handed to
-//! [`crate::sun::close_residuals`], Sun's residual-triangle walk. On the six
-//! parts that walk removes 83–97 % of them (68→10, 292→24, 962→52, 78→10,
-//! 64→12, 382→34) but its boundary template cannot finish the last boundary
-//! slivers; the module documentation there records the geometric reason.
+//! [`crate::sun::close_residuals`], Sun's residual-triangle walk with the
+//! boundary M2/M3 and M6 operations of Sun 2015 §5. On the six parts it closes
+//! plate-hole 4/2 mm and stepped completely (68→0, 292→0, 382→0) and leaves
+//! 2/1/6 triangles on plate-hole 1 mm, l-bracket and ring (962→2, 78→1,
+//! 64→6); those are isolated interior slivers that no pentagon recombination
+//! can move. The module documentation there records the geometric reason.
 //!
 //! **The policy is not enforced by this code.** Nothing here refuses a run that
 //! ignores it; measure the mesh that came out with [`crate::verify::gate`].

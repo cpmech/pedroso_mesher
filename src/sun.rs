@@ -29,17 +29,30 @@
 //! conformity; this mesher's conversion runs on one domain, and
 //! [`CloseStats::remaining`] carries a triangle out rather than breaking it.
 //!
-//! **Measured limit on the Q-Morph output (2026-10-22).** The walk removes
-//! 83-95 % of the leftovers but does not empty the mesh: 10, 24, 52, 10, 12 and
-//! 34 triangles remain on plate-hole 4/2/1 mm, l-bracket, ring and stepped, and
-//! 154 on the 0.6 mm performance part. They are the boundary slivers. The
-//! Fig. 6 template cannot finish them: the Q-Morph quad next to the sliver often
-//! has its own third node on the same straight boundary line, so inserting
-//! `P` on the sliver's boundary edge puts `P`, `b` and that node on one line and
-//! the new outer quad is degenerate. Sun handles this with the nine topological
-//! optimisation modes of Sun 2015 §5 (M2-M7 for a boundary quadrilateral with
-//! three boundary nodes), which are outside this round. Those residuals are
-//! returned in [`CloseStats::remaining`]; the gate is not claimed to pass.
+//! **Boundary topological optimisation.** The Fig. 6 template cannot finish a
+//! boundary sliver when the adjacent Q-Morph quad already has a third node on
+//! the same straight boundary line: inserting `P` then puts `P`, `b` and that
+//! node on one line and the outer template quad is degenerate. Two Sun 2015 §5
+//! operations are implemented for it:
+//!
+//! - **M2/M3 edge swap** ([`WalkMesh::repair_quad`]): after the template, swap
+//!   the degenerate quad's shared edge with an adjacent quad; if the pair of
+//!   new quads is positive, the degeneracy is gone.
+//! - **M6-style absorption** ([`WalkMesh::absorb_sliver`]): when `e-b-c-f` are
+//!   collinear on the boundary, remove the sliver plus its two quads and
+//!   replace them by two quads, deleting one boundary node. The boundary
+//!   geometry is unchanged because the four nodes are collinear.
+//!
+//! **Measured on the Q-Morph output (2026-10-22).** The walk plus those modes,
+//! alternating with W2 smoothing (the smoother moves the nodes that made a
+//! pentagon recombination concave), gives all-quad plate-hole 4 mm, 2 mm and
+//! stepped; plate-hole 1 mm has 2 triangles, l-bracket 1, ring 6 and the 0.6 mm
+//! performance part 8. The remaining ones are isolated interior slivers: every
+//! pentagon split around them is concave and they cannot reach the boundary, so
+//! M2/M3 has nothing to swap. A local cavity/edge-flip remesh is the next
+//! operation. The 40° floor is not met either; only l-bracket reaches 42.6°
+//! (with one triangle left). [`CloseStats::remaining`] carries the triangles
+//! out; the gate is not claimed to pass.
 //!
 //! **Clean room.** Implemented from the papers above; no source code was read
 //! or ported.
@@ -91,6 +104,17 @@ pub struct CloseStats {
     pub moves: usize,
     /// Residual triangle finished with the Sun 2016 boundary template.
     pub boundary_templates: usize,
+    /// Sun 2015 §5.2.1 M2/M3 edge swaps that made a template quad valid.
+    pub boundary_repairs: usize,
+    /// Sun 2015 §5.2.1 M6-style absorptions: a boundary sliver plus its two
+    /// quads become two quads, removing the collinear boundary node.
+    pub boundary_absorptions: usize,
+    /// Boundary residuals whose template was tried.
+    pub template_attempts: usize,
+    /// Template attempts rejected before adding cells (not simple).
+    pub template_raw_failures: usize,
+    /// Templates whose degenerate quads M2/M3 could not repair.
+    pub template_repair_failures: usize,
     /// Triangles that could not be moved or merged.
     pub stuck: usize,
     /// Candidate quads refused because of the Jacobian guard.
@@ -108,6 +132,7 @@ const MOVE_MIN_SJ: f64 = 0.2;
 /// A residual triangle collapsed to less than this area is rejected.
 const MIN_TRI_AREA2: f64 = 1e-14;
 
+#[derive(Clone)]
 struct WalkMesh {
     points: Vec<Node>,
     cells: Vec<Option<Cell>>,
@@ -118,6 +143,13 @@ struct WalkMesh {
     merged: usize,
     quality_rejections: usize,
     merge_failures: usize,
+    repairs: usize,
+    templates: usize,
+    move_min_sj: f64,
+    template_attempts: usize,
+    template_raw_failures: usize,
+    template_repair_failures: usize,
+    absorptions: usize,
 }
 
 impl WalkMesh {
@@ -132,6 +164,13 @@ impl WalkMesh {
             merged: 0,
             quality_rejections: 0,
             merge_failures: 0,
+            repairs: 0,
+            templates: 0,
+            move_min_sj: MOVE_MIN_SJ,
+            template_attempts: 0,
+            template_raw_failures: 0,
+            template_repair_failures: 0,
+            absorptions: 0,
         };
         // Every cell is stored counter-clockwise. The walk reasons about the
         // winding of the moving edge; the normalisation makes the module safe on
@@ -422,7 +461,7 @@ impl WalkMesh {
                 continue;
             }
             let sj = quad_min_sj(&self.points, &quad);
-            if sj < MOVE_MIN_SJ {
+            if sj <= 0.0 || sj < self.move_min_sj {
                 self.quality_rejections += 1;
                 continue;
             }
@@ -564,9 +603,284 @@ impl WalkMesh {
         None
     }
 
+    /// Rebuild the boundary-edge list from the current edge adjacency.
+    fn recompute_boundary(&mut self) {
+        self.boundary = self
+            .edges
+            .iter()
+            .filter(|(_, owners)| owners.len() == 1)
+            .map(|(&edge, _)| edge)
+            .collect();
+        self.boundary.sort_unstable();
+    }
+
+    /// Sun 2015 §5.2.1 M6-style absorption for the straight-boundary
+    /// staircase. A residual `a-b-c` with `b-c` on the boundary, between quads
+    /// `b-a-d-e` and `a-c-f-g`, is removed together with the collinear boundary
+    /// node `b` (or `c`): the three cells become the two quads `c-f-g-a` +
+    /// `c-a-d-e` (or `b-f-g-a` + `b-a-d-e`). This is a hexagon quadrangulation,
+    /// not the Fig. 6 template: no point is inserted, one boundary node is
+    /// removed, and the operation is only valid when `e-b-c-f` are collinear,
+    /// so the boundary geometry is unchanged.
+    fn absorb_one_boundary_sliver(&mut self) -> bool {
+        let ids = self.tri_ids();
+        for id in ids {
+            if self.tri_has_boundary(id) && self.absorb_sliver(id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn absorb_sliver(&mut self, id: usize) -> bool {
+        let Some(t) = self.tri(id) else {
+            return false;
+        };
+        let t = normalize_tri(&self.points, t);
+        for i in 0..3 {
+            let b = t[i];
+            let c = t[(i + 1) % 3];
+            let a = t[(i + 2) % 3];
+            let edge = (b.min(c), b.max(c));
+            if !self.is_boundary_edge(edge) {
+                continue;
+            }
+            let Some(q1_id) = self.quad_neighbor(a, b, id) else {
+                continue;
+            };
+            let Some(q2_id) = self.quad_neighbor(a, c, id) else {
+                continue;
+            };
+            let Some(q1) = self.quad(q1_id) else {
+                continue;
+            };
+            let Some(q2) = self.quad(q2_id) else {
+                continue;
+            };
+            let q1 = normalize_quad(&self.points, q1);
+            let q2 = normalize_quad(&self.points, q2);
+            // Q1 traverses b -> a and Q2 traverses a -> c.
+            let Some(i1) = (0..4).find(|&k| q1[k] == b && q1[(k + 1) % 4] == a) else {
+                continue;
+            };
+            let d = q1[(i1 + 2) % 4];
+            let e = q1[(i1 + 3) % 4];
+            let Some(i2) = (0..4).find(|&k| q2[k] == a && q2[(k + 1) % 4] == c) else {
+                continue;
+            };
+            let f = q2[(i2 + 2) % 4];
+            let g = q2[(i2 + 3) % 4];
+            // The staircase is only removable when e, b, c, f lie on one
+            // straight boundary line; otherwise the chord e-c (or b-f) would
+            // cut the geometry.
+            if !collinear(self.p(e), self.p(b), self.p(c))
+                || !collinear(self.p(b), self.p(c), self.p(f))
+            {
+                continue;
+            }
+            // The union is a hexagon once b or c is removed. A hexagon has
+            // three quadrangulations (the diagonals v0-v3, v1-v4, v2-v5);
+            // evaluate all six and keep the best pair.
+            let original_area = (tri_area2(&self.points, t).abs()
+                + quad_area(&self.points, &q1)
+                + quad_area(&self.points, &q2))
+            .abs();
+            let hexagons = [
+                [c, f, g, a, d, e], // remove b
+                [b, f, g, a, d, e], // remove c
+            ];
+            let mut best: Option<([[usize; 4]; 2], f64)> = None;
+            for hex in hexagons {
+                for k in 0..3 {
+                    let pair = [
+                        normalize_quad(
+                            &self.points,
+                            [hex[k], hex[(k + 1) % 6], hex[(k + 2) % 6], hex[(k + 3) % 6]],
+                        ),
+                        normalize_quad(
+                            &self.points,
+                            [hex[(k + 3) % 6], hex[(k + 4) % 6], hex[(k + 5) % 6], hex[k]],
+                        ),
+                    ];
+                    if !pair.iter().all(|quad| quad_simple(&self.points, quad)) {
+                        continue;
+                    }
+                    let pair_area =
+                        quad_area(&self.points, &pair[0]) + quad_area(&self.points, &pair[1]);
+                    if (pair_area - original_area).abs() > 1.0e-6 * original_area.max(1.0) {
+                        continue;
+                    }
+                    let score = pair
+                        .iter()
+                        .map(|quad| quad_min_sj(&self.points, quad))
+                        .fold(f64::INFINITY, f64::min);
+                    if score <= 0.0 {
+                        continue;
+                    }
+                    if best.as_ref().is_none_or(|(_, bs)| score > *bs) {
+                        best = Some((pair, score));
+                    }
+                }
+            }
+            let Some((best, _)) = best else {
+                continue;
+            };
+            self.remove(id);
+            self.remove(q1_id);
+            self.remove(q2_id);
+            for quad in best {
+                self.add(Cell::Quad(quad));
+            }
+            self.recompute_boundary();
+            self.absorptions += 1;
+            return true;
+        }
+        false
+    }
+
+    /// Quads whose bilinear Jacobian is not strictly positive.
+    fn bad_quad_ids(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for id in 0..self.cells.len() {
+            if let Some(q) = self.quad(id) {
+                let q = normalize_quad(&self.points, q);
+                if quad_min_sj(&self.points, &q) <= 1e-9 {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    }
+
+    /// Sun 2015 §5.2.1 M2/M3: swap the shared edge of a degenerate quad with an
+    /// adjacent quad. The shared edge is replaced by the other diagonal of the
+    /// hexagon; the swap is kept only when both new quads are simple and have a
+    /// strictly positive Jacobian, and the pair with the best minimum Jacobian
+    /// wins.
+    fn repair_quad(&mut self, id: usize) -> bool {
+        let Some(q1) = self.quad(id) else {
+            return false;
+        };
+        let q1 = normalize_quad(&self.points, q1);
+        let mut best: Option<(f64, usize, [usize; 4], [usize; 4])> = None;
+        for i in 0..4 {
+            let x = q1[i];
+            let y = q1[(i + 1) % 4];
+            let edge = (x.min(y), x.max(y));
+            let owners = self.edge_cells(edge);
+            if owners.len() != 2 {
+                continue;
+            }
+            let other = if owners[0] == id {
+                owners[1]
+            } else {
+                owners[0]
+            };
+            let Some(q2) = self.quad(other) else {
+                continue;
+            };
+            let q2 = normalize_quad(&self.points, q2);
+            // Q2 has to traverse the shared edge in the opposite direction.
+            let Some(j) = (0..4).find(|&j| q2[j] == y && q2[(j + 1) % 4] == x) else {
+                continue;
+            };
+            let p = q1[(i + 2) % 4];
+            let q = q1[(i + 3) % 4];
+            let r = q2[(j + 2) % 4];
+            let s = q2[(j + 3) % 4];
+            let original_area = quad_area(&self.points, &q1) + quad_area(&self.points, &q2);
+            let options = [([p, q, x, r], [p, r, s, y]), ([q, x, r, s], [q, s, y, p])];
+            for (left, right) in options {
+                let left = normalize_quad(&self.points, left);
+                let right = normalize_quad(&self.points, right);
+                if !quad_simple(&self.points, &left) || !quad_simple(&self.points, &right) {
+                    continue;
+                }
+                let pair_area = quad_area(&self.points, &left) + quad_area(&self.points, &right);
+                if (pair_area - original_area).abs() > 1.0e-6 * original_area.max(1.0) {
+                    continue;
+                }
+                let sl = quad_min_sj(&self.points, &left);
+                let sr = quad_min_sj(&self.points, &right);
+                // A shallow intermediate degeneracy is allowed: the swap is
+                // one step of M2/M3 and the next iteration repairs the new
+                // boundary quad. The final check in `try_template_repair`
+                // requires every quad to be positive again.
+                if sl <= -0.05 || sr <= -0.05 {
+                    continue;
+                }
+                let score = sl.min(sr);
+                if best.as_ref().is_none_or(|(bs, _, _, _)| score > *bs) {
+                    best = Some((score, other, left, right));
+                }
+            }
+        }
+        if let Some((_, other, left, right)) = best {
+            self.remove(id);
+            self.remove(other);
+            self.add(Cell::Quad(left));
+            self.add(Cell::Quad(right));
+            self.repairs += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply the Fig. 6 template and, if it created degenerate boundary quads
+    /// (the case where an adjacent Q-Morph quad already has a third node on the
+    /// same boundary line), repair them with M2/M3. If that cannot make every
+    /// quad positive, the mesh is restored and the residual is left alone.
+    fn try_template_repair(&mut self, id: usize) -> bool {
+        self.template_attempts += 1;
+        let backup = self.clone();
+        if !self.apply_template_raw(id) {
+            self.template_raw_failures += 1;
+            return false;
+        }
+        for _ in 0..12 {
+            let bad = self.bad_quad_ids();
+            if bad.is_empty() {
+                return true;
+            }
+            let mut changed = false;
+            for q in &bad {
+                if self.quad(*q).is_some() && self.repair_quad(*q) {
+                    changed = true;
+                    break;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        *self = backup;
+        self.template_repair_failures += 1;
+        false
+    }
+
+    /// Template one boundary residual, if any is ready.
+    fn template_one_boundary(&mut self) -> bool {
+        let ids = self.tri_ids();
+        for id in ids {
+            if self.tri_has_boundary(id) {
+                // A single boundary sliver can be absorbed directly when the
+                // adjacent quads form the straight staircase (M6), otherwise
+                // the Fig. 6 template with its M2/M3 repair is used.
+                if self.absorb_sliver(id) {
+                    return true;
+                }
+                if self.try_template_repair(id) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// The Sun 2016, Fig. 6 template: one residual triangle with its boundary
     /// edge and its two adjacent quads become three quads.
-    fn apply_template(&mut self, id: usize) -> bool {
+    fn apply_template_raw(&mut self, id: usize) -> bool {
         let Some(t) = self.tri(id) else {
             return false;
         };
@@ -616,13 +930,12 @@ impl WalkMesh {
                 normalize_quad(&self.points, [inserted, g, a, d]),
                 normalize_quad(&self.points, [inserted, c, f, g]),
             ];
+            // Sun notes that the middle quad may be concave, and on a straight
+            // boundary an outer quad can be degenerate when the adjacent
+            // Q-Morph quad also touches the line. Accept any simple quad here;
+            // `try_template_repair` then runs M2/M3 or restores the mesh.
             let simple = quads.iter().all(|quad| quad_simple(&self.points, quad));
-            // Sun notes that the middle quad may be concave; the two outer
-            // quads must be convex.
-            let convex = [quads[0], quads[2]]
-                .iter()
-                .all(|quad| quad_sj(&self.points, quad).is_some());
-            if !simple || !convex {
+            if !simple {
                 self.points.pop();
                 continue;
             }
@@ -637,6 +950,7 @@ impl WalkMesh {
             self.boundary.push((b.min(inserted), b.max(inserted)));
             self.boundary.push((c.min(inserted), c.max(inserted)));
             self.boundary.sort_unstable();
+            self.templates += 1;
             return true;
         }
         false
@@ -656,8 +970,16 @@ impl WalkMesh {
             if !self.is_tri(id) {
                 return false;
             }
-            if self.tri_has_boundary(id) && self.apply_template(id) {
-                return true;
+            if self.tri_has_boundary(id) {
+                // A single boundary sliver can be absorbed directly when the
+                // adjacent quads form the straight staircase (M6), otherwise
+                // the Fig. 6 template with its M2/M3 repair is used.
+                if self.absorb_sliver(id) {
+                    return true;
+                }
+                if self.try_template_repair(id) {
+                    return true;
+                }
             }
             if let Some(edge) = self.adjacent_boundary_edge(id) {
                 if let Some(next) = self.move_onto_boundary(id, edge) {
@@ -715,68 +1037,105 @@ pub fn close_residuals(
     }
     let mut mesh = WalkMesh::new(points, quads, tris);
     let max_passes = mesh.cells.len().max(1) * 2 + 64;
-    for _ in 0..max_passes {
-        let ids = mesh.tri_ids();
-        if ids.len() <= 1 {
-            break;
-        }
-        let mut merged_this_pass = 0usize;
-        for id in ids {
-            if !mesh.is_tri(id) || mesh.tri_count() <= 1 {
-                continue;
+    // Strict quality first; the lower guards are only used after the 0.2 pass
+    // and the boundary absorption/template pass have stalled, for the last few
+    // slivers that no 0.2 recombinations can move.
+    for guard in [MOVE_MIN_SJ, 0.1, 0.0] {
+        mesh.move_min_sj = guard;
+        for _ in 0..max_passes {
+            let before = mesh.tri_count();
+            if before <= 1 {
+                break;
             }
-            let mut current = id;
-            let mut done = false;
-            // A merge can be geometrically impossible with the nearest target
-            // (the two triangles make a non-convex quad). Try further residuals
-            // before giving up on this one; a failed walk leaves the moving
-            // residual at its new position, which is where the next target is
-            // measured from.
-            let targets = mesh.nearest_tris(current);
-            for target in targets {
-                if mesh.tri_count() <= 1 || !mesh.is_tri(current) || !mesh.is_tri(target) {
+            // Pair residuals until the walk stalls at the 0.2 guard.
+            loop {
+                let ids = mesh.tri_ids();
+                if ids.len() <= 1 {
                     break;
                 }
-                if mesh.shares_edge(current, target) {
-                    if mesh.merge(current, target) {
-                        done = true;
-                        break;
+                let mut merged_this_pass = 0usize;
+                for id in ids {
+                    if !mesh.is_tri(id) || mesh.tri_count() <= 1 {
+                        continue;
                     }
-                    continue;
+                    let mut current = id;
+                    let mut done = false;
+                    // A merge can be geometrically impossible with the nearest
+                    // target (the two triangles make a non-convex quad). Try further
+                    // residuals before giving up on this one; a failed walk leaves
+                    // the moving residual at its new position, which is where the
+                    // next target is measured from.
+                    let targets = mesh.nearest_tris(current);
+                    for target in targets {
+                        if mesh.tri_count() <= 1 || !mesh.is_tri(current) || !mesh.is_tri(target) {
+                            break;
+                        }
+                        if mesh.shares_edge(current, target) {
+                            if mesh.merge(current, target) {
+                                done = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        let Some(pm) = mesh.center(target) else {
+                            continue;
+                        };
+                        match mesh.walk_to(current, target, pm) {
+                            Ok(()) => {
+                                done = true;
+                                break;
+                            }
+                            Err(next) => current = next,
+                        }
+                    }
+                    if done {
+                        merged_this_pass += 1;
+                    } else {
+                        stats.stuck += 1;
+                    }
                 }
-                let Some(pm) = mesh.center(target) else {
-                    continue;
-                };
-                match mesh.walk_to(current, target, pm) {
-                    Ok(()) => {
-                        done = true;
-                        break;
-                    }
-                    Err(next) => current = next,
+                if merged_this_pass == 0 {
+                    break;
                 }
             }
-            if done {
-                merged_this_pass += 1;
+            if mesh.tri_count() <= 1 {
+                break;
+            }
+            // Pairing stalled. A boundary residual can be finished directly with
+            // the Fig. 6 template; M2/M3 repairs the degenerate boundary quads it
+            // creates. One at a time, because removing it can make the rest pair.
+            // A straight-boundary staircase is finished by M6-style absorption
+            // (two quads, one fewer node) before the Fig. 6 template, which would
+            // insert a point on the same line and create a degenerate quad.
+            if mesh.absorb_one_boundary_sliver() {
+                stats.boundary_absorptions += 1;
             } else {
-                stats.stuck += 1;
+                mesh.template_one_boundary();
+            }
+            if mesh.tri_count() == before {
+                break;
             }
         }
-        if merged_this_pass == 0 {
+        if mesh.tri_count() <= 1 {
             break;
         }
     }
 
     if mesh.tri_count() == 1 {
         if let Some(&id) = mesh.tri_ids().first() {
-            if mesh.finish_last(id) {
-                stats.boundary_templates += 1;
-            }
+            mesh.finish_last(id);
         }
     }
     stats.merged_pairs = mesh.merged;
     stats.moves = mesh.moves;
     stats.quality_rejections = mesh.quality_rejections;
     stats.merge_failures = mesh.merge_failures;
+    stats.boundary_repairs = mesh.repairs;
+    stats.boundary_absorptions = mesh.absorptions;
+    stats.boundary_templates = mesh.templates;
+    stats.template_attempts = mesh.template_attempts;
+    stats.template_raw_failures = mesh.template_raw_failures;
+    stats.template_repair_failures = mesh.template_repair_failures;
     let (quads, tris) = mesh.collect();
     stats.remaining = tris.len();
     (mesh.points, quads, tris, stats)
@@ -872,6 +1231,16 @@ fn quad_min_sj(points: &[Node], quad: &[usize; 4]) -> f64 {
     }
 }
 
+/// The absolute area of a simple quad.
+fn quad_area(points: &[Node], quad: &[usize; 4]) -> f64 {
+    let p = |i: usize| [points[i][0], points[i][1]];
+    let a = p(quad[0]);
+    let b = p(quad[1]);
+    let c = p(quad[2]);
+    let d = p(quad[3]);
+    (area2(a, b, c) + area2(a, c, d)).abs()
+}
+
 /// The positive-only scaled Jacobian of a quad, or `None` when it is inverted.
 fn quad_sj(points: &[Node], quad: &[usize; 4]) -> Option<f64> {
     let sj = quad_min_sj(points, quad);
@@ -893,6 +1262,16 @@ fn quad_simple(points: &[Node], quad: &[usize; 4]) -> bool {
         return false;
     }
     !segments_cross(c[0], c[1], c[2], c[3]) && !segments_cross(c[1], c[2], c[3], c[0])
+}
+
+/// Three points on one line, relative to the segment lengths.
+fn collinear(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> bool {
+    let cross = area2(a, b, c).abs();
+    let scale = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2))
+        .sqrt()
+        .max(((c[0] - b[0]).powi(2) + (c[1] - b[1]).powi(2)).sqrt())
+        .max(((c[0] - a[0]).powi(2) + (c[1] - a[1]).powi(2)).sqrt());
+    cross <= 1.0e-9 * scale * scale
 }
 
 fn segments_cross(p: [f64; 2], q: [f64; 2], r: [f64; 2], s: [f64; 2]) -> bool {
@@ -958,9 +1337,41 @@ mod tests {
         assert_eq!(quads.len(), 3, "{quads:?}");
         assert_eq!(points.len(), 8);
         assert_eq!(stats.boundary_templates, 1);
+        assert!(
+            quads.iter().all(|q| quad_min_sj(&points, q) > 0.0),
+            "{quads:?}"
+        );
         let mesh = Mesh::new(points, quads.iter().map(|q| MeshCell::quad4(*q)).collect());
         assert_eq!(mesh.topology().cracks, 0);
-        assert!(quads.iter().all(|q| q.contains(&7)), "{quads:?}");
+    }
+
+    #[test]
+    fn a_straight_boundary_staircase_is_absorbed() {
+        // A boundary sliver a-b-c on y = 0, between quads b-a-d-e and a-c-f-g,
+        // with e, b, c, f collinear. The M6-style absorption removes one
+        // boundary node and replaces the three cells by two quads.
+        let points = vec![
+            [0.5, 1.0, 0.0],  // a
+            [0.0, 0.0, 0.0],  // b
+            [1.0, 0.0, 0.0],  // c
+            [0.5, 2.0, 0.0],  // d
+            [-1.0, 0.0, 0.0], // e
+            [2.0, 0.0, 0.0],  // f
+            [1.5, 2.0, 0.0],  // g
+        ];
+        let quads = [[1, 0, 3, 4], [0, 2, 5, 6]];
+        let tris = [[0, 1, 2]];
+        let (points, quads, tris, stats) = close_residuals(&points, &quads, &tris);
+        assert!(tris.is_empty(), "{tris:?}");
+        assert_eq!(quads.len(), 2, "{quads:?}");
+        assert_eq!(stats.boundary_absorptions, 1, "{stats:?}");
+        assert_eq!(stats.boundary_templates, 0, "{stats:?}");
+        assert!(
+            quads.iter().all(|q| quad_min_sj(&points, q) > 0.0),
+            "{quads:?}"
+        );
+        let mesh = Mesh::new(points, quads.iter().map(|q| MeshCell::quad4(*q)).collect());
+        assert_eq!(mesh.topology().cracks, 0);
     }
 
     #[test]
