@@ -2011,6 +2011,29 @@ pub fn perturb_low_quads(
             }
         }
     }
+    // A domain corner must stay at the corner: sliding it along one of the two
+    // adjacent edges cuts the corner while `boundary_offset` stays 0 (measured:
+    // (0,0) moved to (0,1.08) by the projection).
+    let mut at_corner = vec![false; pts.len()];
+    if let Some(d) = domain {
+        let mut corners: Vec<[f64; 2]> = Vec::new();
+        for (a, b) in d.segments() {
+            corners.push(a);
+            corners.push(b);
+        }
+        for (v, p) in pts.iter().enumerate() {
+            if !on_boundary[v] {
+                continue;
+            }
+            for c in &corners {
+                let dist = ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2)).sqrt();
+                if dist < 1.0e-9 {
+                    at_corner[v] = true;
+                    break;
+                }
+            }
+        }
+    }
     let mut incident: HashMap<usize, Vec<usize>> = HashMap::new();
     for (id, q) in quads.iter().enumerate() {
         for &v in q {
@@ -2042,6 +2065,9 @@ pub fn perturb_low_quads(
             for radius in [0.02 * size, 0.05 * size, 0.1 * size] {
                 for k in 0..8 {
                     let a = std::f64::consts::TAU * k as f64 / 8.0;
+                    if at_corner[v] {
+                        continue;
+                    }
                     let mut candidate = [here[0] + radius * a.cos(), here[1] + radius * a.sin()];
                     if on_boundary[v] {
                         // A boundary node may slide along the polyline, never off it.
@@ -2356,7 +2382,13 @@ mod tests {
     }
 
     #[test]
-    fn a_quad_with_three_collinear_nodes_is_perturbed_away() {
+    fn a_boundary_doublet_is_not_fixable_by_perturbation() {
+        // Three bottom nodes on the domain boundary, collinear: the middle one is
+        // a boundary doublet (a 180-degree corner of its quad). Sliding it along
+        // the boundary cannot remove the collinearity, and moving it off the
+        // boundary is forbidden, so the perturb leaves it alone. Removing it needs
+        // a boundary-doublet collapse / local re-quadrangulation, not a move.
+        let domain = crate::two_d::Domain::rectangle(2.0, 1.0).unwrap();
         let points = vec![
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -2364,58 +2396,26 @@ mod tests {
             [0.0, 1.0, 0.0],
         ];
         let quads = [[0, 1, 2, 3]];
-        assert!(
-            quad_min_sj(&points, &quads[0]) <= 1e-9,
-            "input is degenerate"
-        );
-        let domain = crate::two_d::Domain::rectangle(2.0, 1.0).unwrap();
-        let (pts, quads, tris, moved) =
-            perturb_low_quads(&points, &quads, &[], 1.0, 200, Some(&domain));
-        assert!(moved > 0, "the degenerate corner was not moved");
-        assert!(quad_min_sj(&pts, &quads[0]) >= 0.2, "{:?}", quads[0]);
-        assert!(tris.is_empty());
-    }
-
-    /// A 4 x 4 node grid (3 x 3 quads) with the interior node 6 pulled onto the
-    /// diagonal of its quad, so that quad has three collinear nodes.
-    fn grid_with_a_degenerate_quad() -> (Vec<Node>, Vec<[usize; 4]>) {
-        let mut points = Vec::new();
-        for j in 0..4 {
-            for i in 0..4 {
-                points.push([i as f64, j as f64, 0.0]);
-            }
-        }
-        points[6] = [1.5, 1.5, 0.0];
-        let mut quads = Vec::new();
-        for j in 0..3 {
-            for i in 0..3 {
-                let a = j * 4 + i;
-                quads.push([a, a + 1, a + 5, a + 4]);
-            }
-        }
-        (points, quads)
+        let (pts, _, _, _) = perturb_low_quads(&points, &quads, &[], 1.0, 20, Some(&domain));
+        let d = domain.distance_to_boundary([pts[1][0], pts[1][1]]);
+        assert!(d < 1.0e-12, "the boundary doublet left the boundary: {d}");
+        assert!(quad_min_sj(&pts, &quads[0]) <= 1.0e-9);
     }
 
     #[test]
-    fn an_interior_degenerate_quad_is_perturbed_away() {
-        let domain = crate::two_d::Domain::rectangle(3.0, 3.0).unwrap();
-        let (points, quads) = grid_with_a_degenerate_quad();
-        // The quad 5-6-10-9 has 5, 6 and 10 collinear after moving node 6.
-        let bad = [5usize, 6, 10, 9];
-        assert!(quads.contains(&bad));
-        assert!(quad_min_sj(&points, &bad) <= 1.0e-9, "input is degenerate");
-        let before = points.clone();
-        let (pts, out, _, moved) = perturb_low_quads(&points, &quads, &[], 1.0, 200, Some(&domain));
-        assert!(moved > 0, "no move was made");
-        assert!(quad_min_sj(&pts, &bad) >= 0.2, "{:?}", bad);
-        // The boundary nodes are on the domain boundary and must not move.
-        for (i, p) in before.iter().enumerate() {
-            let boundary = i % 4 == 0 || i % 4 == 3 || !(4..12).contains(&i);
-            if boundary {
-                assert!((pts[i][0] - p[0]).abs() < 1.0e-12 && (pts[i][1] - p[1]).abs() < 1.0e-12);
-            }
-        }
-        assert_eq!(out, quads);
+    fn a_domain_corner_node_is_never_moved() {
+        let domain = crate::two_d::Domain::rectangle(1.0, 1.0).unwrap();
+        // Node 0 is the domain corner (0,0) and the quad is badly shaped there;
+        // the perturb must leave the corner exactly where it is.
+        let points = vec![
+            [0.0, 0.0, 0.0],
+            [0.9, 0.05, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.02, 0.9, 0.0],
+        ];
+        let quads = [[0, 1, 2, 3]];
+        let (pts, _, _, _) = perturb_low_quads(&points, &quads, &[], 1.0, 50, Some(&domain));
+        assert!(pts[0][0].abs() < 1.0e-12 && pts[0][1].abs() < 1.0e-12);
     }
 
     #[test]

@@ -54,6 +54,10 @@ pub struct Stats {
     /// Largest distance of a boundary node from the domain boundary (0 when the
     /// mesh sits on its geometry; the gate cannot see a boundary moved inward).
     pub boundary_offset: f64,
+    /// Largest distance from a domain corner to the nearest boundary node (0 when
+    /// every corner is kept; a corner node sliding along an edge cuts the corner
+    /// while the boundary offset stays 0).
+    pub corner_offset: f64,
     /// Present when [`Route::TwoStage`] ran.
     pub two_stage: Option<twostage::TwoStageStats>,
 }
@@ -186,6 +190,7 @@ pub fn mesh_quads_with_route(
         quads_only_sj: report.min_scaled_jacobian,
         quads_only_angle_deg: report.min_corner_angle_deg,
         boundary_offset: verify::boundary_offset(domain, &mesh),
+        corner_offset: verify::corner_offset(domain, &mesh),
         two_stage,
     };
     let timing = Timing {
@@ -211,6 +216,19 @@ pub fn mesh_quads_with_route(
             timing,
             route,
             reason: format!("a boundary node is {offset:.2e} off the domain boundary"),
+            refusals,
+            mesh,
+        })));
+    }
+    let corner = verify::corner_offset(domain, &mesh);
+    if corner > tolerance {
+        return Err(QuadError::Unsupported(Box::new(Unsupported {
+            gate,
+            raw_gate,
+            stats,
+            timing,
+            route,
+            reason: format!("a domain corner is {corner:.2e} from the nearest boundary node"),
             refusals,
             mesh,
         })));

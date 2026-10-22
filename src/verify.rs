@@ -71,15 +71,8 @@ impl Gate {
     }
 }
 
-/// Largest distance of a **boundary node** from the domain boundary.
-///
-/// A conforming planar mesh has every boundary node on the domain polyline, so
-/// this is ~1e-15 (floating point). A larger value means the mesh no longer sits
-/// on the geometry it was built for — the gate's quality numbers cannot see that,
-/// because moving a boundary node inward can even improve them. Measured on the
-/// ring: a perturbation pass moved boundary nodes up to 0.1 x size per round and
-/// the mesh stuck out of the quarter annulus by ~0.1 mm.
-pub fn boundary_offset(domain: &crate::two_d::Domain, mesh: &Mesh) -> f64 {
+/// Which nodes are on the mesh boundary (an edge used by exactly one cell).
+fn boundary_node_mask(mesh: &Mesh) -> Vec<bool> {
     let mut count: HashMap<(usize, usize), usize> = HashMap::new();
     for cell in &mesh.cells {
         for i in 0..cell.nodes.len() {
@@ -88,22 +81,72 @@ pub fn boundary_offset(domain: &crate::two_d::Domain, mesh: &Mesh) -> f64 {
             *count.entry((a.min(b), a.max(b))).or_default() += 1;
         }
     }
-    let mut on_boundary = vec![false; mesh.points.len()];
+    let mut mask = vec![false; mesh.points.len()];
     for ((a, b), n) in count {
         if n == 1 {
-            if a < on_boundary.len() {
-                on_boundary[a] = true;
+            if a < mask.len() {
+                mask[a] = true;
             }
-            if b < on_boundary.len() {
-                on_boundary[b] = true;
+            if b < mask.len() {
+                mask[b] = true;
             }
         }
     }
+    mask
+}
+
+fn boundary_points(mesh: &Mesh) -> Vec<[f64; 2]> {
+    let mask = boundary_node_mask(mesh);
+    mesh.points
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| mask[*i])
+        .map(|(_, p)| [p[0], p[1]])
+        .collect()
+}
+
+/// Largest distance of a **boundary node** from the domain boundary.
+///
+/// A conforming planar mesh has every boundary node on the domain polyline, so
+/// this is ~1e-15 (floating point). A larger value means the mesh no longer sits
+/// on the geometry it was built for — the gate's quality numbers cannot see that,
+/// because moving a boundary node inward can even improve them. Measured on the
+/// ring: a perturbation pass moved boundary nodes up to 1.92 x size off the
+/// domain.
+pub fn boundary_offset(domain: &crate::two_d::Domain, mesh: &Mesh) -> f64 {
+    boundary_points(mesh)
+        .into_iter()
+        .map(|p| domain.distance_to_boundary(p))
+        .fold(0.0, f64::max)
+}
+
+/// Largest distance from a **domain corner** to the nearest boundary node.
+///
+/// `boundary_offset` only says the nodes are on the polyline; a node sitting on
+/// a corner can slide along an adjacent edge and stay on the polyline while the
+/// corner is cut away (measured: a corner node moved 1.08 along an edge while
+/// the offset stayed 0). Every domain vertex must keep a mesh node, so this
+/// check closes that hole.
+pub fn corner_offset(domain: &crate::two_d::Domain, mesh: &Mesh) -> f64 {
+    let boundary = boundary_points(mesh);
+    if boundary.is_empty() {
+        return f64::INFINITY;
+    }
+    let mut corners: Vec<[f64; 2]> = Vec::new();
+    for (a, b) in domain.segments() {
+        corners.push(a);
+        corners.push(b);
+    }
     let mut worst: f64 = 0.0;
-    for (i, p) in mesh.points.iter().enumerate() {
-        if on_boundary[i] {
-            worst = worst.max(domain.distance_to_boundary([p[0], p[1]]));
+    for c in corners {
+        let mut best = f64::INFINITY;
+        for p in &boundary {
+            let d = ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2)).sqrt();
+            if d < best {
+                best = d;
+            }
         }
+        worst = worst.max(best);
     }
     worst
 }
@@ -246,6 +289,36 @@ mod tests {
             vec![Cell::quad4([0, 1, 2, 3])],
         );
         assert!(boundary_offset(&domain, &on) < 1.0e-12);
+    }
+
+    #[test]
+    fn a_domain_corner_cut_away_is_measured() {
+        use crate::two_d::Domain;
+        let domain = Domain::rectangle(1.0, 1.0).unwrap();
+        // The corner (0,0) node slid up the left edge: still on the polyline,
+        // so the boundary offset is 0, but the corner is cut.
+        let mesh = Mesh::new(
+            vec![
+                [0.0, 0.3, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            vec![Cell::quad4([0, 1, 2, 3])],
+        );
+        assert!(boundary_offset(&domain, &mesh) < 1.0e-12);
+        let d = corner_offset(&domain, &mesh);
+        assert!((d - 0.3).abs() < 1.0e-12, "{d}");
+        let on = Mesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            vec![Cell::quad4([0, 1, 2, 3])],
+        );
+        assert!(corner_offset(&domain, &on) < 1.0e-12);
     }
 
     #[test]
