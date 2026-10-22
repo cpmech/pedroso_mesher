@@ -1,10 +1,13 @@
 //! Alternative all-quad planar route: quadtree–geometry intersection, no cleanup.
 //!
-//! This is the route of Rushdi, Mitchell, Mahmoud, Bajaj and Ebeida,
-//! *All-quad meshing without cleanup*, Computer-Aided Design 84 (2017) 1–16,
-//! and of its IMR 2015 precursor, *Robust all-quad meshing of domains with
-//! connected regions*, Procedia Engineering 124 (2015) 96–108.  The steps
-//! implemented here are:
+//! This is the route of corpus papers **`rushdi-2017`** (Rushdi, Mitchell,
+//! Mahmoud, Bajaj and Ebeida, *All-quad meshing without cleanup*,
+//! Computer-Aided Design 84 (2017) 1–16) and its IMR 2015 precursor
+//! **`rushdi-2015`** (Rushdi et al., *Robust all-quad meshing of domains with
+//! connected regions*, Procedia Engineering 124 (2015) 96–108).  The sections
+//! implemented here are the grid refinement of §2.1, the repelling of §2.2,
+//! polygon formation and midpoint subdivision of §2.3, and the two-refinement
+//! parity and template pass of §2.4.  The steps are:
 //!
 //! 1. **grid refinement to the size field** (§2.1): a quadtree over the
 //!    bounding box whose leaves are refined until the leaf diagonal is at most
@@ -21,9 +24,11 @@
 //! 2. **repelling** (§2.2): grid corners closer than `delta = 0.40 s` (the
 //!    local square size) to the geometry are moved away from it along a grid
 //!    line, so a grid/geometry intersection can never sit next to a corner and
-//!    make a flat or tiny angle.  The paper analyses `s/4`; the larger value is
-//!    an experimental choice that lifts the measured minimum angle above the
-//!    30-degree gate while keeping the scaled Jacobian above 0.5;
+//!    make a flat or tiny angle.  The paper analyses `s/4`; with that value the
+//!    measured minimum corner angle over the corpus was 23–25 degrees, below
+//!    the 30-degree gate.  The larger `0.40` is a measured tuning choice
+//!    ([`DELTA_FRACTION`]): it lifts the minimum above the gate while keeping
+//!    the scaled Jacobian above 0.5;
 //! 3. **polygon formation** (§2.3): every leaf cut by the boundary is split
 //!    into the polygons that conform to the geometry, using
 //!    [`Domain::contains`] and [`Domain::segments`].  A smooth run of the
@@ -43,17 +48,33 @@
 //!    hanging node survives, so the output is conforming without pillowing,
 //!    edge swapping or smoothing.
 //!
+//! Measured result (`examples/alt_quadtree.rs`, default options): 7/7 corpus
+//! parts are all-quad and gate-passing **raw and after the common post-pass**
+//! (post min scaled Jacobian 0.63–1.00, post corner 42.9–90 degrees; 14 900
+//! quads on the 0.6 mm performance part in 0.16 s raw).  The raw corner-angle
+//! band over the corpus is 35.7–145.0 degrees.
+//!
 //! Robustness.  The alignment of the grid lines relative to the boundary
 //! vertices decides whether a nearly-tangent piece of boundary becomes a thin
-//! cap.  The route therefore tries [`ALIGNMENTS`] deterministic line
-//! alignments and keeps the mesh with the best measured gate score.  A sharp
+//! cap.  The route therefore tries [`ALIGNMENTS`] (= 3) deterministic phase
+//! shifts of the grid lines, scores each candidate with [`mesh_score`] and
+//! keeps the best.  If every alignment fails to assemble a conforming mesh,
+//! the whole grid is rebuilt at half the target spacing, up to
+//! [`MAX_ATTEMPTS`] levels.  A sharp
 //! re-entrant corner inside a leaf (not reachable on this corpus, where
 //! axis-aligned corners sit on grid lines) is split by an interior diagonal.
 //!
 //! What is **not** implemented: two-sided domains, and the dedicated sharp
 //! vertex template of §2.3.1.  Axis-aligned sharp corners are placed on grid
 //! lines, where their angle is naturally split between the cells, so a
-//! re-entrant corner never becomes one reflex polygon.
+//! re-entrant corner never becomes one reflex polygon.  A non-axis-aligned
+//! sharp corner whose apex falls inside one leaf is *attempted* by the generic
+//! diagonal split of [`split_bad_vertices`]; if no visible diagonal exists the
+//! attempt fails and another alignment or level is tried, rather than falling
+//! back to the paper's corner template.  The quadtree of the paper is strongly
+//! balanced and adaptive; the size field of this crate is uniform, so the
+//! balanced tree collapses to the uniform grid of item 1 and is walked
+//! directly, with no per-leaf refinement pass.
 //!
 //! **Product limitation: grid-aligned, isotropic mesh.**  This is a
 //! Cartesian/quadtree route, so the mesh follows the background grid.  A
@@ -77,9 +98,17 @@ use serde::{Deserialize, Serialize};
 use crate::mesh::{Cell, Mesh, Node};
 use crate::two_d::{Domain, Sizing};
 
-/// How many grid alignments are tried before the result is accepted.
+/// How many grid alignments (grid-line phase shifts) are tried per attempt.
+///
+/// The search is deterministic: for attempt `level`, alignment `k` uses phase
+/// seed `level * ALIGNMENTS + k` in [`line_set`].  Three phases were enough for
+/// the corpus; this is a tuning choice, not a paper constant.
 const ALIGNMENTS: usize = 3;
 /// How many times the whole grid is rebuilt at half the spacing before failing.
+///
+/// Attempt `level` uses target spacing `cell_factor * size / sqrt(2) / 2^level`
+/// (see [`mesh_with_options`]), so the effective leaf edge halves per level.
+/// Three levels are the work guard; the corpus converges on the first.
 const MAX_ATTEMPTS: usize = 3;
 /// Coordinates are deduplicated at 10 nm resolution.
 const KEY_SCALE: f64 = 1.0e8;
@@ -99,22 +128,42 @@ const KEY_SCALE: f64 = 1.0e8;
 /// [`mesh_with_cell_factor`].
 pub const DEFAULT_CELL_FACTOR: f64 = 1.5;
 
-/// `delta = repelling fraction * local square side`.  The paper analyzes 1/4;
-/// 0.40 was selected empirically: it lifts the measured minimum corner angle
-/// from the paper's 24.3-degree band above the 30-degree gate while keeping
-/// the scaled Jacobian above 0.5 on every part of the corpus.
+/// `delta = repelling fraction * local square side`.  The paper analyses `s/4`
+/// (worst corner around 24.3 degrees); with `s/4` the measured minimum over
+/// this corpus was 23–25 degrees, below the 30-degree gate.  `0.40` is the
+/// measured replacement: it lifts the minimum above the gate while keeping the
+/// scaled Jacobian above 0.5 on every part of the corpus.  Tuning choice.
 const DELTA_FRACTION: f64 = 0.40;
-/// A polygon vertex whose interior angle exceeds this is split by a diagonal.
+/// A polygon corner whose interior angle exceeds this is split by a diagonal.
+///
+/// The paper's sharp-corner discussion is §2.3; the threshold is a tuning
+/// choice that catches both a reflex re-entrant corner (> 180 degrees) and the
+/// nearly flat vertices a polygonal boundary introduces (160–180 degrees).
 const BAD_ANGLE_DEG: f64 = 160.0;
 /// The two halves of a split must not become slivers themselves.
+///
+/// A candidate diagonal is rejected when either corner it creates is below
+/// this angle; 12 degrees is a tuning guard, well beyond the 30-degree gate
+/// because the quad subdivision that follows can only shrink a corner.
 const MIN_SPLIT_ANGLE_DEG: f64 = 12.0;
-/// Geometric tolerance for point/segment identities.
+/// Geometric tolerance for point/segment identities, in model units.
+///
+/// Used for dimensionless comparisons (coordinate equality, turn tests); the
+/// geometric tolerance that scales with the model is `1.0e-7 * self.scale()`
+/// in [`Builder::snap_to_cell_boundary`] and friends.
 const EPS: f64 = 1.0e-9;
 /// Upper bound on diagonal splits per cut cell.
+///
+/// A guard against a polygon that splits forever; on the corpus one or two
+/// splits suffice and the limit is never reached.
 const MAX_SPLITS: usize = 32;
-/// A chain turn gentler than this is smoothed away: the run becomes one chord
-/// whose subdivision midpoint is snapped to the run's arc-length point, instead
-/// of one flat polygon vertex per sampling point.
+/// A chain turn gentler than this is smoothed away.
+///
+/// The run becomes one chord whose subdivision midpoint is snapped to the run's
+/// arc-length point, instead of one flat polygon vertex per sampling point.
+/// The value is a tuning choice between the 30-degree gate and the sampling
+/// of a curved input (a smooth arc sampled at 5–10 degrees of turn must not
+/// keep a vertex per sample, while a real corner of 30 degrees or more must).
 const SMOOTH_TURN_DEG: f64 = 25.0;
 
 /// Options for the quadtree route.
@@ -126,19 +175,41 @@ pub struct Options {
     /// Grid-density factor: every leaf diagonal is at most
     /// `cell_factor * sizing.size`.  `1.0` is the paper's density and larger
     /// values coarsen the mesh; must lie in `[0.25, 4]`.
+    ///
+    /// Invariant: the effective leaf edge is `cell_factor * size / sqrt(2)`;
+    /// the default 1.5 therefore gives an edge of `1.06 * size` and the
+    /// element counts of the paving route at the nominal size.  This is the
+    /// knob the `sweep` mode of `examples/alt_quadtree.rs` measures.
     pub cell_factor: f64,
+
     /// How many deterministic grid alignments are tried per attempt before the
     /// mesh with the best measured gate score is accepted.  Must be at least 1.
+    ///
+    /// Invariant: `alignments * max_attempts` builds are attempted in the
+    /// worst case; `1` disables the search and takes the first conforming
+    /// mesh.
     pub alignments: usize,
+
     /// Repelling distance as a fraction of the local square side; `0.0` turns
     /// repelling off around a grid corner.
+    ///
+    /// The paper analyses `s/4`; the default is `0.40` because `s/4` leaves
+    /// 23–25 degree corners on the corpus (below the 30-degree gate).  Values
+    /// are not range-checked: a value large enough to cross a whole cell makes
+    /// [`repel`] reject the attempt as folded, which the outer loop retries.
     pub delta_fraction: f64,
+
     /// How many times the whole grid is rebuilt at half the spacing before the
     /// route fails.  Must lie in `[1, 32]`.
     pub max_attempts: usize,
 }
 
+/// The measured configuration: [`DEFAULT_CELL_FACTOR`], [`ALIGNMENTS`],
+/// [`DELTA_FRACTION`] and [`MAX_ATTEMPTS`].  Every field is a plain value, so
+/// `Options { cell_factor: 2.0, ..Options::default() }` keeps the rest.
 impl Default for Options {
+    /// The measured defaults; the values are documented on the constants and
+    /// on the fields of [`Options`].
     fn default() -> Self {
         Self {
             cell_factor: DEFAULT_CELL_FACTOR,
@@ -151,7 +222,10 @@ impl Default for Options {
 
 /// Mesh a planar domain with the cleanup-free quadtree route.
 ///
-/// Uses [`Options::default`].
+/// Uses [`Options::default`].  This is the entry point of `Route::Quadtree` in
+/// [`crate::config`].  Returns the best gate-scoring candidate mesh of the
+/// alignment/attempt search; returns `Err` (never panics) if no candidate is
+/// conforming, if the sizing is invalid, or if the domain is degenerate.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
     mesh_with_options(domain, sizing, &Options::default())
 }
@@ -160,6 +234,11 @@ pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
 /// `cell_factor * sizing.size`.  `1.0` is the paper's density; larger values
 /// coarsen the mesh.  The factor also scales the repelling distance, so the
 /// quality band is preserved as far as the corpus allows.
+///
+/// This is the documented **coarse option**: the sweep in
+/// `examples/alt_quadtree.rs` shows that `2.0` is the largest swept factor
+/// that still keeps the corpus 7/7 raw PASS (edge about `1.41 * size`, about
+/// 1.7x fewer elements).  Returns the same errors as [`mesh_with_options`].
 pub fn mesh_with_cell_factor(
     domain: &Domain,
     sizing: &Sizing,
@@ -177,6 +256,19 @@ pub fn mesh_with_cell_factor(
 
 /// Mesh a planar domain with the cleanup-free quadtree route, using explicit
 /// [`Options`].
+///
+/// Validation is strict and happens before any grid work: `cell_factor` in
+/// `[0.25, 4]`, at least one alignment, `max_attempts` in `[1, 32]`, a
+/// positive finite size, an outer loop of at least three points and a
+/// non-degenerate bounding box.
+///
+/// Search: for each attempt level (target spacing halved per level) every
+/// alignment is built by [`build`]; a conforming candidate is scored by
+/// [`mesh_score`] and the best is accepted immediately.  Only if every
+/// alignment of every level fails is `Err` returned, carrying the last build
+/// error.  Complexity is `O(cells log cells)` for the line sets, plus the
+/// per-cell clipping; the memory guard rejects a grid above four million
+/// nodes.
 pub fn mesh_with_options(
     domain: &Domain,
     sizing: &Sizing,
@@ -250,6 +342,12 @@ pub fn mesh_with_options(
 
 /// Score a candidate mesh: gate-passing candidates dominate, and among them a
 /// balanced minimum Jacobian/angle is preferred.
+///
+/// `base = min(min scaled Jacobian, min corner angle / 90)` lies in `[0, 1]`
+/// for a valid mesh, so adding 10 for a passing gate makes every passing
+/// candidate beat every failing one.  Ties keep the earlier alignment because
+/// the comparison is strict (`score > best`).  The score is only an ordering,
+/// not a quality report.
 fn mesh_score(mesh: &Mesh) -> f64 {
     let gate = crate::verify::gate(mesh);
     let base = gate
@@ -263,6 +361,10 @@ fn mesh_score(mesh: &Mesh) -> f64 {
 }
 
 /// The bounding box of the outer loop: `[xmin, ymin, xmax, ymax]`.
+///
+/// Only the outer loop is scanned (holes are inside it).  Returns `Err` on a
+/// non-finite coordinate.  The caller separately rejects a zero width or
+/// height.
 fn bounding_box(domain: &Domain) -> Result<[f64; 4], String> {
     let mut b = [
         f64::INFINITY,
@@ -282,7 +384,9 @@ fn bounding_box(domain: &Domain) -> Result<[f64; 4], String> {
     Ok(b)
 }
 
-/// Every boundary vertex of every loop.
+/// Every boundary vertex of every loop (outer first, then the holes).
+///
+/// Used by [`line_set`] to keep polygonal input vertices off grid lines.
 fn all_vertices(domain: &Domain) -> Vec<[f64; 2]> {
     let mut out = Vec::new();
     out.extend_from_slice(&domain.outer);
@@ -295,6 +399,13 @@ fn all_vertices(domain: &Domain) -> Vec<[f64; 2]> {
 /// Vertices whose two incident segments are both axis-aligned and do not form a
 /// straight line.  They are put exactly on grid lines, so the boundary follows
 /// those lines and the corner angle is split between the adjacent cells.
+///
+/// This is the implementation of the paper's §2.3 remark that an axis-aligned
+/// sharp corner should fall on a grid line rather than inside a leaf: the
+/// corner then becomes a grid node whose four incident cells each see a right
+/// angle.  `EPS` is used for the axis test and `1 - 1e-9` for the
+/// straight-through test, so duplicated or collinear input does not create a
+/// spurious line.
 fn axis_aligned_corners(domain: &Domain) -> Vec<[f64; 2]> {
     let mut out = Vec::new();
     for loop_points in std::iter::once(&domain.outer).chain(domain.holes.iter()) {
@@ -329,45 +440,132 @@ fn axis_aligned_corners(domain: &Domain) -> Vec<[f64; 2]> {
     out
 }
 
-/// One leaf of the (uniform) quadtree: its grid index and its four node ids.
+/// Classification of one leaf of the (uniform) quadtree.
+///
+/// Set in pass 1 of [`build`].  The variant drives pass 2 (hanging nodes),
+/// [`Builder::resolve_parity`] and the template choice in
+/// [`Builder::full_cell`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CellKind {
+    /// No part of the leaf is inside the domain.
     Outside,
+
+    /// The whole leaf is inside and untouched by the boundary; it may receive
+    /// hanging nodes and is meshed by the 2-refinement templates.
     Full,
+
+    /// The boundary crosses the leaf; it is meshed by polygon formation and
+    /// midpoint subdivision ([`Builder::mesh_cut_cell`]).
     Cut,
 }
 
 /// A boundary segment together with its position in the domain loops.
+///
+/// In [`Builder::segs`] the endpoints follow the stored loop order (`a -> b` is
+/// the direction of the input loop).  The segments of [`Builder::clip_cell`]
+/// are the same straight pieces clipped to a leaf; they are re-snapped to the
+/// leaf boundary so the two leaves sharing a side compute bit-identical
+/// endpoints.
 #[derive(Clone, Copy, Debug)]
 struct DomainSeg {
+    /// Start point of the directed segment, in model units.
     a: [f64; 2],
+
+    /// End point of the directed segment, in model units.
     b: [f64; 2],
 }
 
 /// The grid plus all accumulated mesh state of one attempt.
+///
+/// One `Builder` is created per (attempt, alignment) pair by [`build`].  Grid
+/// nodes come first in [`Builder::points`] and keep their `gid` for the whole
+/// attempt; every other node (boundary point, polygon vertex, edge midpoint,
+/// polygon centre) is appended and deduplicated by coordinate through
+/// [`Builder::pool`].
 struct Builder<'a> {
+    /// The input domain; only read (containment, nearest segment, distance).
     domain: &'a Domain,
+
+    /// Sorted x grid lines, length `nx + 1`; strictly increasing.
     xs: Vec<f64>,
+
+    /// Sorted y grid lines, length `ny + 1`; strictly increasing.
     ys: Vec<f64>,
+
+    /// Number of grid cells in x (`xs.len() - 1`).
     nx: usize,
+
+    /// Number of grid cells in y (`ys.len() - 1`).
     ny: usize,
+
     /// Moved positions of the grid nodes, indexed by `gid`.
+    ///
+    /// This is the output of [`repel`]; `pos[gid]` differs from
+    /// `(xs[i], ys[j])` only where repelling moved the node, and the move is
+    /// at most `2 * delta` away from the grid position (Euclidean).
     pos: Vec<[f64; 2]>,
-    /// All mesh nodes; the first `(nx+1)*(ny+1)` are the grid nodes.
+
+    /// All mesh nodes; the first `(nx + 1) * (ny + 1)` are the grid nodes.
+    ///
+    /// Node `gid = j * (nx + 1) + i` holds `pos[gid]`; later nodes are added by
+    /// [`Builder::add_node`].  Unused nodes are compacted away in
+    /// [`Builder::finish`].
     points: Vec<Node>,
+
+    /// Coordinate deduplication map: 10 nm key ([`pack`]) to node id.
+    ///
+    /// Invariant: two entries with the same key are the same node, so a node
+    /// shared by two leaves (a cell side midpoint, a boundary intersection) is
+    /// created once and the mesh is conforming by construction.
     pool: HashMap<(i64, i64), usize>,
+
+    /// The domain boundary, one directed segment per input loop edge.
+    ///
+    /// Includes the closing edge of every loop; holes are included, so a hole
+    /// inside the grid is treated exactly like the outer boundary.
     segs: Vec<DomainSeg>,
+
     /// Grid edges whose midpoint is a mesh node (a hanging node for the leaf
     /// on the other side).
+    ///
+    /// A key `(min(gid0, gid1), max(...))` is present when the midpoint of that
+    /// grid edge is used as a node by a cut leaf or by the parity marking, and
+    /// the untouched leaf on the other side must therefore use a 2-refinement
+    /// template.  Invariant after [`Builder::resolve_parity`]: every untouched
+    /// leaf has an even number of split sides.
     split: HashSet<(usize, usize)>,
+
+    /// Quads of the whole attempt, filled from `cells_quads` in
+    /// [`Builder::finish`].
     quads: Vec<[usize; 4]>,
+
+    /// Per-leaf classification, indexed by `j * nx + i`, length `nx * ny`.
     kind: Vec<CellKind>,
+
+    /// Per cut leaf, the quads its polygons produced (indexed like `kind`).
     cut_quads: Vec<Vec<[usize; 4]>>,
+
+    /// Per cut leaf, the cell sides `k` that its polygon uses in full.
+    ///
+    /// `k` is a side index in the counter-clockwise order `0 = bottom,
+    /// 1 = right, 2 = top, 3 = left`.  A side in this list means the leaf
+    /// contributes a hanging node to its neighbour; see pass 2 of [`build`].
     cut_sides: Vec<Vec<usize>>,
+
+    /// Per leaf, the final quads selected for the mesh (indexed like `kind`).
     cells_quads: Vec<Vec<[usize; 4]>>,
 }
 
-/// Build one attempt.
+/// Build one attempt: grid lines, repelling, leaf classification, cut-cell
+/// meshing, hanging-node marking, parity resolution and template assignment.
+///
+/// `target` is the requested leaf diagonal (already includes
+/// `cell_factor / sqrt(2)` and the halving of the attempt level).  `variant`
+/// selects the deterministic grid phase in [`line_set`].  Returns `Err` for a
+/// degenerate target, a degenerate grid, a collapsed node (two grid nodes at
+/// the same 10 nm key), a cut cell that is not one simply-connected chain, a
+/// template failure, or a final T-junction/crack (see [`Builder::finish`]).
+/// The caller treats any `Err` as one failed alignment.
 fn build(
     domain: &Domain,
     target: f64,
@@ -453,6 +651,8 @@ fn build(
             let quad = builder.cell_quad(i, j);
             let clipped = builder.clip_cell(&quad);
             if clipped.is_empty() {
+                // No boundary piece crosses the leaf: a centre test decides
+                // Full/Outside (the leaf may still be a hole's inside).
                 let centre = average4(&quad);
                 if builder.inside(centre, quad[0]) {
                     builder.kind[cell] = CellKind::Full;
@@ -484,6 +684,8 @@ fn build(
             for &side in &builder.cut_sides[cell] {
                 let (n0, n1) = (gid[side], gid[(side + 1) % 4]);
                 if let Some(neighbour) = builder.neighbour(i, j, side) {
+                    // Only a Full neighbour needs a 2-ref template; a Cut
+                    // neighbour already has the boundary node in its polygon.
                     if builder.kind[neighbour] == CellKind::Full {
                         builder.split.insert(edge_key(n0, n1));
                     }
@@ -493,6 +695,8 @@ fn build(
     }
 
     // --- pass 3: parity marking and 2-ref templates on untouched leaves ---
+    // Cut leaves already carry their quads; Full leaves are meshed only now,
+    // after parity has guaranteed an even number of hanging sides.
     builder.resolve_parity()?;
     for j in 0..ny {
         for i in 0..nx {
@@ -513,6 +717,18 @@ fn build(
 /// cells keep their size) to stop a boundary vertex from landing exactly on a
 /// line.  Lines through axis-aligned sharp corners are then inserted exactly,
 /// dropping uniform lines that would make a sliver next to them.
+///
+/// `n = ceil(span / target)` and `spacing = span / n`, so `spacing <= target`.
+/// The displacement is `phase * spacing * sin(pi * k / n)` with
+/// `phase = 0.06 + 0.055 * ((seed + variant) % 8)`: eight phases in `[0.06,
+/// 0.445]`, zero at both ends (the border lines are not moved) and maximal at
+/// the middle.  A seed is preferred when every polygonal vertex is at least
+/// `1e-7 * span` from every interior line and every axis-aligned sharp corner
+/// is more than `0.05 * spacing` away; otherwise the seed with the largest
+/// corner clearance is kept.  The forced corner lines are added exactly and a
+/// uniform line within `0.5 * spacing` of a forced line is dropped (that would
+/// be a sliver cell).  The result is strictly increasing, with at least two
+/// lines; otherwise `Err`.
 fn line_set(
     min: f64,
     max: f64,
@@ -540,6 +756,8 @@ fn line_set(
         lines.push(max);
         let score = vertex_clearance(&lines, vertices, is_x);
         let sharp_score = vertex_clearance(&lines, axis_vertices, is_x);
+        // Take the first seed that clears both clearances; otherwise keep the
+        // seed with the largest corner clearance and continue the search.
         if sharp_score > 0.05 * spacing && score > 1.0e-7 * span {
             best = Some((sharp_score, lines));
             break;
@@ -586,6 +804,12 @@ fn line_set(
 
 /// Smallest distance of the given vertices to any interior line, as a share of
 /// the grid spacing.  Used to reject a jitter that puts a vertex on a line.
+///
+/// The end lines are excluded (a vertex on the bounding box is legitimate).
+/// Returns 0.0 when there is no vertex or no interior line, and 1.0 when every
+/// vertex sits outside the span (the `worst` stays infinite).  The share is
+/// dimensionless; the caller compares it with `1e-7 * span` or
+/// `0.05 * spacing`.
 fn vertex_clearance(lines: &[f64], vertices: &[[f64; 2]], is_x: bool) -> f64 {
     if vertices.is_empty() || lines.len() < 2 {
         return 0.0;
@@ -606,6 +830,10 @@ fn vertex_clearance(lines: &[f64], vertices: &[[f64; 2]], is_x: bool) -> f64 {
 }
 
 /// Domain segments with their loop and segment indices.
+///
+/// One segment per loop edge, including the closing edge `last -> first`; the
+/// outer loop comes first, then each hole.  The direction is the stored loop
+/// order, which is what [`Builder::clip_cell`] and the chain walk preserve.
 fn domain_segments(domain: &Domain) -> Vec<DomainSeg> {
     let mut out = Vec::new();
     for loop_points in std::iter::once(&domain.outer).chain(domain.holes.iter()) {
@@ -624,6 +852,22 @@ fn domain_segments(domain: &Domain) -> Vec<DomainSeg> {
 }
 
 /// Move grid corners away from the geometry (grid-aligned repelling, §2.2).
+///
+/// For each grid node the allowed displacement is the **minimum** over its
+/// incident leaves of `delta_fraction * min(width, height)` (the local square
+/// side), so a node at a size change keeps the smaller allowance.  A node is
+/// moved only when its distance to the nearest domain segment is in
+/// `(EPS, delta)`; the move is along the grid-aligned direction of
+/// [`repel_point`].  The move is accepted only if the distance to that segment
+/// strictly increased and the displacement is at most `2 * delta` (a guard
+/// against the segment changing under the projection).  Finally every leaf of
+/// the moved grid must stay convex; otherwise the attempt is rejected with
+/// `Err("repelling folded a grid cell")`, and the caller retries another
+/// alignment or a finer grid.
+///
+/// With the paper's `s/4` the measured 30-degree gate failed at 23–25 degrees;
+/// the default `delta_fraction = 0.40` is the measured replacement (see
+/// [`DELTA_FRACTION`]).  The function never panics.
 fn repel(
     domain: &Domain,
     xs: &[f64],
@@ -691,6 +935,12 @@ fn repel(
 /// moved vertically until its vertical distance to the segment is `delta`, and
 /// vice versa.  Returns `None` when the point is not within `delta` of the
 /// segment in the selected coordinate.
+///
+/// "Horizontal-ish" means `|dx| >= |dy|`; the branch is chosen once from the
+/// segment direction, never from the point, so the move stays axis-aligned.
+/// The projection parameter is clamped to the segment, which keeps the move
+/// near an endpoint finite.  The returned point is the input coordinate in the
+/// other axis; the caller re-checks the true distance and the fold.
 fn repel_point(p: [f64; 2], a: [f64; 2], b: [f64; 2], delta: f64) -> Option<[f64; 2]> {
     let d = sub(b, a);
     if d[0].abs() >= d[1].abs() {
@@ -719,11 +969,22 @@ fn repel_point(p: [f64; 2], a: [f64; 2], b: [f64; 2], delta: f64) -> Option<[f64
     }
 }
 
+/// Grid queries and mesh construction for one attempt.
 impl<'a> Builder<'a> {
+    /// Global node id (`gid`) of the grid node `(i, j)`.
+    ///
+    /// Row-major: `j * (nx + 1) + i`; `i` in `0..=nx`, `j` in `0..=ny`.
+    /// Invariant: `gid < (nx + 1) * (ny + 1)`, which is the size of the grid
+    /// prefix of [`Builder::points`].
     fn gid(&self, i: usize, j: usize) -> usize {
         j * (self.nx + 1) + i
     }
 
+    /// The four grid node ids of cell `(i, j)`, counter-clockwise from the
+    /// bottom-left: `[bl, br, tr, tl]`.
+    ///
+    /// Side `k` of the leaf is the edge `gid[k] -> gid[(k + 1) % 4]`
+    /// (`0 = bottom`, `1 = right`, `2 = top`, `3 = left`).
     fn cell_gids(&self, i: usize, j: usize) -> [usize; 4] {
         [
             self.gid(i, j),
@@ -733,6 +994,11 @@ impl<'a> Builder<'a> {
         ]
     }
 
+    /// The **moved** corner coordinates of cell `(i, j)`, counter-clockwise
+    /// from the bottom-left.
+    ///
+    /// Uses [`Builder::pos`], not the uniform lines, so clipping and
+    /// containment see the repelled grid that the mesh will use.
     fn cell_quad(&self, i: usize, j: usize) -> [[f64; 2]; 4] {
         let g = self.cell_gids(i, j);
         [
@@ -743,6 +1009,11 @@ impl<'a> Builder<'a> {
         ]
     }
 
+    /// Flat index (`j * nx + i`) of the leaf across `side`, or `None` on the
+    /// grid border.
+    ///
+    /// `side` uses the counter-clockwise convention of [`Builder::cell_gids`];
+    /// the index is in `0..nx * ny`, matching [`Builder::kind`].
     fn neighbour(&self, i: usize, j: usize, side: usize) -> Option<usize> {
         let n = match side {
             0 => {
@@ -774,6 +1045,12 @@ impl<'a> Builder<'a> {
     }
 
     /// Add a point (deduplicated at 10 nm) and return its node id.
+    ///
+    /// This is the only way new nodes enter the mesh.  The `pool` key is
+    /// [`pack`] (10 nm grid), so a node request that rounds to the same key
+    /// returns the existing id; that is what makes shared boundary nodes and
+    /// shared edge midpoints conforming.  Coordinates are stored as given (not
+    /// rounded); the key only decides identity.
     fn add_node(&mut self, p: [f64; 2]) -> usize {
         let key = pack(p);
         if let Some(&id) = self.pool.get(&key) {
@@ -787,6 +1064,12 @@ impl<'a> Builder<'a> {
 
     /// Is `p` inside the domain?  A point on the geometry is probed a little
     /// toward `toward`, because the even-odd test is ambiguous there.
+    ///
+    /// `toward` must be a point known to be inside the same leaf (normally the
+    /// leaf centre); the probe walks `1e-3` of the way to it if the fixed
+    /// offset still lands on the geometry.  The threshold is `1e-9` in model
+    /// units; this is a classification test, not a boundary test (the exact
+    /// boundary offset is controlled by the snapping of §2.3).
     fn inside(&self, p: [f64; 2], toward: [f64; 2]) -> bool {
         let d = self.domain.distance_to_boundary(p);
         if d > 1.0e-9 {
@@ -806,6 +1089,12 @@ impl<'a> Builder<'a> {
         self.domain.contains(probe)
     }
 
+    /// Characteristic model length: the larger side of the grid, at least 1.
+    ///
+    /// Used to turn the absolute tolerances (`1e-7`, `1e-9`, area `1e-14`)
+    /// into model-relative ones, so a micron part and a kilometre part behave
+    /// the same.  The `max(1.0)` keeps a model smaller than one unit from
+    /// shrinking the tolerances below round-off.
     fn scale(&self) -> f64 {
         let w = self.xs[self.xs.len() - 1] - self.xs[0];
         let h = self.ys[self.ys.len() - 1] - self.ys[0];
@@ -813,6 +1102,18 @@ impl<'a> Builder<'a> {
     }
 
     /// The portions of the domain boundary strictly inside a leaf.
+    ///
+    /// A bounding-box rejection is followed by a convex clip of the segment to
+    /// the (convex) leaf; pieces shorter than `1e-12 * scale` and pieces that
+    /// only touch the leaf boundary are dropped, because they cannot cut the
+    /// leaf.  The clipped endpoints are snapped by
+    /// [`Builder::snap_to_cell_boundary`] so that two leaves sharing a side
+    /// produce the very same intersection point (otherwise the two halves of a
+    /// boundary chain would not meet).
+    ///
+    /// Returns the chain segments in no guaranteed order; the caller groups
+    /// them with [`chain_components`].  An empty result means the leaf is not
+    /// cut (or is only touched), which pass 1 resolves by a centre test.
     fn clip_cell(&self, quad: &[[f64; 2]; 4]) -> Vec<DomainSeg> {
         let mut out = Vec::new();
         for seg in &self.segs {
@@ -847,6 +1148,14 @@ impl<'a> Builder<'a> {
     }
 
     /// Snap a clipping endpoint onto the exact corner/side it belongs to.
+    ///
+    /// The tolerance is `1e-7 * scale`.  An endpoint that is a domain vertex
+    /// (`at_segment_end`) is returned unchanged: it must keep its input
+    /// coordinates.  Otherwise the point is snapped to a leaf corner when it is
+    /// within tolerance, and to the exact segment/side intersection
+    /// ([`side_intersection`]) when it is within `10 * tol`; this is the
+    /// "bit-identical on both sides" trick.  If nothing matches, the clipped
+    /// point is kept as is.
     fn snap_to_cell_boundary(
         &self,
         p: [f64; 2],
@@ -892,6 +1201,16 @@ impl<'a> Builder<'a> {
     ///
     /// Returns the quads of the leaf and the cell sides whose midpoint became a
     /// mesh node (i.e. the leaf contributes a hanging node to its neighbour).
+    ///
+    /// Steps: group the clipped pieces into chains (§2.3); require exactly one
+    /// chain, because a leaf with two disjoint boundary pieces is not handled
+    /// by this route; walk the chain from its entry to its exit on the leaf
+    /// boundary ([`walk_chain`]); close it into a polygon with the inside arc
+    /// ([`Builder::build_polygon`]); record the leaf sides used in full;
+    /// split polygons with a bad corner ([`split_bad_vertices`]); midpoint
+    /// subdivide each polygon ([`Builder::subdivide`]).
+    ///
+    /// `Err` means this alignment/attempt is rejected; the outer loop retries.
     fn mesh_cut_cell(
         &mut self,
         i: usize,
@@ -929,6 +1248,18 @@ impl<'a> Builder<'a> {
 
     /// Choose the boundary polygon of a cut leaf: the chain plus the arc of the
     /// leaf boundary that lies inside the domain.
+    ///
+    /// The chain is first reduced to its real corners by
+    /// [`simplify_chain`], which also returns the arc-length point to use on
+    /// every smooth chord.  Two candidate polygons are formed: the
+    /// counter-clockwise leaf arc from the exit back to the entry, and the
+    /// complementary arc.  A candidate is accepted when it has positive area
+    /// above `1e-14 * scale^2`, is simple, has its centroid strictly inside
+    /// itself and that centroid is inside the domain; the first accepted
+    /// candidate wins.  The polygon is then cleaned at `1e-7 * scale`
+    /// ([`clean_polygon`]) and its edges that coincide with a simplified chain
+    /// chord are tagged with the chord's snap point.  `Err` means the leaf
+    /// could not be closed into one inside polygon.
     fn build_polygon(
         &self,
         quad: &[[f64; 2]; 4],
@@ -971,6 +1302,7 @@ impl<'a> Builder<'a> {
         second.extend(corners);
 
         let mut chosen: Option<Vec<[f64; 2]>> = None;
+        // Use the first valid candidate; the complementary arc is the fallback.
         for mut candidate in [first, second] {
             if polygon_area(&candidate).abs() <= 1.0e-14 * self.scale() * self.scale() {
                 continue;
@@ -1027,10 +1359,21 @@ impl<'a> Builder<'a> {
 
     /// Midpoint subdivision of one polygon into one quad per edge (§2.3).
     ///
+    /// For polygon vertices `v_0..v_{n-1}` and edge midpoints `m_k`, the quads
+    /// are `[C, m_k, v_{k+1}, m_{k+1}]` with `C` the vertex average; this is
+    /// the paper's "one quad per edge" midpoint subdivision.
+    ///
     /// The midpoint of a chain edge is snapped onto the geometry; the midpoint
     /// of an interior edge (a cell side or a split diagonal) stays on the
     /// straight edge.  Snapping keeps every boundary node on the domain while
-    /// changing the quad by at most the small sagitta of the chord.
+    /// changing the quad by at most the small sagitta of the chord.  A snap is
+    /// used only when it is within `0.4` of the chord length; otherwise the
+    /// straight midpoint is kept and the polygon is marked unsnapped.
+    ///
+    /// A degenerate quad after snapping falls back to
+    /// [`Builder::subdivide_unsnapped`] for the whole polygon (so a polygon is
+    /// never half snapped); if the unsnapped subdivision is also degenerate the
+    /// attempt fails with `Err`.
     fn subdivide(&mut self, polygon: &Poly, quads: &mut Vec<[usize; 4]>) -> Result<(), String> {
         let n = polygon.points.len();
         if n < 3 {
@@ -1048,6 +1391,9 @@ impl<'a> Builder<'a> {
             let b = self.points[vertices[(k + 1) % n]];
             let mut m = [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])];
             if polygon.chain_edge[k] {
+                // Snap the chord midpoint onto the boundary run; a snap farther
+                // than 0.4 of the chord would shear the quad too much, so the
+                // whole polygon falls back to straight midpoints below.
                 let q = match polygon.snap.get(k).copied().flatten() {
                     Some(p) => p,
                     None => nearest_boundary_point(self.domain, m),
@@ -1087,6 +1433,11 @@ impl<'a> Builder<'a> {
     }
 
     /// Midpoint subdivision without snapping, used as a fallback.
+    ///
+    /// Identical topology to [`Builder::subdivide`] but every midpoint is the
+    /// straight chord midpoint, so the boundary nodes are the unsnapped chord
+    /// points (a boundary offset of at most the chord sagitta).  All quads must
+    /// be distinct and positively oriented; otherwise `Err`.
     fn subdivide_unsnapped(
         &mut self,
         polygon: &Poly,
@@ -1126,6 +1477,19 @@ impl<'a> Builder<'a> {
 
     /// Mark leaves until every untouched leaf has an even number of hanging
     /// sides (the "corner marking" of §2.4), then the 2-ref templates apply.
+    ///
+    /// An untouched ([`CellKind::Full`]) leaf with an odd number of split sides
+    /// cannot be meshed by the 2-refinement templates.  The pass repeatedly
+    /// takes the first odd leaf and runs a BFS through untouched leaves over
+    /// **unsplit** edges to a second odd leaf; every edge on that path is marked
+    /// as split.  Marking an edge toggles the parity of both endpoint leaves, so
+    /// each round removes two odd leaves.  The path never crosses a cut leaf,
+    /// which would change a cut cell's mesh.
+    ///
+    /// Invariants after the call: every full leaf has even parity, and the
+    /// marked edges are exactly the hanging-node edges.  `Err` if the number of
+    /// odd leaves is odd, if an odd leaf cannot reach a partner, or if the BFS
+    /// parent chain is cyclic (a guard against an inconsistent `split` set).
     fn resolve_parity(&mut self) -> Result<(), String> {
         let total = self.nx * self.ny;
         loop {
@@ -1197,6 +1561,8 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Number of sides of cell `(i, j)` whose midpoint is a split (hanging)
+    /// node, in `0..=4`.
     fn split_count(&self, i: usize, j: usize) -> usize {
         let gid = self.cell_gids(i, j);
         (0..4)
@@ -1205,6 +1571,20 @@ impl<'a> Builder<'a> {
     }
 
     /// Mesh one untouched leaf with the 2-ref templates.
+    ///
+    /// The template depends only on the split sides, which parity guarantees to
+    /// be an even count:
+    ///
+    /// - 0 splits: the cell itself (`1` quad);
+    /// - 2 opposite splits: two quads split by the line joining the two edge
+    ///   midpoints (`2` quads);
+    /// - 2 adjacent splits: three quads around the cell centre, using the two
+    ///   adjacent midpoints and the centre (`3` quads);
+    /// - 4 splits: four quads around the centre, one per corner (`4` quads).
+    ///
+    /// An odd count is rejected (`Err`), which means [`Builder::resolve_parity`]
+    /// missed something.  Every produced quad is checked for positive
+    /// orientation and distinct nodes.
     fn full_cell(&mut self, i: usize, j: usize) -> Result<Vec<[usize; 4]>, String> {
         let gid = self.cell_gids(i, j);
         let mut split = [false; 4];
@@ -1256,12 +1636,21 @@ impl<'a> Builder<'a> {
         Ok(out)
     }
 
+    /// Node id of the midpoint of nodes `a` and `b`, creating it on first
+    /// use.  Deduplication makes the midpoint shared by both neighbouring
+    /// leaves, so no T-junction can remain.
     fn midpoint_id(&mut self, a: usize, b: usize) -> usize {
         let pa = self.points[a];
         let pb = self.points[b];
         self.add_node([0.5 * (pa[0] + pb[0]), 0.5 * (pa[1] + pb[1])])
     }
 
+    /// Node id of the average of a cell's four corners, creating it on first
+    /// use.
+    ///
+    /// The centre is the average of the (possibly repelled) corner positions,
+    /// not the average of the uniform cell; that keeps the 2-ref templates
+    /// inside the repelled quad.
     fn center_id(&mut self, gid: &[usize; 4]) -> usize {
         let mut x = 0.0;
         let mut y = 0.0;
@@ -1273,6 +1662,14 @@ impl<'a> Builder<'a> {
     }
 
     /// Assemble the mesh, compact the point list and check conformity.
+    ///
+    /// Concatenates `cells_quads` into `quads`, remaps the used nodes to a
+    /// compact list, and returns the mesh only after two independent checks:
+    /// [`has_t_junction`] (a node strictly inside a single-use edge) and
+    /// `Mesh::topology().cracks != 0` (boundary cracks).  These checks are the
+    /// "no cleanup" guarantee: a mesh that would need cleanup is rejected and
+    /// the outer search tries another alignment/attempt instead.  `Err` on an
+    /// unknown node id, an empty mesh, a T-junction or a crack.
     fn finish(mut self) -> Result<Mesh, String> {
         for cell in &self.cells_quads {
             self.quads.extend_from_slice(cell);
@@ -1318,30 +1715,42 @@ impl<'a> Builder<'a> {
 // small geometry helpers
 // ---------------------------------------------------------------------------
 
+/// Vector `a - b` (the difference is used as a direction, hence the order).
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     [a[0] - b[0], a[1] - b[1]]
 }
 
+/// Euclidean dot product; the squared length is `dot(a, a)`.
 fn dot(a: [f64; 2], b: [f64; 2]) -> f64 {
     a[0] * b[0] + a[1] * b[1]
 }
 
+/// Scalar cross product `a.x * b.y - a.y * b.x`.
+///
+/// Its sign is the turn direction: positive means `b` is to the left of `a`.
+/// Used by [`polygon_area`], [`segments_cross`] and [`quad_convex`].
 fn cross(a: [f64; 2], b: [f64; 2]) -> f64 {
     a[0] * b[1] - a[1] * b[0]
 }
 
+/// Euclidean length of `a`.
 fn norm(a: [f64; 2]) -> f64 {
     dot(a, a).sqrt()
 }
 
+/// Euclidean distance between two points, in model units.
 fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
     norm(sub(a, b))
 }
 
+/// Linear interpolation `a + t * (b - a)`; `t` is **not** clamped, so the
+/// caller can extrapolate deliberately.
 fn lerp(a: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
     [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]
 }
 
+/// Centroid (vertex average) of four points; the leaf centre used for the
+/// inside probe and the 2-ref templates.
 fn average4(q: &[[f64; 2]; 4]) -> [f64; 2] {
     [
         0.25 * (q[0][0] + q[1][0] + q[2][0] + q[3][0]),
@@ -1370,6 +1779,8 @@ fn pack(p: [f64; 2]) -> (i64, i64) {
     (xi, yi)
 }
 
+/// Order-independent key of an undirected edge, so `(a, b)` and `(b, a)` hit
+/// the same entry in [`Builder::split`].
 fn edge_key(a: usize, b: usize) -> (usize, usize) {
     if a < b {
         (a, b)
@@ -1378,6 +1789,10 @@ fn edge_key(a: usize, b: usize) -> (usize, usize) {
     }
 }
 
+/// Distance from point `p` to the **closed** segment `a..b`.
+///
+/// A zero-length segment falls back to the point distance; the projection is
+/// clamped, so an endpoint gives the correct distance outside the span.
 fn point_segment_distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     let ab = sub(b, a);
     let len2 = dot(ab, ab);
@@ -1400,6 +1815,12 @@ fn polygon_area(p: &[[f64; 2]]) -> f64 {
     0.5 * sum
 }
 
+/// Area centroid of a polygon (the vertex average when the area is zero).
+///
+/// Uses the shoelace weights; `a2.abs() <= 1e-30` is a degeneracy guard that
+/// returns the vertex average instead of dividing by zero, so the function is
+/// total.  Only used for the inside test of a candidate polygon, where a
+/// sliver's centroid is not trusted.
 fn polygon_centroid(p: &[[f64; 2]]) -> [f64; 2] {
     let n = p.len();
     let mut a2 = 0.0;
@@ -1427,6 +1848,11 @@ fn polygon_centroid(p: &[[f64; 2]]) -> [f64; 2] {
     [cx * inv, cy * inv]
 }
 
+/// Even-odd (ray-crossing) test: is `p` strictly inside the closed polygon?
+///
+/// A point exactly on an edge or vertex is ambiguous (the parity can go either
+/// way); callers only use it with a centroid or an offset probe, where that
+/// case does not arise.
 fn point_in_polygon(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
     let n = poly.len();
     let mut inside = false;
@@ -1443,6 +1869,11 @@ fn point_in_polygon(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
     inside
 }
 
+/// Do the open segments `a..b` and `c..d` cross **properly**?
+///
+/// Touching at an endpoint (`t` or `u` at 0/1) and collinear overlap return
+/// false; the tolerance `1e-9` keeps a shared polygon vertex from counting as
+/// a self-intersection in [`polygon_simple`].
 fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
     let d1 = sub(b, a);
     let d2 = sub(d, c);
@@ -1455,6 +1886,11 @@ fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
     t > 1.0e-9 && t < 1.0 - 1.0e-9 && u > 1.0e-9 && u < 1.0 - 1.0e-9
 }
 
+/// Is the closed polygon simple (no two non-adjacent edges properly cross)?
+///
+/// Adjacent edges share a vertex by construction and are skipped.  Returns
+/// false for fewer than three points.  A tangential self-touch is not
+/// detected; the corpus polygons do not produce one.
 fn polygon_simple(p: &[[f64; 2]]) -> bool {
     let n = p.len();
     if n < 3 {
@@ -1497,6 +1933,10 @@ fn polygon_interior_angles(p: &[[f64; 2]]) -> Vec<f64> {
     out
 }
 
+/// Unoriented angle between two vectors, in degrees, clamped to `[0, 180]`.
+///
+/// Returns 0.0 for a zero vector instead of NaN, so a degenerate polygon
+/// vertex is reported as a bad (flat) corner rather than crashing.
 fn angle_between_deg(a: [f64; 2], b: [f64; 2]) -> f64 {
     let na = norm(a);
     let nb = norm(b);
@@ -1506,7 +1946,11 @@ fn angle_between_deg(a: [f64; 2], b: [f64; 2]) -> f64 {
     (dot(a, b) / (na * nb)).clamp(-1.0, 1.0).acos().to_degrees()
 }
 
-/// Is the convex quad wound counter-clockwise?
+/// Is the quad convex (in either winding)?
+///
+/// All four turns must have the same sign; the `1e-14` dead band keeps a
+/// nearly straight corner from flipping the test.  Orientation itself is
+/// checked separately by [`quad_positive`], which requires counter-clockwise.
 fn quad_convex(q: &[[f64; 2]; 4]) -> bool {
     let mut positive = 0;
     let mut negative = 0;
@@ -1524,6 +1968,12 @@ fn quad_convex(q: &[[f64; 2]; 4]) -> bool {
     positive == 4 || negative == 4
 }
 
+/// Is `p` strictly inside the convex quad `q`, at least `1e-10` from its
+/// sides?
+///
+/// Assumes `q` is counter-clockwise.  The margin is what keeps a clipped
+/// boundary endpoint that lies on the leaf boundary from being reported as an
+/// interior point of the chain.
 fn quad_contains_strict(q: &[[f64; 2]; 4], p: [f64; 2]) -> bool {
     for k in 0..4 {
         let a = q[k];
@@ -1538,6 +1988,7 @@ fn quad_contains_strict(q: &[[f64; 2]; 4], p: [f64; 2]) -> bool {
     true
 }
 
+/// Distance from `p` to the nearest side of the quad, in model units.
 fn quad_distance_to_boundary(q: &[[f64; 2]; 4], p: [f64; 2]) -> f64 {
     let mut best = f64::INFINITY;
     for k in 0..4 {
@@ -1546,6 +1997,10 @@ fn quad_distance_to_boundary(q: &[[f64; 2]; 4], p: [f64; 2]) -> f64 {
     best
 }
 
+/// Conservative overlap of an axis-aligned box with a (convex) quad.
+///
+/// Returns true when the boxes overlap, so it only rejects a segment that
+/// cannot possibly cut the leaf; the exact test is the clip that follows.
 fn aabb_overlap(xmin: f64, ymin: f64, xmax: f64, ymax: f64, q: &[[f64; 2]; 4]) -> bool {
     let mut qxmin = f64::INFINITY;
     let mut qymin = f64::INFINITY;
@@ -1585,6 +2040,12 @@ fn clip_segment_to_quad(a: [f64; 2], b: [f64; 2], q: &[[f64; 2]; 4]) -> Option<(
     Some((t0.clamp(0.0, 1.0), t1.clamp(0.0, 1.0)))
 }
 
+/// Does the clipped span `t0..t1` of `a..b` contain a point strictly inside
+/// the quad?
+///
+/// Three sample parameters (1/4, 1/2, 3/4) are enough to reject a segment
+/// that only touches the leaf boundary; a genuine cut always contains one of
+/// them inside because the clipped span is convex.
 fn segment_has_interior(a: [f64; 2], b: [f64; 2], t0: f64, t1: f64, quad: &[[f64; 2]; 4]) -> bool {
     [0.25, 0.5, 0.75].iter().any(|&f| {
         let t = t0 + f * (t1 - t0);
@@ -1657,6 +2118,13 @@ fn arc_corners(q: &[[f64; 2]; 4], u0: f64, u1: f64) -> Vec<[f64; 2]> {
 }
 
 /// One connected piece of the boundary inside a leaf.
+///
+/// Two clipped segments are linked when an endpoint of one is strictly inside
+/// the leaf and within `1e-7 * scale` of an endpoint of the other; the
+/// equivalence classes are the chains.  Components are sorted by their
+/// smallest packed endpoint so the result is deterministic.  `walk_chain`
+/// requires exactly one component for a cut cell; a leaf cut by two separate
+/// boundary pieces is outside this route's templates.
 fn chain_components(segs: &[DomainSeg], quad: &[[f64; 2]; 4], scale: f64) -> Vec<Vec<DomainSeg>> {
     let n = segs.len();
     let mut parent: Vec<usize> = (0..n).collect();
@@ -1700,6 +2168,10 @@ fn chain_components(segs: &[DomainSeg], quad: &[[f64; 2]; 4], scale: f64) -> Vec
     out
 }
 
+/// Union-find root of `i` with path halving.
+///
+/// Used by [`chain_components`]; the parent array is modified in place and the
+/// tree stays shallow, so the grouping is near-linear.
 fn find(parent: &mut [usize], i: usize) -> usize {
     let mut root = i;
     while parent[root] != root {
@@ -1715,6 +2187,14 @@ fn find(parent: &mut [usize], i: usize) -> usize {
 }
 
 /// Follow one chain from an entry point on the leaf boundary to its exit.
+///
+/// The chain's endpoints are the segment ends that lie on (or within
+/// `1e-6 * scale` of) the leaf boundary but not strictly inside it; there must
+/// be exactly two, otherwise the chain enters/leaves more than once and the
+/// leaf cannot be closed by one polygon (`Err`).  The walk starts at the
+/// lexicographically smaller boundary end (deterministic) and returns
+/// `(entry, exit, interior_points)`; `interior_points` are the chain vertices
+/// strictly inside the leaf, excluding both ends.
 fn walk_chain(
     component: &[DomainSeg],
     quad: &[[f64; 2]; 4],
@@ -1776,14 +2256,25 @@ fn walk_chain(
 }
 
 /// A planar polygon plus, per edge, whether it runs along the geometry.
+///
+/// The polygon is the inside region of one cut leaf, counter-clockwise, with
+/// its boundary chain edges marked so that midpoint subdivision can snap them
+/// onto the geometry (§2.3).  `points`, `chain_edge` and `snap` have the same
+/// length; edge `k` runs from `points[k]` to `points[(k + 1) % len]`.
 #[derive(Clone, Debug)]
 struct Poly {
+    /// Polygon vertices, counter-clockwise, in model units.
     points: Vec<[f64; 2]>,
+
     /// `chain_edge[k]` is true when edge `k` (from `points[k]` to
     /// `points[k+1]`) bridges a smooth run of the domain boundary.
     chain_edge: Vec<bool>,
+
     /// For a chain edge, the point of the run that should become the boundary
     /// node: the run's arc-length midpoint, on the geometry.
+    ///
+    /// `None` for an interior edge (a leaf side or a split diagonal), which is
+    /// subdivided at its straight midpoint.
     snap: Vec<Option<[f64; 2]>>,
 }
 
@@ -1798,6 +2289,13 @@ struct Poly {
 /// which lies on the geometry.  The mesh boundary then consists of two chords
 /// per run whose nodes are on the boundary, so `boundary_offset` stays at
 /// round-off and no flat polygon vertex is created.
+///
+/// Returns `(corners, run_midpoints)`: the kept vertices (first and last
+/// always kept) and, for each chord between consecutive kept vertices, the
+/// arc-length midpoint of the dropped run on the original chain.  A turn is
+/// measured as the angle away from straight; `SMOOTH_TURN_DEG` (25 degrees) is
+/// the tuning threshold.  A duplicate point keeps its vertex (zero direction
+/// is not a smooth run for this purpose).
 fn simplify_chain(chain: &[[f64; 2]]) -> (Vec<[f64; 2]>, Vec<[f64; 2]>) {
     let n = chain.len();
     if n <= 1 {
@@ -1839,6 +2337,11 @@ fn simplify_chain(chain: &[[f64; 2]]) -> (Vec<[f64; 2]>, Vec<[f64; 2]>) {
     (points, mids)
 }
 
+/// Point on the polyline `chain` at cumulative arc length `s`.
+///
+/// `arc` must be the cumulative lengths of `chain` (`arc[0] = 0`), as built by
+/// [`simplify_chain`].  `s` is clamped to the polyline ends, so a half-way
+/// value outside the chain cannot produce an extrapolated point.
 fn point_at_arclength(chain: &[[f64; 2]], arc: &[f64], s: f64) -> [f64; 2] {
     let n = chain.len();
     for i in 1..n {
@@ -1868,6 +2371,14 @@ fn nearest_boundary_point(domain: &Domain, p: [f64; 2]) -> [f64; 2] {
 
 /// Split the polygon at every vertex whose interior angle is bad, using a
 /// diagonal to the visible vertex that balances the split best.
+///
+/// A vertex with interior angle above `BAD_ANGLE_DEG` (160 degrees) is a flat
+/// or reflex corner; the worst one is split by [`split_polygon_at`].  The
+/// queue is processed depth-first; at most `MAX_SPLITS` splits are performed,
+/// after which the remaining polygon is returned unsplit (subdivision may then
+/// fail, which rejects the attempt).  A polygon with no bad vertex passes
+/// through unchanged.  The order of the output is the split order and is not
+/// geometrically meaningful.
 fn split_bad_vertices(polygon: &Poly) -> Result<Vec<Poly>, String> {
     let mut queue = vec![polygon.clone()];
     let mut out = Vec::new();
@@ -1904,6 +2415,13 @@ fn split_bad_vertices(polygon: &Poly) -> Result<Vec<Poly>, String> {
 }
 
 /// Split a polygon along the diagonal from vertex `index` to a visible vertex.
+///
+/// Candidate targets are the vertices two or more steps away.  A candidate is
+/// rejected when the diagonal midpoint is outside, when the diagonal properly
+/// crosses an edge, or when either new corner at `index` would be below
+/// `MIN_SPLIT_ANGLE_DEG` or above `BAD_ANGLE_DEG`.  Among the visible targets
+/// the one maximising the smaller of the two new angles at `index` is taken
+/// (the "balanced split").  `Err` when no diagonal is visible.
 fn split_polygon_at(poly: &Poly, index: usize) -> Result<(Poly, Poly), String> {
     let points = &poly.points;
     let n = points.len();
@@ -2014,6 +2532,11 @@ fn make_sub_polygon(poly: &Poly, indices: &[usize]) -> Poly {
 /// Remove consecutive duplicates and vertices that lie on the straight line
 /// between their neighbours.  Both appear when a chain endpoint coincides with
 /// a leaf corner; they would otherwise become flat quads.
+///
+/// `tol` is an absolute model length (`1e-7 * scale` at the call site).  The
+/// loop is bounded by `4 * len + 8` passes as a guard against an input that
+/// keeps re-creating a duplicate; it returns a polygon of fewer than three
+/// points only if the input degenerates that far.
 fn clean_polygon(poly: &[[f64; 2]], tol: f64) -> Vec<[f64; 2]> {
     let mut p = poly.to_vec();
     let mut guard = 0;
@@ -2077,6 +2600,11 @@ fn clean_polygon(poly: &[[f64; 2]], tol: f64) -> Vec<[f64; 2]> {
     p
 }
 
+/// Does the polygon contain the leaf side `points[a] -> points[b]` in full?
+///
+/// The tolerance is `1e-9` in model units; `a` or `b` outside the node list is
+/// false.  A true result is what makes the leaf contribute a hanging node to
+/// its neighbour (the "split side" of pass 2).
 fn polygon_has_edge(poly: &[[f64; 2]], a: usize, b: usize, points: &[Node]) -> bool {
     if a >= points.len() || b >= points.len() {
         return false;
@@ -2096,6 +2624,12 @@ fn polygon_has_edge(poly: &[[f64; 2]], a: usize, b: usize, points: &[Node]) -> b
     false
 }
 
+/// Is the node quad positively oriented (strictly counter-clockwise) and
+/// inside the node list?
+///
+/// The `1e-15` dead band rejects a collinear or inverted corner.  This is the
+/// final geometric guard of every template and subdivision, not a quality
+/// metric.
 fn quad_positive(q: &[usize; 4], points: &[Node]) -> bool {
     if q.iter().any(|&id| id >= points.len()) {
         return false;
@@ -2117,6 +2651,11 @@ fn quad_positive(q: &[usize; 4], points: &[Node]) -> bool {
     true
 }
 
+/// Are the four node ids of the quad pairwise distinct?
+///
+/// A collapsed edge (two equal ids) would pass the cross-product test as zero
+/// area only by accident; it is rejected here first so the error message is
+/// about distinctness.
 fn all_distinct(q: &[usize; 4]) -> bool {
     for i in 0..4 {
         for j in (i + 1)..4 {
@@ -2130,6 +2669,14 @@ fn all_distinct(q: &[usize; 4]) -> bool {
 
 /// True when a node lies strictly inside an edge that is used by only one
 /// cell — the signature of a hanging node that was not resolved.
+///
+/// Only single-use edges are examined (an interior edge is shared by two
+/// cells, a resolved hanging edge by two as well).  Candidate nodes are found
+/// through a uniform hash whose cell size is `max(min_edge, 1% of max_edge,
+/// 1e-9)`, so a huge model with one tiny edge does not create an enormous
+/// table.  A node within `1e-8` of an edge interior, at a parameter strictly
+/// inside `(1e-6, 1-1e-6)`, is a T-junction.  This is a final safety net; a
+/// true result aborts the attempt, it is never repaired.
 fn has_t_junction(points: &[Node], quads: &[[usize; 4]]) -> bool {
     if points.is_empty() || quads.is_empty() {
         return false;
@@ -2209,10 +2756,18 @@ fn has_t_junction(points: &[Node], quads: &[[usize; 4]]) -> bool {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+/// Unit tests for the cleanup-free quadtree route.
+///
+/// They mirror the corpus gates of `examples/alt_quadtree.rs` at a smaller
+/// size: all-quad, no cracks, boundary offset at round-off, the analytic area
+/// within 2%, and `verify::gate` passing.  The shapes are a square, a plate
+/// with a polygonal hole, an L-bracket (re-entrant corner), a convex hexagon,
+/// a quarter ring, a stepped part, and the option/error paths.
 mod tests {
     use super::*;
     use crate::verify;
 
+    /// Number of quad cells; equal to `mesh.cells.len()` asserts all-quad.
     fn quad_count(mesh: &Mesh) -> usize {
         mesh.cells
             .iter()
@@ -2220,6 +2775,8 @@ mod tests {
             .count()
     }
 
+    /// A 10 x 10 square at size 1 is a pure tensor grid: all-quad, crack-free,
+    /// exactly on the boundary and area-exact.
     #[test]
     fn a_square_is_all_quad_and_conforming() {
         let domain = Domain::rectangle(10.0, 10.0).unwrap();
@@ -2234,6 +2791,9 @@ mod tests {
         assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
     }
 
+    /// The plate with a 16-segment hole is watertight around the hole: the
+    /// area is within 2% of `100 * 60 - pi * 10^2`, which also checks that the
+    /// hole boundary is followed and not filled.
     #[test]
     fn a_plate_with_a_hole_is_all_quad_and_watertight() {
         let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
@@ -2253,6 +2813,8 @@ mod tests {
         assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
     }
 
+    /// The L-bracket's re-entrant corner lies on grid lines; the mesh must
+    /// keep the notch (area `80*20 + 20*40`) and stay conforming.
     #[test]
     fn an_l_bracket_keeps_its_reentrant_corner() {
         let domain = Domain::new(
@@ -2282,6 +2844,9 @@ mod tests {
         assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
     }
 
+    /// A regular hexagon exercises slanted boundary chords and the snapping
+    /// of their subdivision midpoints (`SMOOTH_TURN_DEG`); the area is checked
+    /// against `3 * sqrt(3) / 2 * r^2`.
     #[test]
     fn a_convex_hexagon_is_all_quad_and_conforming() {
         let hexagon: Vec<[f64; 2]> = (0..6)
@@ -2306,6 +2871,10 @@ mod tests {
         assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
     }
 
+    /// The documented coarse option: `cell_factor = 2.0` must stay all-quad
+    /// and gate-passing while more than halving the element count against
+    /// `1.0`, and the out-of-range factors `0.0`/`5.0` must be errors (not
+    /// panics).
     #[test]
     fn a_larger_cell_factor_coarsens_the_mesh_and_stays_all_quad() {
         let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
@@ -2328,6 +2897,9 @@ mod tests {
         assert!(mesh_with_cell_factor(&domain, &sizing, 5.0).is_err());
     }
 
+    /// A non-default `Options` (`cell_factor = 2.0`, one alignment) still
+    /// produces a conforming, boundary-faithful mesh: the option plumbing does
+    /// not silently fall back to the defaults.
     #[test]
     fn non_default_options_still_produce_a_valid_mesh() {
         let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
@@ -2346,6 +2918,8 @@ mod tests {
         assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
     }
 
+    /// Invalid sizing and a two-point outer loop are reported as `Err`, never
+    /// as a panic (the crate's "never crash" contract).
     #[test]
     fn bad_requests_are_errors_not_panics() {
         let domain = Domain::rectangle(1.0, 1.0).unwrap();
@@ -2361,6 +2935,9 @@ mod tests {
         assert!(mesh(&short, &Sizing::uniform(0.5).unwrap()).is_err());
     }
 
+    /// A quarter ring (curved outer and inner arcs, one component with a
+    /// concave junction) and a stepped part (three re-entrant corners) both
+    /// build, pass the gate and stay on the boundary.
     #[test]
     fn a_ring_and_a_stepped_domain_build() {
         let mut outer: Vec<[f64; 2]> = (0..=24)
