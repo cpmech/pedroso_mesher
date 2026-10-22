@@ -37,11 +37,17 @@
 //!    nearly the same triangulation, §5).
 //! 4. **Recombination** (§7 of the paper). The resulting
 //!    right-triangle-dominated mesh is recombined into quads with a
-//!    maximum-cardinality Blossom matching. Edge weights are the scaled
-//!    Jacobians quantised to a coarse scale (1..=101), which keeps the matching
-//!    fast and deterministic while preferring good quads. This is the paper's
-//!    indirect step: the L-norm work is in the point placement, not in the
-//!    recombination.
+//!    maximum-cardinality matching of the triangle dual graph; edge weights are
+//!    the scaled Jacobians quantised to a coarse scale (1..=101). The matching
+//!    has two stages on large meshes, because the exact weighted Blossom
+//!    (`mwmatching`) costs O(n^3) and needs ~55 s on the 30k-triangle
+//!    performance part: the exact weighted Blossom runs on spatial blocks small
+//!    enough to be cheap, then a quality-first greedy matching plus an
+//!    unweighted Edmonds Blossom handle the thin interface band and restore
+//!    maximum cardinality. Meshes up to `EXACT_MATCHING_TRIANGLES` use the
+//!    exact weighted Blossom unchanged, so their measured table is reproduced.
+//!    This is the paper's indirect step: the L-norm work is in the point
+//!    placement, not in the recombination.
 //! 5. **Residual-triangle closure**. The dual graph of a triangulation,
 //!    restricted to *convex* triangle pairs, does not always have a perfect
 //!    matching (one triangle can be surrounded by matched neighbours with no
@@ -68,9 +74,9 @@
 //!
 //! The mesh returned is all-quad on the seven-part benchmark (raw and after the
 //! common post-pass); no triangle is silently dropped. The refinement cascade
-//! adds a small number of quads locally (e.g. +59 on plate-hole 2 mm, +528 on
+//! adds a small number of quads locally (e.g. +59 on plate-hole 2 mm, +269 on
 //! the 0.6 mm performance part) and can raise the local aspect ratio (measured
-//! post: p95 1.2–2.3, max 8.1), which is the price of keeping every cell
+//! post: p95 1.2–2.3, max ~8), which is the price of keeping every cell
 //! conforming and every new quad convex.
 
 use std::collections::HashMap;
@@ -933,13 +939,37 @@ fn quad_metrics(quad: [usize; 4], points: &[Node]) -> (f64, f64, f64) {
     (sj, min_angle, max_angle)
 }
 
-/// Maximum-cardinality recombination with equal edge weights.
+// ------------------------------------------------------------------------- //
+// Recombination: maximum-cardinality matching of adjacent triangles
+// ------------------------------------------------------------------------- //
+
+/// Sentinel of the triangle matching (a free triangle).
+const UNMATCHED: usize = usize::MAX;
+
+/// Up to this many triangles the exact weighted Blossom ([`weighted_matching`])
+/// is affordable and is used unchanged, so the route's measured table is
+/// reproduced where its cost is small. Above it the mesh is matched block by
+/// block ([`blocked_matching`]).
+const EXACT_MATCHING_TRIANGLES: usize = 12_000;
+
+/// Target number of triangles per block of the large-mesh matching. The exact
+/// weighted Blossom is cubic-ish, so a block of ~12k triangles costs a fraction
+/// of the whole mesh while still giving most of the mesh the weighted matching.
+const BLOCK_TRIANGLES: usize = 12_000;
+
+/// Half-width of the block-interface band, in mean triangle edge lengths.
+const BAND_EDGES: f64 = 2.0;
+
+/// Candidate recombination edges: an interior edge shared by exactly two
+/// triangles whose union is a convex quad passing the quality floor, returned as
+/// `(triangle_a, triangle_b, weight)` with `a < b`.
 ///
-/// The crate's `pair_triangles_with` maximises a 1000-level quality weight after
-/// the cardinality; on the large benchmark that weighted blossom is the whole
-/// cost of the route. Equal weights ask only for the maximum number of quads,
-/// which is what the gate needs, and the common post-pass recovers the shape.
-fn recombine(tris: &[[usize; 3]], points: &[Node]) -> (Vec<[usize; 4]>, Vec<[usize; 3]>) {
+/// The floor is deliberately loose (SJ 0.05, 10°): it removes only the pairs
+/// that are not a quad at all, because every pairing that is achievable is one
+/// more quad in the final mesh, and the common post-pass repairs shape. The
+/// integer weight encodes the scaled Jacobian and is the matching's quality
+/// tie-break.
+fn recombination_edges(tris: &[[usize; 3]], points: &[Node]) -> Vec<(usize, usize, i32)> {
     let mut edge_map: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
     for (t, tri) in tris.iter().enumerate() {
         for k in 0..3 {
@@ -953,8 +983,8 @@ fn recombine(tris: &[[usize; 3]], points: &[Node]) -> (Vec<[usize; 4]>, Vec<[usi
         if owners.len() != 2 {
             continue;
         }
-        let (t1, t2) = (owners[0], owners[1]);
-        let Some(quad) = pair_quad(tris[t1], tris[t2], points) else {
+        let (ta, tb) = (owners[0], owners[1]);
+        let Some(quad) = pair_quad(tris[ta], tris[tb], points) else {
             continue;
         };
         let (sj, min_angle, max_angle) = quad_metrics(quad, points);
@@ -962,20 +992,294 @@ fn recombine(tris: &[[usize; 3]], points: &[Node]) -> (Vec<[usize; 4]>, Vec<[usi
             continue;
         }
         let weight = 1 + (sj * 100.0).round().clamp(0.0, 100.0) as i32;
-        edges.push((t1, t2, weight));
+        edges.push((ta, tb, weight));
     }
     edges.sort_unstable();
-    let mut matching = mwmatching::Matching::new(edges);
-    matching.max_cardinality();
-    let mate = matching.solve();
+    edges
+}
+
+/// A deterministic, quality-first maximal matching: the heaviest edge is taken
+/// first, ties broken by index. It is the starting point of the fast strategy
+/// and already fixes the shape of almost every quad.
+fn greedy_matching(n: usize, edges: &[(usize, usize, i32)]) -> Vec<usize> {
+    let mut mate = vec![UNMATCHED; n];
+    let mut order: Vec<usize> = (0..edges.len()).collect();
+    order.sort_unstable_by(|&a, &b| {
+        edges[b]
+            .2
+            .cmp(&edges[a].2)
+            .then_with(|| edges[a].0.cmp(&edges[b].0))
+            .then_with(|| edges[a].1.cmp(&edges[b].1))
+    });
+    for &i in &order {
+        let (a, b, _) = edges[i];
+        if mate[a] == UNMATCHED && mate[b] == UNMATCHED {
+            mate[a] = b;
+            mate[b] = a;
+        }
+    }
+    mate
+}
+
+/// Mean edge length of the triangulation (the interface-band width unit).
+fn edge_scale(tris: &[[usize; 3]], points: &[Node]) -> f64 {
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for tri in tris {
+        for k in 0..3 {
+            let a = tri[k];
+            let b = tri[(k + 1) % 3];
+            sum += ((points[a][0] - points[b][0]).powi(2) + (points[a][1] - points[b][1]).powi(2))
+                .sqrt();
+            count += 1;
+        }
+    }
+    if count == 0 {
+        1.0
+    } else {
+        sum / count as f64
+    }
+}
+
+/// An ordering key for the free vertices of the augmenting search: the smaller
+/// the value, the worse the triangle would be closed by the refinement cascade,
+/// and the earlier its search runs. A triangle that closes well may stay free;
+/// one whose centroid split would make a poor quad should be matched instead.
+/// This is what keeps the residual-triangle closure succeeding.
+fn free_vertex_scores(tris: &[[usize; 3]], points: &[Node]) -> Vec<f64> {
+    tris.iter()
+        .map(|&t| {
+            let cell = Cell::tri3(t);
+            let angles = quality::corner_angles(&cell, points);
+            let min = angles.iter().copied().fold(f64::INFINITY, f64::min);
+            if min.is_finite() {
+                min
+            } else {
+                f64::NEG_INFINITY
+            }
+        })
+        .collect()
+}
+
+/// Maximum-cardinality matching in an unweighted general graph (Edmonds'
+/// blossom: alternating-tree BFS with odd-cycle contraction).
+///
+/// The starting matching comes from [`greedy_matching`], so the search only
+/// augments the few vertices greediness left free, and the quads it breaks are
+/// only those on a genuine augmenting path. Repeating full passes until a pass
+/// augments nothing makes the result maximum: a matching is maximum exactly
+/// when no augmenting path exists, and every augmenting path starts at a free
+/// vertex.
+struct Blossom<'a> {
+    adj: &'a [Vec<usize>],
+    mate: Vec<usize>,
+    /// Parent in the alternating tree (`UNMATCHED` when absent).
+    parent: Vec<usize>,
+    /// Base vertex of the blossom a vertex belongs to.
+    base: Vec<usize>,
+    /// Outer vertex of the current tree.
+    outer: Vec<bool>,
+    /// Scratch set for `lca`, with a generation stamp to avoid O(n) clears.
+    seen: Vec<u32>,
+    stamp: u32,
+    blossom: Vec<bool>,
+    queue: Vec<usize>,
+}
+
+impl<'a> Blossom<'a> {
+    fn new(n: usize, adj: &'a [Vec<usize>], mate: Vec<usize>) -> Self {
+        Self {
+            adj,
+            mate,
+            parent: vec![UNMATCHED; n],
+            base: (0..n).collect(),
+            outer: vec![false; n],
+            seen: vec![0; n],
+            stamp: 0,
+            blossom: vec![false; n],
+            queue: Vec::with_capacity(n),
+        }
+    }
+
+    /// Augment until no augmenting path is left. Free vertices are searched
+    /// worst-first (`scores` ascending): a vertex that cannot stay free in any
+    /// maximum matching is matched by its own search, so the vertices that
+    /// remain free are the most closeable ones.
+    fn run(mut self, scores: &[f64]) -> Vec<usize> {
+        let n = self.base.len();
+        loop {
+            let mut roots: Vec<usize> = (0..n).filter(|&v| self.mate[v] == UNMATCHED).collect();
+            roots
+                .sort_unstable_by(|&a, &b| scores[a].total_cmp(&scores[b]).then_with(|| a.cmp(&b)));
+            let mut augmented = false;
+            for root in roots {
+                if self.mate[root] == UNMATCHED && self.find_path(root) {
+                    augmented = true;
+                }
+            }
+            if !augmented {
+                return self.mate;
+            }
+        }
+    }
+
+    /// Lowest common ancestor of two outer vertices in the alternating tree.
+    fn lca(&mut self, a: usize, b: usize) -> Option<usize> {
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            self.seen.iter_mut().for_each(|s| *s = 0);
+            self.stamp = 1;
+        }
+        let stamp = self.stamp;
+        let mut a = a;
+        loop {
+            a = self.base[a];
+            self.seen[a] = stamp;
+            let partner = self.mate[a];
+            if partner == UNMATCHED {
+                break;
+            }
+            let up = self.parent[partner];
+            if up == UNMATCHED {
+                break;
+            }
+            a = up;
+        }
+        let mut b = b;
+        loop {
+            b = self.base[b];
+            if self.seen[b] == stamp {
+                return Some(b);
+            }
+            let partner = self.mate[b];
+            if partner == UNMATCHED {
+                return None;
+            }
+            let up = self.parent[partner];
+            if up == UNMATCHED {
+                return None;
+            }
+            b = up;
+        }
+    }
+
+    /// Mark the alternating-tree path from `v` up to base `b` as one blossom,
+    /// re-parenting it towards `child`.
+    fn mark_path(&mut self, mut v: usize, b: usize, mut child: usize) {
+        let mut guard = 0usize;
+        while self.base[v] != b {
+            guard += 1;
+            if guard > self.base.len() {
+                return;
+            }
+            let partner = self.mate[v];
+            if partner == UNMATCHED {
+                return;
+            }
+            self.blossom[self.base[v]] = true;
+            self.blossom[self.base[partner]] = true;
+            self.parent[v] = child;
+            child = partner;
+            let up = self.parent[partner];
+            if up == UNMATCHED {
+                return;
+            }
+            v = up;
+        }
+    }
+
+    /// One alternating-tree search from the free vertex `root`; augments the
+    /// matching and returns `true` when an augmenting path was found.
+    fn find_path(&mut self, root: usize) -> bool {
+        let n = self.base.len();
+        for i in 0..n {
+            self.parent[i] = UNMATCHED;
+            self.base[i] = i;
+            self.outer[i] = false;
+        }
+        self.outer[root] = true;
+        self.queue.clear();
+        self.queue.push(root);
+        let mut head = 0usize;
+        while head < self.queue.len() {
+            let v = self.queue[head];
+            head += 1;
+            for i in 0..self.adj[v].len() {
+                let u = self.adj[v][i];
+                if self.base[v] == self.base[u] || self.mate[v] == u {
+                    continue;
+                }
+                let partner = self.mate[u];
+                let u_is_outer =
+                    u == root || (partner != UNMATCHED && self.parent[partner] != UNMATCHED);
+                if u_is_outer {
+                    let Some(curbase) = self.lca(v, u) else {
+                        continue;
+                    };
+                    self.blossom.iter_mut().for_each(|b| *b = false);
+                    self.mark_path(v, curbase, u);
+                    self.mark_path(u, curbase, v);
+                    for w in 0..n {
+                        if self.blossom[self.base[w]] {
+                            self.base[w] = curbase;
+                            if !self.outer[w] {
+                                self.outer[w] = true;
+                                self.queue.push(w);
+                            }
+                        }
+                    }
+                } else if self.parent[u] == UNMATCHED {
+                    self.parent[u] = v;
+                    if partner == UNMATCHED {
+                        // Collect the alternating path first: a malformed tree
+                        // (which should not happen) must not leave a half-flipped
+                        // matching behind. The path is `inner - outer - inner - …`
+                        // from the free vertex `u` up to the root.
+                        let mut steps: Vec<(usize, usize)> = Vec::new();
+                        let mut cur = u;
+                        let mut seen = vec![false; n];
+                        loop {
+                            let up = self.parent[cur];
+                            if up == UNMATCHED || steps.len() > n || seen[cur] || seen[up] {
+                                return false;
+                            }
+                            seen[cur] = true;
+                            seen[up] = true;
+                            steps.push((cur, up));
+                            let next = self.mate[up];
+                            if next == UNMATCHED {
+                                break;
+                            }
+                            cur = next;
+                        }
+                        for &(inner, outer) in &steps {
+                            self.mate[inner] = outer;
+                            self.mate[outer] = inner;
+                        }
+                        return true;
+                    }
+                    self.outer[partner] = true;
+                    self.queue.push(partner);
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Rebuild the quads from a `mate` array (one entry per triangle, `UNMATCHED`
+/// when free), re-deriving each quad from the two triangles.
+fn quads_from_mate(
+    tris: &[[usize; 3]],
+    points: &[Node],
+    mate: &[usize],
+) -> (Vec<[usize; 4]>, Vec<[usize; 3]>) {
     let mut used = vec![false; tris.len()];
     let mut quads = Vec::new();
     for t in 0..tris.len() {
-        let partner = mate.get(t).copied().unwrap_or(mwmatching::SENTINEL);
-        if used[t] || partner == mwmatching::SENTINEL || partner >= tris.len() {
-            continue;
-        }
-        if used[partner] || partner <= t {
+        let partner = mate.get(t).copied().unwrap_or(UNMATCHED);
+        if used[t] || partner == UNMATCHED || partner >= tris.len() || used[partner] || partner <= t
+        {
             continue;
         }
         if let Some(quad) = pair_quad(tris[t], tris[partner], points) {
@@ -991,6 +1295,226 @@ fn recombine(tris: &[[usize; 3]], points: &[Node]) -> (Vec<[usize; 4]>, Vec<[usi
         .map(|(_, tri)| *tri)
         .collect();
     (quads, leftover)
+}
+
+/// The reference weighted maximum-cardinality Blossom from `mwmatching`.
+///
+/// This is the matching the route was measured with, and it is the route's
+/// quality reference: it maximises the number of quads and, among those
+/// matchings, the total scaled Jacobian. It is kept for meshes small enough that
+/// its O(n^3) cost is invisible, which is exactly where it can be used without
+/// slowing the route.
+fn weighted_matching(n: usize, edges: &[(usize, usize, i32)]) -> Vec<usize> {
+    if edges.is_empty() {
+        return vec![UNMATCHED; n];
+    }
+    let mut matching = mwmatching::Matching::new(edges.to_vec());
+    matching.max_cardinality();
+    let mate = matching.solve();
+    let mut out = vec![UNMATCHED; n];
+    for (t, slot) in out.iter_mut().enumerate() {
+        *slot = mate.get(t).copied().unwrap_or(UNMATCHED);
+    }
+    out
+}
+
+/// Number of spatial blocks for the large-mesh matching.
+fn block_count(n: usize) -> usize {
+    n.div_ceil(BLOCK_TRIANGLES).max(1)
+}
+
+/// Match a large mesh block by block with the weighted Blossom, then fix the
+/// thin interface band with the fast greedy + unweighted Blossom and restore
+/// global maximum cardinality.
+///
+/// The weighted Blossom is super-linear (about 55 s on the 30k-triangle
+/// performance part), so the mesh is cut into spatial blocks whose interior is
+/// small enough to match exactly; only the band around the cuts, plus whatever
+/// the blocks leave free, is matched by the fast strategy.
+///
+/// The block solve is deliberately a **maximum-weight** matching, not a
+/// maximum-cardinality one: forcing every block to pair all of its triangles
+/// would lock in low-quality pairs along the block boundary and prevent the
+/// band pass from finding better cross-cut quads. The final unweighted Blossom
+/// restores maximum cardinality over the whole graph, which is what the
+/// all-quad closure requires.
+#[allow(clippy::too_many_arguments)]
+fn blocked_matching(
+    tris: &[[usize; 3]],
+    points: &[Node],
+    edges: &[(usize, usize, i32)],
+    adj: &[Vec<usize>],
+    scores: &[f64],
+    band_width: f64,
+    blocks: usize,
+) -> Vec<usize> {
+    let n = tris.len();
+    let mut mate = vec![UNMATCHED; n];
+    if blocks <= 1 {
+        return weighted_matching(n, edges);
+    }
+    let centroids: Vec<f64> = tris
+        .iter()
+        .map(|t| (points[t[0]][0] + points[t[1]][0] + points[t[2]][0]) / 3.0)
+        .collect();
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &x in &centroids {
+        lo = lo.min(x);
+        hi = hi.max(x);
+    }
+    if !hi.is_finite() || !lo.is_finite() || hi <= lo {
+        let greedy = greedy_matching(n, edges);
+        return Blossom::new(n, adj, greedy).run(scores);
+    }
+    let width = (hi - lo) / blocks as f64;
+    let cuts: Vec<f64> = (1..blocks).map(|i| lo + width * i as f64).collect();
+    let in_band: Vec<bool> = centroids
+        .iter()
+        .map(|&x| cuts.iter().any(|&c| (x - c).abs() <= band_width))
+        .collect();
+    let block_of = |x: f64| -> usize {
+        let mut b = 0usize;
+        for (i, &c) in cuts.iter().enumerate() {
+            if x > c {
+                b = i + 1;
+            }
+        }
+        b
+    };
+    let mut local_of = vec![UNMATCHED; n];
+    let mut block_vertices: Vec<Vec<usize>> = vec![Vec::new(); blocks];
+    for t in 0..n {
+        if in_band[t] {
+            continue;
+        }
+        let b = block_of(centroids[t]);
+        local_of[t] = block_vertices[b].len();
+        block_vertices[b].push(t);
+    }
+    for b in 0..blocks {
+        if block_vertices[b].is_empty() {
+            continue;
+        }
+        let mut local_edges: Vec<(usize, usize, i32)> = Vec::new();
+        for &(a, c, w) in edges {
+            if in_band[a] || in_band[c] {
+                continue;
+            }
+            if block_of(centroids[a]) != b || block_of(centroids[c]) != b {
+                continue;
+            }
+            local_edges.push((local_of[a], local_of[c], w));
+        }
+        if local_edges.is_empty() {
+            continue;
+        }
+        let mut matching = mwmatching::Matching::new(local_edges);
+        let local_mate = matching.solve();
+        for (local, &t) in block_vertices[b].iter().enumerate() {
+            let p = local_mate.get(local).copied().unwrap_or(UNMATCHED);
+            if p != UNMATCHED && p < block_vertices[b].len() {
+                mate[t] = block_vertices[b][p];
+            }
+        }
+    }
+    // Greedy over the band and the block-free vertices, best quality first.
+    let mut order: Vec<usize> = (0..edges.len())
+        .filter(|&i| {
+            let (a, b, _) = edges[i];
+            mate[a] == UNMATCHED && mate[b] == UNMATCHED
+        })
+        .collect();
+    order.sort_unstable_by(|&a, &b| {
+        edges[b]
+            .2
+            .cmp(&edges[a].2)
+            .then_with(|| edges[a].0.cmp(&edges[b].0))
+            .then_with(|| edges[a].1.cmp(&edges[b].1))
+    });
+    for &i in &order {
+        let (a, b, _) = edges[i];
+        if mate[a] == UNMATCHED && mate[b] == UNMATCHED {
+            mate[a] = b;
+            mate[b] = a;
+        }
+    }
+    // Global maximum cardinality; only the band's free vertices can remain.
+    Blossom::new(n, adj, mate).run(scores)
+}
+
+/// How the triangle dual graph is matched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatchPlan {
+    /// The reference weighted Blossom (`mwmatching`) on the whole graph.
+    Exact,
+    /// Weighted Blossom on spatial block interiors, fast matching on the band.
+    Blocked,
+    /// Quality-first greedy plus unweighted Blossom augmentation.
+    Fast,
+}
+
+/// Match the triangles with one plan and rebuild the quads.
+fn recombine_with(
+    tris: &[[usize; 3]],
+    points: &[Node],
+    plan: MatchPlan,
+) -> (Vec<[usize; 4]>, Vec<[usize; 3]>) {
+    let edges = recombination_edges(tris, points);
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); tris.len()];
+    for &(a, b, _) in &edges {
+        adj[a].push(b);
+        adj[b].push(a);
+    }
+    let mate = match plan {
+        MatchPlan::Exact => weighted_matching(tris.len(), &edges),
+        MatchPlan::Blocked => {
+            let scores = free_vertex_scores(tris, points);
+            let band_width = BAND_EDGES * edge_scale(tris, points);
+            let blocks = block_count(tris.len());
+            blocked_matching(tris, points, &edges, &adj, &scores, band_width, blocks)
+        }
+        MatchPlan::Fast => {
+            let greedy = greedy_matching(tris.len(), &edges);
+            let scores = free_vertex_scores(tris, points);
+            Blossom::new(tris.len(), &adj, greedy).run(&scores)
+        }
+    };
+    quads_from_mate(tris, points, &mate)
+}
+
+/// Recombine and close residual triangles, trying the plans in order.
+///
+/// The matching only decides *where* the few residual triangles sit; the
+/// refinement cascade can fail on an unlucky pair (its first split may make a
+/// poor quad). Trying the fast plan as a fallback makes the closure robust
+/// without giving up the weighted matching when it works. If every plan fails,
+/// the first result is kept with its triangles: an honest quad-dominant mesh is
+/// better than a half-modified one.
+fn recombine_and_close(
+    tris: &[[usize; 3]],
+    points: &[Node],
+    plans: &[MatchPlan],
+) -> (Vec<Node>, Vec<[usize; 4]>, Vec<[usize; 3]>) {
+    let mut first: Option<(Vec<Node>, Vec<[usize; 4]>, Vec<[usize; 3]>)> = None;
+    for &plan in plans {
+        let (quads, leftover) = recombine_with(tris, points, plan);
+        if leftover.is_empty() {
+            return (points.to_vec(), quads, leftover);
+        }
+        let mut closed_points = points.to_vec();
+        let mut closed_quads = quads.clone();
+        let mut closed_left = leftover.clone();
+        if close_leftovers(&mut closed_points, &mut closed_quads, &mut closed_left).is_ok() {
+            return (closed_points, closed_quads, closed_left);
+        }
+        if first.is_none() {
+            first = Some((points.to_vec(), quads, leftover));
+        }
+    }
+    match first {
+        Some(result) => result,
+        None => (points.to_vec(), Vec::new(), tris.to_vec()),
+    }
 }
 
 // ------------------------------------------------------------------------- //
@@ -1251,7 +1775,6 @@ pub fn mesh_with_options(
     if domain.outer.len() < 3 {
         return Err("the outer loop has fewer than three points".to_string());
     }
-
     let field = CrossField::build(domain, size);
     let loops = sample_boundary(domain, size);
     if loops.is_empty() {
@@ -1295,22 +1818,17 @@ pub fn mesh_with_options(
         return Err("the relaxed triangulation produced no triangle".to_string());
     }
     let points: Vec<Node> = rebuilt.points.iter().map(|p| [p[0], p[1], 0.0]).collect();
-    let (mut quads, mut leftover) = recombine(&final_tris, &points);
-    let mut points = points;
-    if !leftover.is_empty() {
-        // A maximum-cardinality matching over convex pairs can still leave a
-        // triangle when the dual graph has no perfect matching. Close it with a
-        // local refinement cascade; every new quad is validated, and the whole
-        // closure is rolled back if it would produce a bad cell.
-        let saved_points = points.clone();
-        let saved_quads = quads.clone();
-        let saved_tris = leftover.clone();
-        if close_leftovers(&mut points, &mut quads, &mut leftover).is_err() {
-            points = saved_points;
-            quads = saved_quads;
-            leftover = saved_tris;
-        }
-    }
+    // A maximum-cardinality matching over convex pairs can still leave a triangle
+    // when the dual graph has no perfect matching. The plans below are tried in
+    // order: the matching decides where the residual triangles sit, and the
+    // refinement cascade closes them; an unlucky pair can make the cascade's
+    // first split poor, so the fast matching is kept as a fallback.
+    let plans: &[MatchPlan] = if final_tris.len() <= EXACT_MATCHING_TRIANGLES {
+        &[MatchPlan::Exact, MatchPlan::Fast]
+    } else {
+        &[MatchPlan::Blocked, MatchPlan::Fast]
+    };
+    let (points, quads, leftover) = recombine_and_close(&final_tris, &points, plans);
     let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
     for t in &leftover {
         cells.push(Cell::tri3(*t));
@@ -1426,6 +1944,84 @@ mod tests {
         let gate = verify::gate(&mesh);
         assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
         assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
+    }
+
+    #[test]
+    fn the_greedy_matching_is_augmented_to_maximum_cardinality() {
+        // A 4-vertex path whose heaviest edge is the middle one: greedy takes
+        // the middle edge and leaves both ends free, so the matching is not
+        // maximum until one augmenting path replaces it.
+        let edges = vec![(0usize, 1usize, 1i32), (1, 2, 100), (2, 3, 1)];
+        let greedy = greedy_matching(4, &edges);
+        assert_eq!(greedy.iter().filter(|&&m| m != UNMATCHED).count(), 2);
+        let adj = vec![vec![1usize], vec![0, 2], vec![1, 3], vec![2]];
+        let scores = vec![0.0f64; 4];
+        let mate = Blossom::new(4, &adj, greedy).run(&scores);
+        let pairs = (0..4)
+            .filter(|&t| mate[t] != UNMATCHED && mate[t] > t)
+            .count();
+        assert_eq!(pairs, 2, "not a maximum matching: {mate:?}");
+        for t in 0..4 {
+            if mate[t] != UNMATCHED {
+                assert_eq!(mate[mate[t]], t);
+            }
+        }
+    }
+
+    /// The triangle dual graph of a `cells` x `cells` square grid (two right
+    /// triangles per square, so every square is a candidate quad).
+    fn triangle_grid(cells: usize) -> (Vec<Node>, Vec<[usize; 3]>) {
+        let side = cells + 1;
+        let mut points = Vec::with_capacity(side * side);
+        for j in 0..side {
+            for i in 0..side {
+                points.push([i as f64, j as f64, 0.0]);
+            }
+        }
+        let id = |i: usize, j: usize| j * side + i;
+        let mut tris = Vec::with_capacity(cells * cells * 2);
+        for j in 0..cells {
+            for i in 0..cells {
+                tris.push([id(i, j), id(i + 1, j), id(i + 1, j + 1)]);
+                tris.push([id(i, j), id(i + 1, j + 1), id(i, j + 1)]);
+            }
+        }
+        (points, tris)
+    }
+
+    #[test]
+    fn the_blocked_matching_is_a_perfect_matching_on_a_triangle_grid() {
+        let (points, tris) = triangle_grid(24);
+        // Force two blocks: the grid is far below the production threshold but
+        // this exercises the block + interface-band path.
+        let edges = recombination_edges(&tris, &points);
+        let mut adj = vec![Vec::new(); tris.len()];
+        for &(a, b, _) in &edges {
+            adj[a].push(b);
+            adj[b].push(a);
+        }
+        let scores = free_vertex_scores(&tris, &points);
+        let band = BAND_EDGES * edge_scale(&tris, &points);
+        let mate = blocked_matching(&tris, &points, &edges, &adj, &scores, band, 2);
+        for t in 0..tris.len() {
+            assert_ne!(mate[t], UNMATCHED, "triangle {t} left free");
+            assert_eq!(mate[mate[t]], t);
+        }
+        let (quads, leftover) = quads_from_mate(&tris, &points, &mate);
+        assert_eq!(quads.len(), tris.len() / 2);
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn the_recombination_makes_all_quads_on_a_triangle_grid() {
+        let (points, tris) = triangle_grid(12);
+        let (points, quads, leftover) = recombine_and_close(&tris, &points, &[MatchPlan::Exact]);
+        assert_eq!(quads.len(), tris.len() / 2);
+        assert!(leftover.is_empty(), "{} triangles left", leftover.len());
+        let cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
+        let mesh = Mesh::new(points, cells);
+        let gate = verify::gate(&mesh);
+        assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
     }
 
     #[test]
