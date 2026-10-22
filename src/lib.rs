@@ -22,6 +22,7 @@ pub mod grid;
 pub mod io;
 pub mod mesh;
 pub mod msh;
+pub mod parity;
 pub mod qmorph;
 pub mod quadify;
 pub mod quality;

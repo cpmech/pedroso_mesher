@@ -57,7 +57,7 @@
 //! **Clean room.** Implemented from the papers above; no source code was read
 //! or ported.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::mesh::Node;
 
@@ -869,27 +869,155 @@ impl WalkMesh {
     }
 
     fn cavity_close(&mut self, seed: usize) -> bool {
-        let mut seed_sets = vec![vec![seed]];
+        // 1. Corridor to another residual: the pair gives an even boundary and
+        // the DP is not forced to quadrangulate the sliver alone.
         if let Some(partner) = self.nearest_tris(seed).into_iter().next() {
             if partner != seed {
-                seed_sets.push(vec![seed, partner]);
+                if let Some(mut region) = self.path_region(seed, partner, 16) {
+                    for _ in 0..2 {
+                        if self.try_cavity_region(&region) {
+                            return true;
+                        }
+                        if !self.expand_region(&mut region, 24) {
+                            break;
+                        }
+                    }
+                }
             }
         }
-        for seeds in seed_sets {
-            let mut region: HashSet<usize> = seeds.iter().copied().collect();
-            for _ in 0..=10 {
-                if self.try_cavity_region(&region) {
-                    return true;
-                }
-                match self.frontier_quad(&region) {
-                    Some(next) => {
-                        region.insert(next);
+        // 2. Corridor to the boundary: one triangle + quads has odd parity, so
+        // the boundary edge is split before the quadrangulation.
+        if let Some(target) = self.nearest_boundary_cell(seed) {
+            if target != seed {
+                if let Some(mut region) = self.path_region(seed, target, 20) {
+                    for _ in 0..2 {
+                        if self.try_cavity_region(&region) {
+                            return true;
+                        }
+                        if !self.expand_region(&mut region, 26) {
+                            break;
+                        }
                     }
-                    None => break,
                 }
+            }
+        }
+        // 3. Fallback: grow a compact region around the seed.
+        let mut region: HashSet<usize> = HashSet::from([seed]);
+        for _ in 0..=10 {
+            if self.try_cavity_region(&region) {
+                return true;
+            }
+            match self.frontier_quad(&region) {
+                Some(next) => {
+                    region.insert(next);
+                }
+                None => break,
             }
         }
         false
+    }
+
+    /// Shortest path from `start` to `target` through quad cells (the end
+    /// points may be triangles). Returns the cells on the path.
+    fn path_region(&self, start: usize, target: usize, max_cells: usize) -> Option<HashSet<usize>> {
+        let mut previous: HashMap<usize, usize> = HashMap::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(start);
+        previous.insert(start, usize::MAX);
+        let mut found = false;
+        while let Some(id) = queue.pop_front() {
+            if previous.len() > max_cells {
+                break;
+            }
+            let Some(cell) = self.cell(id) else {
+                continue;
+            };
+            for i in 0..cell.n_nodes() {
+                for &other in self.edge_cells(cell.edge(i)) {
+                    if other == id || previous.contains_key(&other) {
+                        continue;
+                    }
+                    if other == target {
+                        previous.insert(other, id);
+                        found = true;
+                        break;
+                    }
+                    if self.quad(other).is_some() {
+                        previous.insert(other, id);
+                        queue.push_back(other);
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+            if found {
+                break;
+            }
+        }
+        if !found {
+            return None;
+        }
+        let mut region = HashSet::new();
+        let mut current = target;
+        while current != usize::MAX {
+            region.insert(current);
+            current = *previous.get(&current)?;
+        }
+        if region.len() > max_cells {
+            return None;
+        }
+        Some(region)
+    }
+
+    /// Add all quads adjacent to the region, up to `limit` cells.
+    fn expand_region(&self, region: &mut HashSet<usize>, limit: usize) -> bool {
+        let mut added = false;
+        let mut candidates = Vec::new();
+        for &id in region.iter() {
+            let Some(cell) = self.cell(id) else {
+                continue;
+            };
+            for i in 0..cell.n_nodes() {
+                for &other in self.edge_cells(cell.edge(i)) {
+                    if region.contains(&other) || self.quad(other).is_none() {
+                        continue;
+                    }
+                    candidates.push(other);
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        for other in candidates {
+            if region.len() >= limit {
+                break;
+            }
+            if region.insert(other) {
+                added = true;
+            }
+        }
+        added
+    }
+
+    /// The quad owning the domain boundary edge nearest to the seed.
+    fn nearest_boundary_cell(&self, seed: usize) -> Option<usize> {
+        let center = self.center(seed)?;
+        let mut best: Option<(f64, usize)> = None;
+        for &edge in &self.boundary {
+            let mid = midpoint(self.p(edge.0), self.p(edge.1));
+            let d = (mid[0] - center[0]).powi(2) + (mid[1] - center[1]).powi(2);
+            let Some(&owner) = self.edge_cells(edge).first() else {
+                continue;
+            };
+            if self.quad(owner).is_none() {
+                continue;
+            }
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, owner));
+            }
+        }
+        best.map(|(_, owner)| owner)
     }
 
     fn try_cavity_region(&mut self, region: &HashSet<usize>) -> bool {
@@ -1042,6 +1170,22 @@ impl WalkMesh {
     }
 
     /// Apply the best swap with one neighbour of `id`.
+    /// The smallest Jacobian over all quads (1.0 when there are none).
+    fn min_quad_sj(&self) -> f64 {
+        let mut min = f64::INFINITY;
+        for id in 0..self.cells.len() {
+            if let Some(q) = self.quad(id) {
+                let q = normalize_quad(&self.points, q);
+                min = min.min(quad_min_sj(&self.points, &q));
+            }
+        }
+        if min.is_finite() {
+            min
+        } else {
+            1.0
+        }
+    }
+
     fn repair_quad(&mut self, id: usize) -> bool {
         let Some(q1) = self.quad(id) else {
             return false;
@@ -1092,7 +1236,9 @@ impl WalkMesh {
         for _ in 0..12 {
             let bad = self.bad_quad_ids();
             if bad.is_empty() {
-                return true;
+                // Do not accept a template that leaves a near-degenerate quad;
+                // the ring regression was one at SJ ~ 0.000.
+                return self.min_quad_sj() >= 0.05;
             }
             let mut changed = false;
             for q in &bad {
@@ -1466,7 +1612,7 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
             let quad = normalize_quad(points, quad);
             let result = if quad_simple(points, &quad) {
                 let sj = quad_min_sj(points, &quad);
-                if sj > -0.05 {
+                if sj > 0.0 {
                     Some((sj, i + 1, i + 2))
                 } else {
                     None
@@ -1490,7 +1636,7 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
                     let quad = normalize_quad(points, [loopv[i], loopv[k], loopv[l], loopv[j]]);
                     if quad_simple(points, &quad) {
                         let sq = quad_min_sj(points, &quad);
-                        if sq > -0.05 {
+                        if sq > 0.0 {
                             let score = sq.min(s1).min(s2).min(s3);
                             if best.as_ref().is_none_or(|(bs, _, _)| score > *bs) {
                                 best = Some((score, k, l));
@@ -1543,6 +1689,45 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
         return None;
     }
     Some(quads)
+}
+
+/// Repair quads below `threshold` with the M2/M3 edge swap, repeatedly, until
+/// none can be improved. Returns the mesh and the number of swaps.
+pub fn repair_low_quads(
+    points: &[Node],
+    quads: &[[usize; 4]],
+    tris: &[[usize; 3]],
+    threshold: f64,
+    rounds: usize,
+) -> (Vec<Node>, Vec<[usize; 4]>, Vec<[usize; 3]>, usize) {
+    let mut mesh = WalkMesh::new(points, quads, tris);
+    let backup = mesh.clone();
+    let mut swaps = 0usize;
+    for _ in 0..rounds {
+        let mut changed = false;
+        for id in 0..mesh.cells.len() {
+            if let Some(q) = mesh.quad(id) {
+                let q = normalize_quad(&mesh.points, q);
+                if quad_min_sj(&mesh.points, &q) < threshold && mesh.repair_quad(id) {
+                    if mesh.min_quad_sj() <= 0.0 {
+                        // M2/M3 is allowed to step through a shallow concavity
+                        // inside the template repair, but a standalone quality
+                        // repair must not leave an inverted quad.
+                        let (quads, tris) = backup.collect();
+                        return (backup.points, quads, tris, 0);
+                    }
+                    changed = true;
+                    swaps += 1;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let (quads, tris) = mesh.collect();
+    (mesh.points, quads, tris, swaps)
 }
 
 /// Greedy quality pass: swap the shared edge of two quads when the minimum

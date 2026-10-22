@@ -12,6 +12,7 @@
 //! when the mesh is all-quad or two consecutive rounds make no progress.
 
 use pedroso_mesher::mesh::{Cell, Kind, Mesh};
+use pedroso_mesher::parity::even_boundary_loops;
 use pedroso_mesher::qmorph::convert_with_stats;
 use pedroso_mesher::quality;
 use pedroso_mesher::sun;
@@ -111,6 +112,10 @@ fn run(name: &str, d: &Domain, size: f64) {
             return;
         }
     };
+    // Sun 2016 §3.3: make every boundary loop even before conversion. An odd
+    // loop otherwise leaves an odd residual after pairing, which is exactly the
+    // l-bracket/perf failure mode.
+    let (points, tris, parity_splits) = even_boundary_loops(&points, &tris);
     let t_tri = t0.elapsed().as_secs_f64();
     let t1 = std::time::Instant::now();
     let ((quads, leftover, points), refusals) = convert_with_stats(&tris, &points, size);
@@ -185,8 +190,19 @@ fn run(name: &str, d: &Domain, size: f64) {
         }
     };
 
-    // Topological quality pass: swap quad edges while the pair's minimum angle
-    // improves and both new quads keep SJ >= 0.2, then smooth once more.
+    // First repair near-degenerate quads (M2/M3), then improve the minimum
+    // angle by quality-driven edge swaps.
+    let (points, quads, tris, low_repairs) = sun::repair_low_quads(
+        &mesh.points,
+        &quad_cells(&mesh),
+        &tri_cells(&mesh),
+        0.05,
+        16,
+    );
+    let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
+    cells.extend(tris.iter().map(|t| Cell::tri3(*t)));
+    mesh = Mesh::new(points, cells);
+
     let (points, quads, tris, quality_swaps) =
         sun::improve_quality(&mesh.points, &quad_cells(&mesh), &tri_cells(&mesh), 12);
     let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
@@ -254,7 +270,9 @@ fn run(name: &str, d: &Domain, size: f64) {
         quad_report.min_corner_angle_deg,
         t_total,
     );
-    println!("      quality swaps: {quality_swaps}");
+    println!(
+        "      quality swaps: {quality_swaps} | low repairs: {low_repairs} | parity splits: {parity_splits}"
+    );
     if let Some(reason) = gate.reason() {
         println!("      reason: {reason}");
     }
