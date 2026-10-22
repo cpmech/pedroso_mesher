@@ -139,6 +139,9 @@ const MOVE_MIN_SJ: f64 = 0.2;
 /// A residual triangle collapsed to less than this area is rejected.
 const MIN_TRI_AREA2: f64 = 1e-14;
 
+/// A cavity quad must leave usable quality; otherwise the cavity is rejected.
+const CAVITY_MIN_SJ: f64 = 0.0;
+
 #[derive(Clone)]
 struct WalkMesh {
     points: Vec<Node>,
@@ -873,12 +876,12 @@ impl WalkMesh {
         // the DP is not forced to quadrangulate the sliver alone.
         if let Some(partner) = self.nearest_tris(seed).into_iter().next() {
             if partner != seed {
-                if let Some(mut region) = self.path_region(seed, partner, 16) {
-                    for _ in 0..2 {
+                if let Some(mut region) = self.path_region(seed, partner, 30) {
+                    for _ in 0..4 {
                         if self.try_cavity_region(&region) {
                             return true;
                         }
-                        if !self.expand_region(&mut region, 24) {
+                        if !self.expand_region(&mut region, 60) {
                             break;
                         }
                     }
@@ -889,12 +892,12 @@ impl WalkMesh {
         // the boundary edge is split before the quadrangulation.
         if let Some(target) = self.nearest_boundary_cell(seed) {
             if target != seed {
-                if let Some(mut region) = self.path_region(seed, target, 20) {
-                    for _ in 0..2 {
+                if let Some(mut region) = self.path_region(seed, target, 40) {
+                    for _ in 0..4 {
                         if self.try_cavity_region(&region) {
                             return true;
                         }
-                        if !self.expand_region(&mut region, 26) {
+                        if !self.expand_region(&mut region, 60) {
                             break;
                         }
                     }
@@ -903,7 +906,7 @@ impl WalkMesh {
         }
         // 3. Fallback: grow a compact region around the seed.
         let mut region: HashSet<usize> = HashSet::from([seed]);
-        for _ in 0..=10 {
+        for _ in 0..=20 {
             if self.try_cavity_region(&region) {
                 return true;
             }
@@ -1075,9 +1078,10 @@ impl WalkMesh {
         let new_area: f64 = quads.iter().map(|q| quad_area(&self.points, q)).sum();
         let area_ok = (new_area - original_area).abs() <= 1.0e-6 * original_area.max(1.0);
         let valid = area_ok
-            && quads
-                .iter()
-                .all(|q| self.valid_new_cell(Cell::Quad(*q), &region_ids));
+            && quads.iter().all(|q| {
+                self.valid_new_cell(Cell::Quad(*q), &region_ids)
+                    && quad_min_sj(&self.points, q) >= CAVITY_MIN_SJ
+            });
         if !valid {
             self.cavity_valid_fail += 1;
             if inserted.is_some() {
@@ -1271,9 +1275,6 @@ impl WalkMesh {
                     return true;
                 }
             }
-            if self.cavity_close(id) {
-                return true;
-            }
         }
         false
     }
@@ -1408,9 +1409,6 @@ impl WalkMesh {
                     return true;
                 }
             }
-            if self.cavity_close(id) {
-                return true;
-            }
             if let Some(edge) = self.adjacent_boundary_edge(id) {
                 if let Some(next) = self.move_onto_boundary(id, edge) {
                     id = next;
@@ -1539,10 +1537,8 @@ pub fn close_residuals(
             // insert a point on the same line and create a degenerate quad.
             if mesh.absorb_one_boundary_sliver() {
                 stats.boundary_absorptions += 1;
-            } else if !mesh.template_one_boundary() {
-                // Last resort: a local cavity quadrangulation around an
-                // isolated interior sliver.
-                mesh.cavity_one();
+            } else {
+                mesh.template_one_boundary();
             }
             if mesh.tri_count() == before {
                 break;
@@ -1625,9 +1621,9 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
         }
         let mut best: Option<(f64, usize, usize)> = None;
         let mut k = i + 1;
-        while k + 2 < j {
+        while k < j {
             let mut l = k + 1;
-            while l + 1 < j {
+            while l < j {
                 if let (Some((s1, _, _)), Some((s2, _, _)), Some((s3, _, _))) = (
                     solve(i, k, loopv, points, memo),
                     solve(k, l, loopv, points, memo),
@@ -1663,6 +1659,9 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
         if j == i + 3 {
             out.push([loopv[i], loopv[i + 1], loopv[i + 2], loopv[j]]);
         } else {
+            // The quad at this node is part of the tiling; the recursions
+            // only cover the three sub-polygons.
+            out.push([loopv[i], loopv[k], loopv[l], loopv[j]]);
             build(i, k, loopv, memo, out);
             build(k, l, loopv, memo, out);
             build(l, j, loopv, memo, out);
@@ -1685,7 +1684,9 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
         .abs()
         * 0.5;
     let quad_area_sum: f64 = quads.iter().map(|q| quad_area(points, q)).sum();
-    if (quad_area_sum - polygon_area).abs() > 1.0e-6 * polygon_area.max(1.0) {
+    // quad_area is twice the geometric area; the polygon shoelace is twice
+    // the area as well, so compare in the same (doubled) units.
+    if (quad_area_sum - 2.0 * polygon_area).abs() > 1.0e-6 * (2.0 * polygon_area).max(1.0) {
         return None;
     }
     Some(quads)
@@ -1824,6 +1825,27 @@ fn quad_min_angle(points: &[Node], quad: &[usize; 4]) -> f64 {
     } else {
         0.0
     }
+}
+
+/// Post-process the leftovers with the local cavity quadrangulation. This runs
+/// after the ordinary pairing/absorption/template pipeline has stalled; the
+/// cavity is deliberately not part of that pipeline because it changes the
+/// ordering the front needs.
+pub fn close_by_cavity(
+    points: &[Node],
+    quads: &[[usize; 4]],
+    tris: &[[usize; 3]],
+) -> (Vec<Node>, Vec<[usize; 4]>, Vec<[usize; 3]>, usize) {
+    let mut mesh = WalkMesh::new(points, quads, tris);
+    let mut closed = 0usize;
+    for _ in 0..64 {
+        if !mesh.cavity_one() {
+            break;
+        }
+        closed += 1;
+    }
+    let (quads, tris) = mesh.collect();
+    (mesh.points, quads, tris, closed)
 }
 
 fn midpoint(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
@@ -2057,6 +2079,35 @@ mod tests {
         );
         let mesh = Mesh::new(points, quads.iter().map(|q| MeshCell::quad4(*q)).collect());
         assert_eq!(mesh.topology().cracks, 0);
+    }
+
+    #[test]
+    fn a_regular_hexagon_quadrangulates() {
+        let points: Vec<Node> = (0..6)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / 6.0;
+                [a.cos(), a.sin(), 0.0]
+            })
+            .collect();
+        let loopv: Vec<usize> = (0..6).collect();
+        assert!(
+            quadrangulate(&points, &loopv).is_some(),
+            "hexagon did not quadrangulate"
+        );
+    }
+
+    #[test]
+    fn a_regular_octagon_quadrangulates() {
+        let points: Vec<Node> = (0..8)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / 8.0;
+                [a.cos(), a.sin(), 0.0]
+            })
+            .collect();
+        let loopv: Vec<usize> = (0..8).collect();
+        let quads = quadrangulate(&points, &loopv);
+        assert!(quads.is_some(), "octagon did not quadrangulate");
+        assert_eq!(quads.map(|q| q.len()), Some(3));
     }
 
     #[test]

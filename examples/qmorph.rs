@@ -190,6 +190,38 @@ fn run(name: &str, d: &Domain, size: f64) {
         }
     };
 
+    // If triangles remain after the ordinary closure rounds, alternate the
+    // cavity quadrangulation with a few ordinary walk/smooth rounds. The
+    // cavity changes the local topology; the walk can then pair what it
+    // unlocked.
+    let mut cavity_closed = 0usize;
+    for _ in 0..3 {
+        if tri_cells(&mesh).is_empty() {
+            break;
+        }
+        let before = tri_cells(&mesh).len();
+        let (points, quads, tris, closed) =
+            sun::close_by_cavity(&mesh.points, &quad_cells(&mesh), &tri_cells(&mesh));
+        cavity_closed += closed;
+        let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
+        cells.extend(tris.iter().map(|t| Cell::tri3(*t)));
+        mesh = Mesh::new(points, cells);
+        for _ in 0..4 {
+            if tri_cells(&mesh).is_empty() {
+                break;
+            }
+            smooth_mesh(&mut mesh, d, 80, size);
+            let (points, quads, tris, _) =
+                sun::close_residuals(&mesh.points, &quad_cells(&mesh), &tri_cells(&mesh));
+            let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
+            cells.extend(tris.iter().map(|t| Cell::tri3(*t)));
+            mesh = Mesh::new(points, cells);
+        }
+        if tri_cells(&mesh).len() >= before {
+            break;
+        }
+    }
+
     // First repair near-degenerate quads (M2/M3), then improve the minimum
     // angle by quality-driven edge swaps.
     let (points, quads, tris, low_repairs) = sun::repair_low_quads(
@@ -271,7 +303,7 @@ fn run(name: &str, d: &Domain, size: f64) {
         t_total,
     );
     println!(
-        "      quality swaps: {quality_swaps} | low repairs: {low_repairs} | parity splits: {parity_splits}"
+        "      quality swaps: {quality_swaps} | low repairs: {low_repairs} | cavity: {cavity_closed} | parity splits: {parity_splits}"
     );
     if let Some(reason) = gate.reason() {
         println!("      reason: {reason}");
