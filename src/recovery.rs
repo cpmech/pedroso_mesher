@@ -19,21 +19,92 @@ pub type Tri = [usize; 3];
 /// flips do not converge. The mesh is then in a partially recovered state; the
 /// caller is expected to work on a copy.
 pub fn recover_edge(tris: &mut [Tri], points: &[Node], a: usize, b: usize) -> bool {
+    let alive = vec![true; tris.len()];
+    recover_edge_live(tris, points, a, b, &alive)
+}
+
+/// As [`recover_edge`], but only flipping edges whose two triangles are alive.
+///
+/// This matters when the triangulation is being consumed: a flip between a live
+/// triangle and one already replaced by a quad would silently cut through that
+/// quad, and the mesh would come out with cracks.
+pub fn recover_edge_live(
+    tris: &mut [Tri],
+    points: &[Node],
+    a: usize,
+    b: usize,
+    alive: &[bool],
+) -> bool {
     if a == b {
         return false;
     }
     for _ in 0..tris.len() {
-        if has_edge(tris, a, b) {
+        if has_edge_live(tris, alive, a, b) {
             return true;
         }
-        let Some((u, v)) = first_crossing(tris, points, a, b) else {
-            return has_edge(tris, a, b);
+        let Some((u, v)) = first_crossing_live(tris, points, a, b, alive) else {
+            return has_edge_live(tris, alive, a, b);
         };
-        if !flip_edge(tris, points, u, v) {
+        if !flip_edge_live(tris, points, u, v, alive) {
             return false;
         }
     }
-    has_edge(tris, a, b)
+    has_edge_live(tris, alive, a, b)
+}
+
+fn has_edge_live(tris: &[Tri], alive: &[bool], a: usize, b: usize) -> bool {
+    tris.iter()
+        .enumerate()
+        .any(|(i, t)| alive[i] && (0..3).any(|k| t[k] == a && t[(k + 1) % 3] == b))
+}
+
+fn first_crossing_live(
+    tris: &[Tri],
+    points: &[Node],
+    a: usize,
+    b: usize,
+    alive: &[bool],
+) -> Option<(usize, usize)> {
+    let p = points[a];
+    let q = points[b];
+    for (i, t) in tris.iter().enumerate() {
+        if !alive[i] {
+            continue;
+        }
+        for k in 0..3 {
+            let (u, v) = (t[k], t[(k + 1) % 3]);
+            if u == a || u == b || v == a || v == b {
+                continue;
+            }
+            if segments_cross(p, q, points[u], points[v]) {
+                return Some((u, v));
+            }
+        }
+    }
+    None
+}
+
+fn flip_edge_live(tris: &mut [Tri], points: &[Node], u: usize, v: usize, alive: &[bool]) -> bool {
+    let mut owners: Vec<usize> = (0..tris.len())
+        .filter(|&i| alive[i] && tris[i].contains(&u) && tris[i].contains(&v))
+        .collect();
+    if owners.len() != 2 {
+        return false;
+    }
+    let (p, q) = (apex(&tris[owners[0]], u, v), apex(&tris[owners[1]], u, v));
+    if p == q {
+        return false;
+    }
+    if side(points[u], points[v], points[p]) * side(points[u], points[v], points[q]) >= 0.0 {
+        return false;
+    }
+    if side(points[p], points[q], points[u]) * side(points[p], points[q], points[v]) >= 0.0 {
+        return false;
+    }
+    owners.sort_unstable();
+    tris[owners[0]] = [p, q, u];
+    tris[owners[1]] = [q, p, v];
+    true
 }
 
 /// True when some triangle has `a` and `b` as consecutive nodes.

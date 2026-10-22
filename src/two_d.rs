@@ -990,6 +990,11 @@ fn convex_ccw(q: &[[f64; 2]; 4]) -> bool {
     })
 }
 
+/// Scaled Jacobian of a quad given by coordinates, for callers outside this module.
+pub fn quad_min_sj_public(q: &[[f64; 2]; 4]) -> f64 {
+    quad_min_sj(q)
+}
+
 /// The quality contract's scaled Jacobian, for a quad given as coordinates.
 fn quad_min_sj(q: &[[f64; 2]; 4]) -> f64 {
     let pts: Vec<Node> = q.iter().map(|p| [p[0], p[1], 0.0]).collect();

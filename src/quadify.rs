@@ -20,7 +20,7 @@ pub type Quad = [usize; 4];
 
 /// Convert `tris` into quads, returning the quads and the triangles that could
 /// not be converted (the mesh may then be left quad-dominant).
-pub fn quadify(tris: &[[usize; 3]], points: &[Node]) -> (Vec<Quad>, Vec<[usize; 3]>) {
+pub fn quadify(tris: &[[usize; 3]], points: &[Node], size: f64) -> (Vec<Quad>, Vec<[usize; 3]>) {
     let mut tris: Vec<[usize; 3]> = tris.to_vec();
     let mut alive = vec![true; tris.len()];
     let mut quads: Vec<Quad> = Vec::new();
@@ -44,16 +44,23 @@ pub fn quadify(tris: &[[usize; 3]], points: &[Node]) -> (Vec<Quad>, Vec<[usize; 
             let Some(seed) = alive_triangle_containing(&tris, &alive, a, b) else {
                 continue;
             };
-            for (c, d) in candidate_corners(&tris, &alive, points, a, b) {
+            for (c, d) in candidate_corners(&tris, &alive, points, a, b, size) {
                 let quad = [a, b, d, c];
                 if !valid_quad(&quad, points) {
                     continue;
                 }
-                // the top edge must exist; if it does not, recover it on a copy
+                // all three missing sides must exist: a-c, b-d and c-d
                 let mut recovered = tris.clone();
-                if !has_edge(&recovered, &alive, c, d)
-                    && !crate::recovery::recover_edge(&mut recovered, points, c, d)
-                {
+                let mut ok = true;
+                for (u, v) in [(a, c), (b, d), (c, d)] {
+                    if !has_edge(&recovered, &alive, u, v)
+                        && !crate::recovery::recover_edge_live(&mut recovered, points, u, v, &alive)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
                     continue;
                 }
                 let Some(region) = region_inside(&recovered, &alive, seed, &quad, points) else {
@@ -112,35 +119,130 @@ fn front_edges(tris: &[[usize; 3]], alive: &[bool], points: &[Node]) -> Vec<(usi
         .collect()
 }
 
-/// Pairs `(c, d)` of existing neighbours that close a quad with `(a, b)`.
+/// Pairs `(c, d)` that close a quad with `(a, b)`, chosen geometrically.
+///
+/// Q-Morph puts the side nodes along the inward normal at the local element
+/// size; taking only graph neighbours (as the first slice did) restricts the
+/// quad to the current triangulation and caps its shape. Here any node ahead of
+/// the front and at a plausible distance is a candidate, and the three missing
+/// sides are recovered afterwards.
 fn candidate_corners(
     tris: &[[usize; 3]],
     alive: &[bool],
     points: &[Node],
     a: usize,
     b: usize,
+    size: f64,
 ) -> Vec<(usize, usize)> {
+    // Only nodes reachable from the front edge through live triangles: a side
+    // node across already-converted territory cannot be reached without cutting
+    // through a quad, and the recovery would fail anyway.
+    let near_a = live_neighbourhood(tris, alive, a, 2);
+    let near_b = live_neighbourhood(tris, alive, b, 2);
+    let pa = points[a];
+    let pb = points[b];
+    let length = edge_length(points, a, b);
+    let target = if length > 1e-9 { length } else { size };
+    // inward normal: rotate the front direction by +90 degrees (alive region left)
+    let n = [-(pb[1] - pa[1]), (pb[0] - pa[0])];
+    let nn = (n[0] * n[0] + n[1] * n[1]).sqrt();
+    if nn <= 1e-12 {
+        return Vec::new();
+    }
+    let n = [n[0] / nn, n[1] / nn];
+
+    let ahead = |p: Node, origin: Node| -> bool {
+        let d = [p[0] - origin[0], p[1] - origin[1]];
+        let len = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        if len < 1e-9 {
+            return false;
+        }
+        let cos = (d[0] * n[0] + d[1] * n[1]) / len;
+        cos > 0.35 && len >= 0.5 * target && len <= 1.8 * target
+    };
+
     let mut out = Vec::new();
-    let na = neighbours(tris, alive, a);
-    let nb = neighbours(tris, alive, b);
-    for &c in &na {
-        if c == b {
+    for &c in &near_a {
+        if c == a || c == b || !ahead(points[c], pa) {
             continue;
         }
-        for &d in &nb {
-            if d == a || d == c {
+        for &d in &near_b {
+            if d == a || d == b || d == c || !ahead(points[d], pb) {
                 continue;
             }
-            out.push((c, d));
+            // the sides must stay inside the live region, or the recovery has to
+            // cut through a quad and will fail
+            if inside_live(tris, alive, points, a, c)
+                && inside_live(tris, alive, points, b, d)
+                && inside_live(tris, alive, points, c, d)
+            {
+                out.push((c, d));
+            }
         }
     }
-    // prefer the pair closest to a square: longer top edge, shorter sides
     out.sort_by(|&(c1, d1), &(c2, d2)| {
         let s1 = shape_score(points, a, b, d1, c1);
         let s2 = shape_score(points, a, b, d2, c2);
         s2.partial_cmp(&s1).unwrap_or(std::cmp::Ordering::Equal)
     });
+    out.truncate(12);
     out
+}
+
+/// True when the open segment `a-b` stays inside live triangles.
+fn inside_live(tris: &[[usize; 3]], alive: &[bool], points: &[Node], a: usize, b: usize) -> bool {
+    for step in 1..8 {
+        let t = step as f64 / 8.0;
+        let px = points[a][0] + t * (points[b][0] - points[a][0]);
+        let py = points[a][1] + t * (points[b][1] - points[a][1]);
+        let inside = tris.iter().enumerate().any(|(i, tri)| {
+            if !alive[i] {
+                return false;
+            }
+            let (p0, p1, p2) = (points[tri[0]], points[tri[1]], points[tri[2]]);
+            let d0 = (p1[0] - p0[0]) * (py - p0[1]) - (p1[1] - p0[1]) * (px - p0[0]);
+            let d1 = (p2[0] - p1[0]) * (py - p1[1]) - (p2[1] - p1[1]) * (px - p1[0]);
+            let d2 = (p0[0] - p2[0]) * (py - p2[1]) - (p0[1] - p2[1]) * (px - p2[0]);
+            (d0 >= -1e-12 && d1 >= -1e-12 && d2 >= -1e-12)
+                || (d0 <= 1e-12 && d1 <= 1e-12 && d2 <= 1e-12)
+        });
+        if !inside {
+            return false;
+        }
+    }
+    true
+}
+
+/// Nodes within `depth` triangle steps of `start`, using live triangles only.
+fn live_neighbourhood(
+    tris: &[[usize; 3]],
+    alive: &[bool],
+    start: usize,
+    depth: usize,
+) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    let mut frontier = vec![start];
+    seen.insert(start);
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for &v in &frontier {
+            for (i, t) in tris.iter().enumerate() {
+                if !alive[i] || !t.contains(&v) {
+                    continue;
+                }
+                for &u in t {
+                    if seen.insert(u) {
+                        next.push(u);
+                    }
+                }
+            }
+        }
+        frontier = next;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+    seen.into_iter().collect()
 }
 
 fn shape_score(points: &[Node], a: usize, b: usize, d: usize, c: usize) -> f64 {
@@ -282,7 +384,31 @@ fn valid_quad(quad: &Quad, points: &[Node]) -> bool {
         let b = points[quad[(i + 1) % 4]];
         area += a[0] * b[1] - b[0] * a[1];
     }
-    area > 1e-12 && shape_score(points, quad[0], quad[1], quad[2], quad[3]) > 15.0
+    if area <= 1e-12 {
+        return false;
+    }
+    // strictly convex: every corner turns left
+    let convex = (0..4).all(|i| {
+        let a = points[quad[(i + 3) % 4]];
+        let b = points[quad[i]];
+        let c = points[quad[(i + 1) % 4]];
+        cross(a, b, c) > 0.0
+    });
+    if !convex {
+        return false;
+    }
+    // real Jacobian, not just corners: a quad can have usable angles and still be
+    // a sliver once the bilinear map is evaluated
+    crate::two_d::quad_min_sj_public(&coords_of_quad(quad, points)) > 0.2
+}
+
+fn coords_of_quad(quad: &Quad, points: &[Node]) -> [[f64; 2]; 4] {
+    [
+        [points[quad[0]][0], points[quad[0]][1]],
+        [points[quad[1]][0], points[quad[1]][1]],
+        [points[quad[2]][0], points[quad[2]][1]],
+        [points[quad[3]][0], points[quad[3]][1]],
+    ]
 }
 
 fn cross(a: Node, b: Node, c: Node) -> f64 {
@@ -306,7 +432,7 @@ mod tests {
             [1.0, 1.0, 0.0],
             [0.0, 1.0, 0.0],
         ];
-        let (quads, leftover) = quadify(&[[0, 1, 2], [0, 2, 3]], &points);
+        let (quads, leftover) = quadify(&[[0, 1, 2], [0, 2, 3]], &points, 1.0);
         assert_eq!(quads.len(), 1, "quads {quads:?} leftover {leftover:?}");
         assert!(leftover.is_empty());
     }
@@ -329,7 +455,7 @@ mod tests {
                 tris.push([a, c, d]);
             }
         }
-        let (quads, leftover) = quadify(&tris, &points);
+        let (quads, leftover) = quadify(&tris, &points, 1.0);
         assert!(leftover.is_empty(), "leftover {leftover:?}");
         assert_eq!(quads.len(), 4, "quads {quads:?}");
     }
