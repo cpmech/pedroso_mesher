@@ -29,6 +29,7 @@ pub mod quality;
 pub mod recovery;
 pub mod sun;
 pub mod two_d;
+pub mod twostage;
 pub mod verify;
 
 pub use bench::{Part, PARTS};

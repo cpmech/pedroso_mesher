@@ -80,11 +80,7 @@ pub fn gate(mesh: &Mesh) -> Gate {
     let inverted = mesh
         .cells
         .iter()
-        .filter(|c| {
-            quality::scaled_jacobian(c, &mesh.points)
-                .iter()
-                .any(|&s| s <= 0.0)
-        })
+        .filter(|c| cell_inverted(c, &mesh.points))
         .count();
     Gate {
         quads,
@@ -95,6 +91,28 @@ pub fn gate(mesh: &Mesh) -> Gate {
         min_corner_angle_deg: report.min_corner_angle_deg,
         cracks: topo.cracks,
     }
+}
+
+/// True when a cell has non-positive orientation.
+///
+/// A `Tri3` must be checked by **signed area**: the quality report gives every
+/// triangle a scaled Jacobian of 1.0 (there is no corner Jacobian to measure), so
+/// a triangle wound clockwise is invisible to it. That hole let a conversion
+/// whose recovery flips produced inverted triangles report "no inverted element"
+/// — and every later pairing, merge or cavity silently refused those triangles.
+fn cell_inverted(cell: &crate::mesh::Cell, points: &[crate::mesh::Node]) -> bool {
+    if cell.kind == Kind::Tri3 {
+        let (a, b, c) = (
+            points[cell.nodes[0]],
+            points[cell.nodes[1]],
+            points[cell.nodes[2]],
+        );
+        let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        return area <= 0.0;
+    }
+    quality::scaled_jacobian(cell, points)
+        .iter()
+        .any(|&s| s <= 0.0)
 }
 
 /// Pairs of cells that share more than one edge. Such cells overlap; the
@@ -164,6 +182,15 @@ mod tests {
         assert_eq!(g.inverted, 1);
         assert!(!g.passes());
         assert!(g.reason().unwrap_or_default().contains("inverted"));
+    }
+
+    #[test]
+    fn a_reversed_triangle_counts_as_inverted() {
+        let mut mesh = unit_quad();
+        mesh.cells.push(Cell::tri3([0, 2, 1]));
+        let g = gate(&mesh);
+        assert_eq!(g.inverted, 1, "{g:?}");
+        assert!(!g.passes());
     }
 
     #[test]

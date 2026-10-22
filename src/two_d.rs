@@ -332,6 +332,28 @@ const MIN_PAIR_ANGLE_DEG: f64 = 10.0;
 /// quad, however good its scaled Jacobian looks.
 const MAX_PAIR_ANGLE_DEG: f64 = 160.0;
 
+/// Quality guards for [`pair_triangles_with`].
+///
+/// The shipped matching path uses `PairGuard::default`, i.e. the constants
+/// above; a caller that pairs a **region** of an existing mesh (the two-stage
+/// conversion) can ask for a stricter floor without changing that path.
+#[derive(Clone, Copy, Debug)]
+pub struct PairGuard {
+    pub min_scaled_jacobian: f64,
+    pub min_angle_deg: f64,
+    pub max_angle_deg: f64,
+}
+
+impl Default for PairGuard {
+    fn default() -> Self {
+        PairGuard {
+            min_scaled_jacobian: MIN_PAIR_SCALED_JACOBIAN,
+            min_angle_deg: MIN_PAIR_ANGLE_DEG,
+            max_angle_deg: MAX_PAIR_ANGLE_DEG,
+        }
+    }
+}
+
 /// Refinement stops after this many passes even if the size field is unmet.
 const MAX_PASSES: usize = 200;
 /// A circumcenter closer than this to the boundary is not inserted: it would
@@ -899,6 +921,22 @@ fn circumcenter(p: &[[f64; 2]]) -> Option<([f64; 2], f64)> {
 /// Pair adjacent triangles into quads: maximum cardinality, then maximum
 /// quality, via a general weighted matching (Edmonds' blossom algorithm).
 fn pair_triangles(tris: &[[usize; 3]], points: &[Node]) -> (Vec<[usize; 4]>, Vec<[usize; 3]>) {
+    pair_triangles_with(tris, points, PairGuard::default())
+}
+
+/// Pair adjacent triangles into quads with explicit quality guards.
+///
+/// This is the matching the shipped path uses, exposed so a region of an
+/// existing mesh can be paired under its own floor (the two-stage Q-Morph +
+/// matching conversion). Every candidate quad must be convex, have scaled
+/// Jacobian ≥ `guard.min_scaled_jacobian` and corner angles within
+/// `[guard.min_angle_deg, guard.max_angle_deg]`; the rest is maximum-cardinality
+/// matching, weighted by scaled Jacobian.
+pub fn pair_triangles_with(
+    tris: &[[usize; 3]],
+    points: &[Node],
+    guard: PairGuard,
+) -> (Vec<[usize; 4]>, Vec<[usize; 3]>) {
     // edge key -> the (up to two) triangles that use it
     let mut edge_to_tris: std::collections::HashMap<(usize, usize), Vec<usize>> =
         std::collections::HashMap::new();
@@ -922,16 +960,16 @@ fn pair_triangles(tris: &[[usize; 3]], points: &[Node]) -> (Vec<[usize; 4]>, Vec
         let cell = Cell::quad4(quad);
         let sj = quality::scaled_jacobian(&cell, points);
         let worst = sj.iter().copied().fold(f64::INFINITY, f64::min);
-        if !worst.is_finite() || worst < MIN_PAIR_SCALED_JACOBIAN {
+        if !worst.is_finite() || worst < guard.min_scaled_jacobian {
             continue;
         }
         let angles = quality::quad_angles(&cell, points);
         let min_angle = angles.iter().copied().fold(f64::INFINITY, f64::min);
         let max_angle = angles.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        if !min_angle.is_finite() || min_angle < MIN_PAIR_ANGLE_DEG {
+        if !min_angle.is_finite() || min_angle < guard.min_angle_deg {
             continue;
         }
-        if !max_angle.is_finite() || max_angle > MAX_PAIR_ANGLE_DEG {
+        if !max_angle.is_finite() || max_angle > guard.max_angle_deg {
             continue;
         }
         // weight: quality in [0, 1] scaled to an integer; higher is better

@@ -94,6 +94,14 @@ struct LoopScratch {
     used: Vec<bool>,
 }
 
+/// Reusable marks for [`CellMesh::removing_fragments`].
+#[derive(Default)]
+struct FragmentCheck {
+    stamp: Vec<u32>,
+    generation: u32,
+    stack: Vec<usize>,
+}
+
 /// A mesh whose cells are triangles and quads, with edge adjacency, a bucket
 /// index over edges (for recovery) and the current front.
 pub struct CellMesh {
@@ -122,7 +130,10 @@ impl CellMesh {
             edge_buckets: HashMap::new(),
             bucket: if size > 1e-9 { size } else { 1.0 },
             front: HashSet::new(),
-            live_tris: tris.len(),
+            // `index_cell` below counts the initial triangles; starting at
+            // `tris.len()` here counted them twice, which made the runaway guard
+            // and the fragment guard see twice the real region.
+            live_tris: 0,
             node_edges: HashMap::new(),
         };
         for id in 0..mesh.cells.len() {
@@ -206,7 +217,7 @@ impl CellMesh {
             return;
         };
         if cell.is_tri() {
-            self.live_tris += 1;
+            self.live_tris = self.live_tris.saturating_sub(1);
         }
         for i in 0..cell.n_nodes() {
             let edge = cell.edge(i);
@@ -260,6 +271,124 @@ impl CellMesh {
 
     fn edge_cells(&self, edge: (usize, usize)) -> &[usize] {
         self.edges.get(&edge).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The unconverted triangles, in cell order.
+    fn triangles(&self) -> Vec<[usize; 3]> {
+        self.cell_ids()
+            .filter_map(|id| match self.cells[id] {
+                Some(Cell::Tri(t)) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Sizes of the connected components of the unconverted triangles, by shared
+    /// edge, largest first. **One entry** means the remaining region is a single
+    /// triangulation — the state the two-stage conversion hands to the matching
+    /// stage. More than one means the front stranded islands, and a matching
+    /// stage would leave one triangle per odd island.
+    pub fn live_tri_component_sizes(&self) -> Vec<usize> {
+        let mut seen = vec![false; self.cells.len()];
+        let mut sizes = Vec::new();
+        let mut stack = Vec::new();
+        for start in self.cell_ids() {
+            if seen[start] || !self.cells[start].as_ref().is_some_and(Cell::is_tri) {
+                continue;
+            }
+            seen[start] = true;
+            stack.push(start);
+            let mut size = 0usize;
+            while let Some(id) = stack.pop() {
+                size += 1;
+                let Some(Some(cell)) = self.cells.get(id).copied() else {
+                    continue;
+                };
+                for i in 0..cell.n_nodes() {
+                    for &other in self.edge_cells(cell.edge(i)) {
+                        if other != id
+                            && !seen[other]
+                            && self
+                                .cells
+                                .get(other)
+                                .and_then(|c| c.as_ref())
+                                .is_some_and(Cell::is_tri)
+                        {
+                            seen[other] = true;
+                            stack.push(other);
+                        }
+                    }
+                }
+            }
+            sizes.push(size);
+        }
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        sizes
+    }
+
+    /// True when removing `region` (all triangles) would leave an unconverted
+    /// component with an **odd** number of triangles.
+    ///
+    /// A component of odd size can never be paired completely — matching leaves
+    /// one triangle — so the front must not create one. Even components are
+    /// fine: parity of a triangulated region equals parity of its boundary, so
+    /// an even component has an even boundary and a perfect pairing is possible
+    /// (edge flips fix the structures where it is not).
+    fn removing_leaves_odd_component(&self, region: &[usize], scratch: &mut FragmentCheck) -> bool {
+        let remaining = self.live_tris.saturating_sub(region.len());
+        if remaining == 0 {
+            return false;
+        }
+        if scratch.stamp.len() < self.cells.len() {
+            scratch.stamp.resize(self.cells.len(), 0);
+        }
+        scratch.generation = scratch.generation.wrapping_add(1);
+        if scratch.generation == 0 {
+            for s in &mut scratch.stamp {
+                *s = 0;
+            }
+            scratch.generation = 1;
+        }
+        let generation = scratch.generation;
+        for &id in region {
+            scratch.stamp[id] = generation;
+        }
+        for start in self.cell_ids() {
+            if scratch.stamp[start] == generation
+                || !self.cells[start].as_ref().is_some_and(Cell::is_tri)
+            {
+                continue;
+            }
+            scratch.stamp[start] = generation;
+            scratch.stack.push(start);
+            let mut size = 0usize;
+            while let Some(id) = scratch.stack.pop() {
+                size += 1;
+                let Some(Some(cell)) = self.cells.get(id).copied() else {
+                    continue;
+                };
+                for i in 0..cell.n_nodes() {
+                    for &other in self.edge_cells(cell.edge(i)) {
+                        if scratch.stamp[other] == generation {
+                            continue;
+                        }
+                        if self
+                            .cells
+                            .get(other)
+                            .and_then(|c| c.as_ref())
+                            .is_some_and(Cell::is_tri)
+                        {
+                            scratch.stamp[other] = generation;
+                            scratch.stack.push(other);
+                        }
+                    }
+                }
+            }
+            if size % 2 == 1 {
+                return true;
+            }
+        }
+        false
     }
 
     fn set_cell(&mut self, id: usize, cell: Cell) {
@@ -697,6 +826,11 @@ impl CellMesh {
         {
             return false;
         }
+        // NOTE: the reversed order below (`[p, q, u]`, `[q, p, v]`) is only
+        // correct when `t1` traverses v→u; on the other half of the cases it
+        // writes both new triangles **inverted**. Fixing the winding changes the
+        // closure's trajectory (measured 4/6 → 2/6 on the gate table), because
+        // the closure's tie-breaks follow the stored node order; see the record.
         self.set_cell(owners0, Cell::Tri([p, q, u]));
         self.set_cell(owners1, Cell::Tri([q, p, v]));
         true
@@ -834,6 +968,8 @@ enum Refusal {
     Shape,
     Recovery,
     Region,
+    /// The quad would have left an unconverted region of odd triangle count.
+    OddRegion,
 }
 
 /// Counters for the stage at which a front edge failed.
@@ -844,6 +980,8 @@ pub struct Refusals {
     pub invalid_quad: usize,
     pub recovery: usize,
     pub region: usize,
+    /// Placements refused to keep every unconverted region even.
+    pub odd_region: usize,
     /// Nodes inserted because the front edge disagreed with the size field.
     pub mismatch_insertions: usize,
     /// Front edges examined.
@@ -864,18 +1002,66 @@ pub fn convert(
     convert_with_stats(tris, points, size).0
 }
 
-pub fn convert_with_stats(
-    tris: &[[usize; 3]],
-    points: &[Node],
-    size: f64,
-) -> ((Vec<[usize; 4]>, Vec<[usize; 3]>, Vec<Node>), Refusals) {
+/// How the front decides it has finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontStop {
+    /// Convert until no front edge can advance. The leftovers are whatever the
+    /// stalled loops left behind, often several disconnected islands.
+    Exhaust,
+    /// Refuse a placement that would leave an unconverted component with an
+    /// odd number of triangles. The front then stops with every remaining
+    /// component even, which is the condition the matching stage needs to pair
+    /// it completely; the front may still split the region into several even
+    /// components (it does so naturally as it advances).
+    EvenComponents,
+}
+
+/// The front's state when it stops.
+#[derive(Debug, Default)]
+pub struct FrontResult {
+    pub points: Vec<Node>,
+    pub quads: Vec<[usize; 4]>,
+    /// The unconverted triangles, in cell order.
+    pub triangles: Vec<[usize; 3]>,
+    pub refusals: Refusals,
+    /// Connected-component sizes of `triangles`, largest first. One entry means
+    /// the remainder is one triangulation.
+    pub region_components: Vec<usize>,
+}
+
+/// Run the Q-Morph front and return its state, **without** the Sun closure.
+///
+/// [`convert_with_stats`] is this plus [`crate::sun::close_residuals`]; the
+/// two-stage conversion is this plus a triangle matching stage.
+pub fn run_front(tris: &[[usize; 3]], points: &[Node], size: f64, stop: FrontStop) -> FrontResult {
     let mut refusals = Refusals::default();
     let mut mesh = CellMesh::new(points, tris, size);
     let mut quads: Vec<[usize; 4]> = Vec::new();
+    front_loop(&mut mesh, tris.len(), size, &mut quads, &mut refusals, stop);
+    let region_components = mesh.live_tri_component_sizes();
+    let triangles = mesh.triangles();
+    FrontResult {
+        points: mesh.points,
+        quads,
+        triangles,
+        refusals,
+        region_components,
+    }
+}
+
+fn front_loop(
+    mesh: &mut CellMesh,
+    tris_len: usize,
+    size: f64,
+    quads: &mut Vec<[usize; 4]>,
+    refusals: &mut Refusals,
+    stop: FrontStop,
+) {
     let mut blocked: HashSet<(usize, usize)> = HashSet::new();
-    let max_attempts = 200 * tris.len() + 10_000;
-    let max_triangles = 4 * tris.len() + 100;
+    let max_attempts = 200 * tris_len + 10_000;
+    let max_triangles = 4 * tris_len + 100;
     let mut scratch = LoopScratch::default();
+    let mut fragment = FragmentCheck::default();
 
     'outer: loop {
         let mut loops: Vec<(f64, Vec<(usize, usize)>)> = mesh
@@ -919,7 +1105,7 @@ pub fn convert_with_stats(
                 if refusals.attempts > max_attempts || mesh.live_tris > max_triangles {
                     break 'outer;
                 }
-                match try_quad(&mut mesh, edge, size, &mut quads, &mut refusals) {
+                match try_quad(mesh, edge, size, quads, refusals, stop, &mut fragment) {
                     Ok(()) => {
                         progressed = true;
                         // Rule 4: only edges touching the new quad can have
@@ -936,6 +1122,7 @@ pub fn convert_with_stats(
                             Refusal::Shape => refusals.invalid_quad += 1,
                             Refusal::Recovery => refusals.recovery += 1,
                             Refusal::Region => refusals.region += 1,
+                            Refusal::OddRegion => refusals.odd_region += 1,
                         }
                         blocked.insert(edge);
                     }
@@ -946,19 +1133,17 @@ pub fn convert_with_stats(
             break;
         }
     }
+}
 
-    let leftover: Vec<[usize; 3]> = mesh
-        .cell_ids()
-        .filter_map(|id| match mesh.cells[id] {
-            Some(Cell::Tri(t)) => Some(t),
-            _ => None,
-        })
-        .collect();
-    // Sun's residual-triangle walk closes the leftovers on the Q-Morph output.
-    // It keeps the placed quads; only quads on a moving triangle's path are
-    // destroyed and rebuilt.
+pub fn convert_with_stats(
+    tris: &[[usize; 3]],
+    points: &[Node],
+    size: f64,
+) -> ((Vec<[usize; 4]>, Vec<[usize; 3]>, Vec<Node>), Refusals) {
+    let front = run_front(tris, points, size, FrontStop::Exhaust);
+    let mut refusals = front.refusals;
     let (points, quads, leftover, closure) =
-        crate::sun::close_residuals(&mesh.points, &quads, &leftover);
+        crate::sun::close_residuals(&front.points, &front.quads, &front.triangles);
     refusals.closure = closure;
     ((quads, leftover, points), refusals)
 }
@@ -979,6 +1164,8 @@ fn try_quad(
     size: f64,
     quads: &mut Vec<[usize; 4]>,
     refusals: &mut Refusals,
+    stop: FrontStop,
+    fragment: &mut FragmentCheck,
 ) -> Result<(), Refusal> {
     let seed = mesh.tri_owner(edge.0, edge.1).ok_or(Refusal::Placement)?;
     let Some(Cell::Tri(tri)) = mesh.cells[seed] else {
@@ -1112,6 +1299,13 @@ fn try_quad(
         };
         if region.is_empty() {
             last = Refusal::Region;
+            continue;
+        }
+        // Two-stage: never leave an unconverted region of odd size.
+        if stop == FrontStop::EvenComponents
+            && mesh.removing_leaves_odd_component(&region, fragment)
+        {
+            last = Refusal::OddRegion;
             continue;
         }
         for &id in &region {
@@ -1296,6 +1490,53 @@ mod tests {
             assert!(sj > 0.0);
         }
         assert!(mesh.front.is_empty(), "front {:?}", mesh.front);
+    }
+
+    /// A 3 × 3 grid of nodes (2 × 2 cells), each cell split into two triangles.
+    fn grid_3x3() -> (Vec<Node>, Vec<[usize; 3]>) {
+        let mut points = Vec::new();
+        for j in 0..3 {
+            for i in 0..3 {
+                points.push([i as f64, j as f64, 0.0]);
+            }
+        }
+        let id = |i: usize, j: usize| j * 3 + i;
+        let mut tris = Vec::new();
+        for j in 0..2 {
+            for i in 0..2 {
+                let (a, b, c, d) = (id(i, j), id(i + 1, j), id(i + 1, j + 1), id(i, j + 1));
+                tris.push([a, b, c]);
+                tris.push([a, c, d]);
+            }
+        }
+        (points, tris)
+    }
+
+    #[test]
+    fn the_even_region_guard_leaves_only_even_components() {
+        let (points, tris) = grid_3x3();
+        let front = run_front(&tris, &points, 1.0, FrontStop::EvenComponents);
+        assert!(
+            front.region_components.iter().all(|n| n % 2 == 0),
+            "odd region left: {:?}",
+            front.region_components
+        );
+        // The guard may refuse placements, but it must not lose the quads it
+        // placed or the triangles it kept: the union tiles the input.
+        let placed: usize = front.quads.len() * 4 + front.triangles.len() * 3;
+        let source: usize = tris.len() * 3;
+        assert!(placed <= source);
+    }
+
+    #[test]
+    fn the_front_keeps_every_triangle_wound_counter_clockwise() {
+        let (points, tris) = grid_3x3();
+        let front = run_front(&tris, &points, 1.0, FrontStop::Exhaust);
+        for t in &front.triangles {
+            let (a, b, c) = (front.points[t[0]], front.points[t[1]], front.points[t[2]]);
+            let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+            assert!(area >= 0.0, "clockwise triangle {t:?} after the front");
+        }
     }
 
     #[test]

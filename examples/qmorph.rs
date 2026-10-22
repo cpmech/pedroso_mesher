@@ -17,6 +17,7 @@ use pedroso_mesher::qmorph::convert_with_stats;
 use pedroso_mesher::quality;
 use pedroso_mesher::sun;
 use pedroso_mesher::two_d::{smooth_mesh, triangulate, Domain, Sizing};
+use pedroso_mesher::twostage;
 use pedroso_mesher::verify;
 
 fn arc(cx: f64, cy: f64, r: f64, a0: f64, a1: f64, n: usize) -> Vec<[f64; 2]> {
@@ -103,7 +104,16 @@ fn tri_cells(mesh: &Mesh) -> Vec<[usize; 3]> {
         .collect()
 }
 
-fn run(name: &str, d: &Domain, size: f64) {
+/// Which conversion route the gate table is measuring.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// Q-Morph front to exhaustion + Sun residual closure (the shipped route).
+    Front,
+    /// Q-Morph front under the even-region guard + Blossom matching.
+    TwoStage,
+}
+
+fn run(name: &str, d: &Domain, size: f64, mode: Mode) {
     let t0 = std::time::Instant::now();
     let (points, tris) = match triangulate(d, &Sizing::uniform(size).unwrap()) {
         Ok(v) => v,
@@ -118,7 +128,23 @@ fn run(name: &str, d: &Domain, size: f64) {
     let (points, tris, parity_splits) = even_boundary_loops(&points, &tris);
     let t_tri = t0.elapsed().as_secs_f64();
     let t1 = std::time::Instant::now();
-    let ((quads, leftover, points), refusals) = convert_with_stats(&tris, &points, size);
+    let mut two_stage_note = String::new();
+    let ((quads, leftover, points), refusals) = if mode == Mode::TwoStage {
+        let r = twostage::convert(&tris, &points, size);
+        two_stage_note = format!(
+            " | two-stage: front {} core {} ({} comps) matched {} flips {} inverted-core {} rejected {}",
+            r.stats.front_quads,
+            r.stats.core_triangles,
+            r.stats.core_components,
+            r.stats.matched_quads,
+            r.stats.flips,
+            r.stats.inverted_core,
+            r.stats.rejected_merge,
+        );
+        ((r.quads, r.triangles, r.points), r.refusals)
+    } else {
+        convert_with_stats(&tris, &points, size)
+    };
     let t_conv = t1.elapsed().as_secs_f64();
 
     let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
@@ -303,7 +329,7 @@ fn run(name: &str, d: &Domain, size: f64) {
         t_total,
     );
     println!(
-        "      quality swaps: {quality_swaps} | low repairs: {low_repairs} | cavity: {cavity_closed} | parity splits: {parity_splits}"
+        "      quality swaps: {quality_swaps} | low repairs: {low_repairs} | cavity: {cavity_closed} | parity splits: {parity_splits}{two_stage_note}"
     );
     if let Some(reason) = gate.reason() {
         println!("      reason: {reason}");
@@ -312,6 +338,13 @@ fn run(name: &str, d: &Domain, size: f64) {
 }
 
 fn main() {
+    // `cargo run --example qmorph -- two-stage` measures the two-stage route;
+    // the default is the shipped front + Sun closure route.
+    let mode = if std::env::args().any(|a| a == "two-stage") {
+        Mode::TwoStage
+    } else {
+        Mode::Front
+    };
     println!(
         "{:12} {:>4}  {:>5}  {:>4}  {:>3}  {:>5}  {:>5}  {:>6}  {:>4}",
         "part", "size", "quads", "tri", "inv", "minSJ", "minAng", "cracks", "gate"
@@ -320,20 +353,23 @@ fn main() {
         "plate-hole",
         &Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap(),
         4.0,
+        mode,
     );
     run(
         "plate-hole",
         &Domain::plate_with_hole(100.0, 60.0, 10.0, 24).unwrap(),
         2.0,
+        mode,
     );
     run(
         "plate-hole",
         &Domain::plate_with_hole(100.0, 60.0, 10.0, 48).unwrap(),
         1.0,
+        mode,
     );
-    run("l-bracket", &l_bracket(), 2.0);
-    run("ring", &ring(), 1.0);
-    run("stepped", &stepped(), 1.0);
+    run("l-bracket", &l_bracket(), 2.0, mode);
+    run("ring", &ring(), 1.0, mode);
+    run("stepped", &stepped(), 1.0, mode);
 
     // Performance: the gate wants 10 000 quads converted in under 2 s.
     println!("--- performance ---");
@@ -341,5 +377,6 @@ fn main() {
         "plate-perf",
         &Domain::plate_with_hole(100.0, 60.0, 10.0, 64).unwrap(),
         0.6,
+        mode,
     );
 }
