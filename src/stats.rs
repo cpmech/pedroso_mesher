@@ -145,16 +145,17 @@ pub struct MeshStatistics {
     pub aspect_ratio: Distribution,
 
     /// Histogram of the valence of interior nodes: `valence[k]` counts the
-    /// interior nodes incident to exactly `k` cells for `k = 1..=7`, and
-    /// `valence[8]` counts every interior node of valence 8 or more.
-    /// `valence[0]` is always 0 (a node with no cell is not a mesh node).
-    /// Valence is counted in incident cells, so it is the quad valence only on
-    /// an all-quad mesh. Why it matters: valence 4 is the regular interior quad
-    /// node; the other values are the singularities whose reduction is the
-    /// subject of verma-2017.
+    /// interior nodes incident to exactly `k` **quads** for `k = 1..=7`, and
+    /// `valence[8]` counts every interior node of quad valence 8 or more.
+    /// `valence[0]` is always 0 (a node with no quad is not a mesh node).
+    /// Triangles are ignored here: on a quad-dominant mesh a node with three
+    /// quads and one triangle is a valence-4 node of the quad mesh, which is
+    /// what this metric means. Why it matters: valence 4 is the regular
+    /// interior quad node; the other values are the singularities whose
+    /// reduction is the subject of verma-2017.
     pub valence: Vec<usize>,
 
-    /// Share (0..1) of interior nodes with exactly four incident cells — the
+    /// Share (0..1) of interior nodes with exactly four incident quads — the
     /// regular fraction of the interior. 1.0 is a fully regular interior;
     /// measured: 58 % on the ring, and 43.6 -> 49.3 % after the singularity
     /// swaps. 0.0 on a mesh with no interior node.

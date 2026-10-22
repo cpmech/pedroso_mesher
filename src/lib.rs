@@ -83,3 +83,7 @@ pub mod simons_godf;
 pub mod simons_qgp;
 
 pub mod simons_sizefamily;
+
+pub mod simons_channel;
+
+pub mod sized;

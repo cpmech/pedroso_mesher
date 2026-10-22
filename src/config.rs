@@ -144,13 +144,24 @@ pub enum Route {
     /// with the best quality of the shipped routes (post SJ 0.66–0.98, corner
     /// 41.6–78.7 degrees; the 0.6 mm row uses the blocked matching path).
     L1,
+
+    /// **Sized** — direct (the Simons 2024 thesis pipeline). Chapter 2 grid and
+    /// boundary channel (`simons_channel`); Chapters 3–5 are available as
+    /// `simons_godf`, `simons_sizefamily` and `simons_qgp`. Character: a
+    /// regular grid interior, a carved channel and a boundary ribbon, all-quad
+    /// and exactly on the boundary. Measured table: `examples/alt_*` do not
+    /// cover it; `src/sized.rs` tests a 10 x 10 square (60 quads, SJ 0.707,
+    /// 45–135 degrees, cracks 0) and `simons_channel` a square with a hole.
+    /// Non-convex domains whose grid interior degenerates (l-bracket) return a
+    /// clean error.
+    Sized,
 }
 
 impl Route {
-    /// All nine routes, in shipping order (the order the tables and the
+    /// All ten routes, in shipping order (the order the tables and the
     /// configuration examples use). Every route in this array is callable by
     /// [`generate`]; not every route passes the gate on every part.
-    pub const ALL: [Route; 9] = [
+    pub const ALL: [Route; 10] = [
         Route::Qmorph,
         Route::Paving,
         Route::Bipartite,
@@ -160,6 +171,7 @@ impl Route {
         Route::Crossfield,
         Route::Untangle,
         Route::L1,
+        Route::Sized,
     ];
 
     /// The stable lowercase name used in tables, JSON and logs.
@@ -177,6 +189,7 @@ impl Route {
             Route::Crossfield => "crossfield",
             Route::Untangle => "untangle",
             Route::L1 => "l1",
+            Route::Sized => "sized",
         }
     }
 }
@@ -229,6 +242,10 @@ pub struct MeshConfig {
     /// Options of the `decompose` route: corner threshold (degrees) and the
     /// recursion-depth safety limit.
     pub decompose: crate::alt_decompose::Options,
+
+    /// Options of the `sized` route (the Simons 2024 channel route; currently
+    /// empty because the thesis knobs are fixed at their measured defaults).
+    pub sized: crate::sized::Options,
 }
 
 impl MeshConfig {
@@ -369,6 +386,7 @@ pub fn generate(
             crate::alt_untangle::mesh_with_options(domain, sizing, &config.untangle)?
         }
         Route::L1 => crate::alt_l1::mesh_with_options(domain, sizing, &config.l1)?,
+        Route::Sized => crate::sized::mesh_with_options(domain, sizing, &config.sized)?,
     };
     // Step 2: the generator's own row. Measuring before smoothing is what lets
     // a caller compare a route against its measured table and see the smoother's
@@ -486,7 +504,7 @@ pub fn generate_quad(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::two_d::Sizing;
@@ -511,10 +529,21 @@ mod tests {
 
     #[test]
     fn every_route_generates_a_mesh_on_a_square() {
-        let (domain, sizing) = square();
         for route in Route::ALL {
+            // The channel route needs room for an interior grid next to its
+            // 1.4 h boundary cull; the other routes are happy on the small test
+            // square.
+            let (domain, sizing) = if route == Route::Sized {
+                (
+                    Domain::rectangle(10.0, 10.0).unwrap(),
+                    crate::two_d::Sizing::uniform(1.0).unwrap(),
+                )
+            } else {
+                square()
+            };
             let config = MeshConfig::new(route);
-            let out = generate(&domain, &sizing, &config).unwrap();
+            let out = generate(&domain, &sizing, &config)
+                .unwrap_or_else(|e| panic!("{} failed on its test domain: {e}", route.name()));
             assert!(
                 !out.mesh.cells.is_empty(),
                 "{} produced no cells",

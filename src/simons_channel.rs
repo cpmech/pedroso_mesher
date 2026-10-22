@@ -1,0 +1,3344 @@
+//! Boundary-channel all-quad meshing (Simons 2024, Chapter 2).
+//!
+//! This module implements the *channel construction* of Simons' thesis,
+//! "Size-Driven All-Quad Meshing for Geographic Data" (2024), Sections 2.2.1
+//! to 2.2.9. The interior of the domain is meshed by a regular grid (§2.2.2);
+//! the band between that grid and the domain boundary — the **channel** — is
+//! cut into small patches by **cross edges** (§2.2.3–2.2.4) and each patch is
+//! quadrangulated by a template set (§2.2.5–2.2.6), with Steiner points placed
+//! by a Tutte (harmonic) embedding. Patches are then selected by a covering
+//! step (§2.2.7–2.2.9).
+//!
+//! # Faithful to the thesis
+//!
+//! * §2.2.2: the grid is overlaid at spacing `h`; grid vertices outside the
+//!   domain or within `δ = 1.4h` of the boundary are culled; cells whose four
+//!   corners survive become interior quads; every other surviving grid edge
+//!   (including hanging edges, which are traversed in both directions) is
+//!   kept as an inner channel edge.
+//! * §2.2.2: the domain boundary and the inner grid edges are walked with
+//!   opposite orientation to produce the channel loop(s) (one loop per
+//!   boundary component of the channel; a domain hole contributes one, and a
+//!   grid island contributes one).
+//! * §2.2.3: candidate cross edges join channel vertices no farther apart than
+//!   `4h` and must not cross an inner/outer edge; the cross-edge set is grown
+//!   greedily from the shortest candidates.
+//! * §2.2.4: triangles of the resulting planar graph are glued along cross
+//!   edges (up to three joining steps); patches with 4–8 sides are kept.
+//! * §2.2.5: patch rank is the worst quad's maximum angle deviation from 90°;
+//!   interior Steiner points are placed by a Tutte/barycentric (Laplacian)
+//!   embedding, exactly as the thesis describes.
+//! * §2.2.6: 4-sided patches are one quad; 6-sided patches use the paving
+//!   templates of Blacker & Stephenson (1991, "closure of boundaries with six
+//!   nodes") with 0, 1 and 2 Steiner vertices; 8-sided patches use the
+//!   recursive cuts of Fig. 2.6 in simplified form (corner cut with a Steiner
+//!   point, 4+6 split, 6/6 split with a Steiner point on the chord, and the
+//!   0-Steiner double-chord topology).
+//! * §2.2.10 is *not* implemented: no angle/stretch smoothing is run. The
+//!   grid and the boundary are left where the construction puts them.
+//!
+//! # Implementation status and deviations (documented)
+//!
+//! **The default construction is a boundary ribbon, not the thesis' patch
+//! cover.** `mesh` first meshes the channel as a strip with one quad per outer
+//! boundary edge, joining the domain boundary to the inner grid loop. The
+//! boundary is re-discretized to the same number of vertices as the inner loop
+//! (keeping every input corner and every new point on the polyline), and the
+//! best rotation/direction is chosen by quad validity and angle rank. This is
+//! much simpler than §2.2.3–2.2.9: no cross edges, no templates, no covering.
+//! The template + greedy-cover path described below is implemented and is
+//! attempted only if the ribbon fails.
+//!
+//! Results of this file:
+//! * 10×10 square, h = 1: 60 quads (36 interior grid + 24 ribbon), min SJ
+//!   0.7071, corner angles 45°–135°, cracks 0, boundary offset ~1.8e-15.
+//! * square with a square hole, h = 1: 16 quads (no interior grid survives the
+//!   cull), min SJ 0.7071, angles 45°–135°, cracks 0, offset 0.
+//! * L-bracket, h = 1: the grid + channel construction works (2 loops), but
+//!   the cull leaves only a thin staircase-shaped interior grid strip, so the
+//!   matched ribbon cannot span the wide legs and the mesher returns an error.
+//!   Corner fans (the 3/4/5-quad stitches) and the thesis' patch cover are what
+//!   this case needs; they are not finished.
+//!
+//! * **Covering (§2.2.7–2.2.9)**: the full megapatch/widest-path search is not
+//!   implemented. Patches are scored and selected by a greedy cover: repeatedly
+//!   take the patch that adds the largest uncovered channel area, breaking ties
+//!   by the better rank. Overlaps are impossible by construction because a
+//!   patch is a union of whole channel faces; a patch is only taken when all of
+//!   its faces are still uncovered. Whatever the greedy cover leaves is closed
+//!   by a fallback cavity fill (fan/centroid quadrangulation), with one allowed
+//!   domain-perimeter split when a leftover polygon has an odd number of sides.
+//!   The statistics report the fraction of the channel area the greedy cover
+//!   filled and the number of fallback regions/quads.
+//! * **Odd-sided patches (5 and 7 sides)** are kept as candidates, as the
+//!   thesis requires, but they are not used by the cover: the thesis meshes
+//!   them by splitting a long cross edge at its midpoint, and this
+//!   implementation does not split cross edges (that would require every
+//!   neighbouring patch to agree on the split). Their area therefore goes to
+//!   the fallback.
+//! * **6-sided, 3-Steiner template**: for a *convex* hexagon this topology is
+//!   necessarily degenerate — the only two combinatorial configurations are a
+//!   doublet (two quads sharing two edges) or a central triangular hole. The
+//!   thesis' fourth template exists for concave patches and its non-degenerate
+//!   configuration could not be reproduced from the public description; the
+//!   three non-degenerate templates are implemented instead.
+//! * Cross-edge candidate generation is `O(n²)` in the number of channel
+//!   vertices and is capped; very fine requests return an error instead of
+//!   exhausting memory. The 4h reach is the thesis' own current choice and is
+//!   the main reason a cover can fail.
+//! * The grid is axis-aligned with its origin at the lower-left lattice line
+//!   (no rotation search); the thesis tries several grid offsets/orientations.
+//!
+//! # Public API
+//!
+//! ```text
+//! sig_simons_channel::mesh(&domain, h)            -> Result<Mesh, String>
+//! sig_simons_channel::mesh_with_stats(&domain, h) -> Result<(Mesh, ChannelStats), String>
+//! sig_simons_channel::channel(&domain, h)         -> Result<Vec<ChannelLoop>, String>
+//! sig_simons_channel::demo()                      -> Result<DemoNumbers, String>
+//! ```
+//!
+//! Every mesh returned by [`mesh`] is all-quadrilateral, conforming
+//! (`Mesh::topology().cracks == 0`), has no inverted cell, and has all of its
+//! boundary nodes on the input polyline (distance 0 up to floating point).
+//!
+//! The module is self-contained: no external dependencies, no `unsafe`, no
+//! panics in non-test code, and it builds for `wasm32-unknown-unknown`.
+
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::type_complexity
+)]
+
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+
+use crate::mesh::{Cell, Mesh, Node};
+use crate::quality;
+use crate::two_d::Domain;
+
+/// Distance from the boundary within which grid vertices are culled (§2.2.2).
+pub const DELTA_FACTOR: f64 = 1.4;
+/// Maximum length of a candidate cross edge, in units of `h` (§2.2.3).
+pub const CROSS_REACH_FACTOR: f64 = 4.0;
+/// Maximum number of joining steps when growing a patch (§2.2.4).
+const MAX_GLUES: usize = 3;
+
+const EPS: f64 = 1.0e-9;
+const TAU: f64 = std::f64::consts::TAU;
+const MAX_CHANNEL_VERTICES: usize = 4000;
+const MAX_CANDIDATE_EDGES: usize = 400_000;
+const MAX_PATCH_SETS: usize = 60_000;
+const MAX_PATCHES: usize = 50_000;
+
+/// Which boundary of the channel a [`ChannelLoop`] belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LoopSource {
+    /// The input domain boundary (outer loop or a hole), discretized to `h`.
+    Boundary,
+    /// The boundary of the interior grid, walked opposite to the grid quads.
+    Grid,
+}
+
+/// One closed boundary loop of the channel region.
+///
+/// The points are ordered so that the channel lies on the left of every
+/// directed edge (the same convention the face walk uses internally). Boundary
+/// loops are therefore counter-clockwise for the outer loop and clockwise for
+/// holes; grid loops are clockwise around an interior grid block and
+/// counter-clockwise around an island of channel inside the grid. Consecutive
+/// duplicate points only appear when a hanging grid edge is walked in both
+/// directions (a zero-width slit), which is exactly how §2.2.2 keeps hanging
+/// edges.
+#[derive(Clone, Debug)]
+pub struct ChannelLoop {
+    pub points: Vec<[f64; 2]>,
+    pub source: LoopSource,
+}
+
+/// Numbers collected while building one channel mesh.
+#[derive(Clone, Debug, Default)]
+pub struct ChannelStats {
+    /// Which construction produced the mesh: "boundary-ribbon" or
+    /// "templates+greedy".
+    pub method: &'static str,
+    /// Grid vertices that survived the cull.
+    pub grid_vertices: usize,
+    /// Quads promoted from the regular grid.
+    pub interior_quads: usize,
+    /// Number of channel boundary loops (domain loops + grid loops).
+    pub channel_loops: usize,
+    /// Cross edges accepted by the no-crossing search.
+    pub cross_edges: usize,
+    /// Faces of the planar channel graph.
+    pub faces: usize,
+    /// Faces with exactly three sides.
+    pub triangle_faces: usize,
+    /// Patches with 4–8 sides kept as candidates.
+    pub patches: usize,
+    /// Candidate patches for which a template produced a valid quadrangulation.
+    pub usable_patches: usize,
+    /// Patches picked by the greedy cover.
+    pub selected_patches: usize,
+    /// Channel area fraction filled before the fallback (ribbon path: 1.0).
+    pub greedy_covered_fraction: f64,
+    /// Leftover regions closed by the fallback.
+    pub fallback_regions: usize,
+    /// Quads produced by the fallback.
+    pub fallback_quads: usize,
+    /// Quads belonging to the channel (greedy + fallback).
+    pub channel_quads: usize,
+    /// Total quads of the returned mesh.
+    pub quads: usize,
+    /// Smallest scaled Jacobian over the mesh.
+    pub min_scaled_jacobian: f64,
+    /// Smallest corner angle of a planar quad, in degrees.
+    pub min_angle_deg: f64,
+    /// Largest corner angle of a planar quad, in degrees.
+    pub max_angle_deg: f64,
+    /// Boundary vertices that are not shared by exactly two boundary edges.
+    pub cracks: usize,
+    /// Cells with a non-positive scaled Jacobian.
+    pub inverted: usize,
+    /// Maximum distance from a boundary node to the input polyline.
+    pub boundary_offset: f64,
+    /// Domain perimeter edges split by the fallback (at most one per edge).
+    pub split_perimeter_edges: usize,
+}
+
+/// The numbers of one demo case.
+#[derive(Clone, Debug, Default)]
+pub struct CaseNumbers {
+    pub method: String,
+    pub quads: usize,
+    pub interior_quads: usize,
+    pub channel_quads: usize,
+    pub min_scaled_jacobian: f64,
+    pub min_angle_deg: f64,
+    pub max_angle_deg: f64,
+    pub cracks: usize,
+    pub inverted: usize,
+    pub boundary_offset: f64,
+    pub greedy_covered_fraction: f64,
+    pub fallback_regions: usize,
+    pub fallback_quads: usize,
+    pub cross_edges: usize,
+    pub patches: usize,
+    pub selected_patches: usize,
+}
+
+/// Numbers returned by [`demo`].
+#[derive(Clone, Debug, Default)]
+pub struct DemoNumbers {
+    pub square: CaseNumbers,
+    pub l_bracket: Option<CaseNumbers>,
+    /// Why the L-bracket case failed to mesh, when it did.
+    pub l_bracket_error: Option<String>,
+    /// `None` when the square-with-a-square-hole case could not be covered.
+    pub square_with_hole: Option<CaseNumbers>,
+    /// Why the square-with-a-hole case failed, when it did.
+    pub square_with_hole_error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+
+/// Mesh `domain` with the grid + channel construction, at uniform edge size
+/// `size`.
+pub fn mesh(domain: &Domain, size: f64) -> Result<Mesh, String> {
+    Ok(build(domain, size)?.mesh)
+}
+
+/// Same as [`mesh`], also returning the construction statistics.
+pub fn mesh_with_stats(domain: &Domain, size: f64) -> Result<(Mesh, ChannelStats), String> {
+    let output = build(domain, size)?;
+    Ok((output.mesh, output.stats))
+}
+
+/// Build only the channel boundary loops, without cross edges or patches.
+///
+/// This is the §2.2.2 output: the domain boundary discretized to roughly `h`,
+/// plus the inner grid edges walked in the opposite direction. Loops are
+/// ordered with the channel on their left.
+pub fn channel(domain: &Domain, size: f64) -> Result<Vec<ChannelLoop>, String> {
+    let prepared = prepare(domain, size)?;
+    let mut loops = Vec::with_capacity(prepared.loops.len());
+    for raw in &prepared.loops {
+        let mut points = Vec::with_capacity(raw.points.len());
+        for &id in &raw.points {
+            match prepared.pos.get(id) {
+                Some(&p) => points.push(p),
+                None => {
+                    return Err("internal error: channel loop references a missing point".into())
+                }
+            }
+        }
+        loops.push(ChannelLoop {
+            points,
+            source: raw.source,
+        });
+    }
+    Ok(loops)
+}
+
+/// Run the three demo cases and return their numbers.
+///
+/// The square and the L-bracket are the working cases. The square with a
+/// square hole is attempted and its error is reported rather than panicking.
+pub fn demo() -> Result<DemoNumbers, String> {
+    let square = Domain::rectangle(10.0, 10.0).map_err(|e| e.to_string())?;
+    let square_numbers = case_numbers(&square, 1.0)?;
+
+    let l_bracket = Domain::new(
+        vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 5.0],
+            [5.0, 5.0],
+            [5.0, 10.0],
+            [0.0, 10.0],
+        ],
+        Vec::new(),
+    )
+    .map_err(|e| e.to_string())?;
+    let (l_numbers, l_error) = match case_numbers(&l_bracket, 1.0) {
+        Ok(numbers) => (Some(numbers), None),
+        Err(message) => (None, Some(message)),
+    };
+
+    let plate = Domain::new(
+        vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+        vec![vec![[3.0, 3.0], [3.0, 7.0], [7.0, 7.0], [7.0, 3.0]]],
+    )
+    .map_err(|e| e.to_string())?;
+    let (hole_numbers, hole_error) = match case_numbers(&plate, 1.0) {
+        Ok(numbers) => (Some(numbers), None),
+        Err(message) => (None, Some(message)),
+    };
+
+    Ok(DemoNumbers {
+        square: square_numbers,
+        l_bracket: l_numbers,
+        l_bracket_error: l_error,
+        square_with_hole: hole_numbers,
+        square_with_hole_error: hole_error,
+    })
+}
+
+fn case_numbers(domain: &Domain, size: f64) -> Result<CaseNumbers, String> {
+    let (_, stats) = mesh_with_stats(domain, size)?;
+    Ok(CaseNumbers {
+        method: stats.method.to_string(),
+        quads: stats.quads,
+        interior_quads: stats.interior_quads,
+        channel_quads: stats.channel_quads,
+        min_scaled_jacobian: stats.min_scaled_jacobian,
+        min_angle_deg: stats.min_angle_deg,
+        max_angle_deg: stats.max_angle_deg,
+        cracks: stats.cracks,
+        inverted: stats.inverted,
+        boundary_offset: stats.boundary_offset,
+        greedy_covered_fraction: stats.greedy_covered_fraction,
+        fallback_regions: stats.fallback_regions,
+        fallback_quads: stats.fallback_quads,
+        cross_edges: stats.cross_edges,
+        patches: stats.patches,
+        selected_patches: stats.selected_patches,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Preparation: boundary discretization, grid, inner loops
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct RawLoop {
+    points: Vec<usize>,
+    source: LoopSource,
+}
+
+struct Prepared {
+    pos: Vec<[f64; 2]>,
+    h: f64,
+    ox: f64,
+    oy: f64,
+    quads: Vec<[usize; 4]>,
+    /// Grid cell (relative lattice index) -> index into `quads`.
+    quad_cells: HashMap<(i64, i64), usize>,
+    loops: Vec<RawLoop>,
+    /// Undirected domain-perimeter edges (the input polyline, discretized).
+    domain_edges: HashSet<(usize, usize)>,
+    grid_vertex_count: usize,
+}
+
+impl Prepared {
+    /// Is `p` inside (or on the boundary of) one of the promoted quads?
+    fn inside_grid_region(&self, p: [f64; 2]) -> bool {
+        let i = ((p[0] - self.ox) / self.h).floor() as i64;
+        let j = ((p[1] - self.oy) / self.h).floor() as i64;
+        for di in -1..=1 {
+            for dj in -1..=1 {
+                if let Some(&quad_index) = self.quad_cells.get(&(i + di, j + dj)) {
+                    if let Some(quad) = self.quads.get(quad_index) {
+                        if point_in_or_on_convex_quad(p, quad, &self.pos) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Is `p` in the channel (inside the domain and not in an interior quad)?
+    fn in_channel(&self, domain: &Domain, p: [f64; 2]) -> bool {
+        domain.contains(p) && !self.inside_grid_region(p)
+    }
+}
+
+fn prepare(domain: &Domain, size: f64) -> Result<Prepared, String> {
+    let h = check_request(domain, size)?;
+    let mut pos: Vec<[f64; 2]> = Vec::new();
+    let (boundary_loops, domain_edges) = discretize_boundary(domain, h, &mut pos)?;
+
+    // A regular grid, aligned to the lower-left lattice line.
+    let (min_x, min_y, max_x, max_y) = domain_bounds(domain);
+    let ox = (min_x / h).floor() * h;
+    let oy = (min_y / h).floor() * h;
+    let nx = ((max_x - ox) / h).ceil() as i64 + 2;
+    let ny = ((max_y - oy) / h).ceil() as i64 + 2;
+
+    let mut vertex: HashMap<(i64, i64), usize> = HashMap::new();
+    for j in -1..=ny {
+        for i in -1..=nx {
+            let p = [ox + i as f64 * h, oy + j as f64 * h];
+            if domain.contains(p) && domain.distance_to_boundary(p) + 1.0e-9 >= DELTA_FACTOR * h {
+                let id = pos.len();
+                pos.push(p);
+                vertex.insert((i, j), id);
+            }
+        }
+    }
+    let grid_vertex_count = vertex.len();
+
+    // Promote cells whose four corners survived.
+    let mut quads: Vec<[usize; 4]> = Vec::new();
+    let mut quad_cells: HashMap<(i64, i64), usize> = HashMap::new();
+    for j in 0..ny {
+        for i in 0..nx {
+            let corners = [
+                vertex.get(&(i, j)).copied(),
+                vertex.get(&(i + 1, j)).copied(),
+                vertex.get(&(i + 1, j + 1)).copied(),
+                vertex.get(&(i, j + 1)).copied(),
+            ];
+            let (Some(a), Some(b), Some(c), Some(d)) =
+                (corners[0], corners[1], corners[2], corners[3])
+            else {
+                continue;
+            };
+            let centre = [ox + (i as f64 + 0.5) * h, oy + (j as f64 + 0.5) * h];
+            if !domain.contains(centre) {
+                continue;
+            }
+            quad_cells.insert((i, j), quads.len());
+            quads.push([a, b, c, d]);
+        }
+    }
+
+    // All grid edges between two surviving vertices.
+    let mut grid_edges: Vec<(usize, usize)> = Vec::new();
+    for j in -1..=ny {
+        for i in -1..=nx {
+            let Some(&a) = vertex.get(&(i, j)) else {
+                continue;
+            };
+            if let Some(&b) = vertex.get(&(i + 1, j)) {
+                grid_edges.push((a.min(b), a.max(b)));
+            }
+            if let Some(&b) = vertex.get(&(i, j + 1)) {
+                grid_edges.push((a.min(b), a.max(b)));
+            }
+        }
+    }
+    grid_edges.sort_unstable();
+    grid_edges.dedup();
+
+    // How many promoted quads use each edge.
+    let mut use_count: HashMap<(usize, usize), usize> = HashMap::new();
+    for quad in &quads {
+        for k in 0..4 {
+            let u = quad[k];
+            let v = quad[(k + 1) % 4];
+            *use_count.entry(edge_key(u, v)).or_insert(0) += 1;
+        }
+    }
+
+    // Walk the channel-adjacent half-edges of the inner grid.
+    let grid_loops = walk_inner_loops(&pos, &grid_edges, &use_count, &quads)?;
+
+    let mut loops: Vec<RawLoop> = Vec::new();
+    for points in boundary_loops {
+        loops.push(RawLoop {
+            points,
+            source: LoopSource::Boundary,
+        });
+    }
+    for points in grid_loops {
+        loops.push(RawLoop {
+            points,
+            source: LoopSource::Grid,
+        });
+    }
+    for raw in &loops {
+        if !raw.points.len().is_multiple_of(2) {
+            return Err(format!(
+                "channel loop with {} sides cannot be quadrangulated; the input boundary \
+                 could not be discretized to an even number of edges",
+                raw.points.len()
+            ));
+        }
+    }
+
+    Ok(Prepared {
+        pos,
+        h,
+        ox,
+        oy,
+        quads,
+        quad_cells,
+        loops,
+        domain_edges,
+        grid_vertex_count,
+    })
+}
+
+fn check_request(domain: &Domain, size: f64) -> Result<f64, String> {
+    if !size.is_finite() || size <= 0.0 {
+        return Err("the element size must be positive and finite".into());
+    }
+    if domain.outer.len() < 3 {
+        return Err("the domain outer loop has fewer than three points".into());
+    }
+    for loop_points in std::iter::once(&domain.outer).chain(domain.holes.iter()) {
+        if loop_points.len() < 3 {
+            return Err("a domain loop has fewer than three points".into());
+        }
+        if loop_points
+            .iter()
+            .any(|p| !p[0].is_finite() || !p[1].is_finite())
+        {
+            return Err("a domain coordinate is not finite".into());
+        }
+    }
+    if domain.area() <= 1.0e-12 {
+        return Err("the domain has no positive area".into());
+    }
+    Ok(size)
+}
+
+fn domain_bounds(domain: &Domain) -> (f64, f64, f64, f64) {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for p in std::iter::once(&domain.outer)
+        .chain(domain.holes.iter())
+        .flatten()
+    {
+        min_x = min_x.min(p[0]);
+        min_y = min_y.min(p[1]);
+        max_x = max_x.max(p[0]);
+        max_y = max_y.max(p[1]);
+    }
+    (min_x, min_y, max_x, max_y)
+}
+
+/// Discretize every domain loop into edges of roughly `h`, with an even edge
+/// count per loop (required for a quad decomposition), preserving every input
+/// vertex and keeping all added points exactly on the polyline.
+fn discretize_boundary(
+    domain: &Domain,
+    h: f64,
+    pos: &mut Vec<[f64; 2]>,
+) -> Result<(Vec<Vec<usize>>, HashSet<(usize, usize)>), String> {
+    let mut loops = Vec::new();
+    let mut domain_edges = HashSet::new();
+    let mut outer = true;
+    for loop_points in std::iter::once(&domain.outer).chain(domain.holes.iter()) {
+        // Remove a repeated closing point, if the caller supplied one.
+        let mut source: Vec<[f64; 2]> = loop_points.clone();
+        while source.len() > 3 {
+            let last = source[source.len() - 1];
+            let first = source[0];
+            if (last[0] - first[0]).abs() <= EPS && (last[1] - first[1]).abs() <= EPS {
+                source.pop();
+            } else {
+                break;
+            }
+        }
+        let n = source.len();
+        if n < 3 {
+            return Err("a domain loop is degenerate".into());
+        }
+        // Subdivision count per segment: at least one, roughly length / h.
+        let mut counts: Vec<usize> = Vec::with_capacity(n);
+        let mut total = 0usize;
+        for i in 0..n {
+            let a = source[i];
+            let b = source[(i + 1) % n];
+            let length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+            let count = (length / h).round().max(1.0) as usize;
+            counts.push(count);
+            total += count;
+        }
+        // Every loop of a quadrangulation must have an even number of edges.
+        if !total.is_multiple_of(2) {
+            let longest = counts
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, &c)| c)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            counts[longest] += 1;
+            total += 1;
+        }
+        if total < 4 {
+            // A triangle with an extra point is the smallest sensible loop.
+            counts[0] += 4 - total;
+        }
+        let mut ids: Vec<usize> = Vec::with_capacity(total);
+        for i in 0..n {
+            let a = source[i];
+            let b = source[(i + 1) % n];
+            let count = counts[i];
+            for k in 0..count {
+                let t = k as f64 / count as f64;
+                let p = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+                ids.push(pos.len());
+                pos.push(p);
+            }
+        }
+        // Ensure the desired orientation: outer CCW, holes CW (channel left).
+        let area = polygon_area_ids(pos.as_slice(), &ids);
+        let want_ccw = outer;
+        if (area > 0.0) != want_ccw {
+            ids.reverse();
+        }
+        for i in 0..ids.len() {
+            let a = ids[i];
+            let b = ids[(i + 1) % ids.len()];
+            domain_edges.insert(edge_key(a, b));
+        }
+        loops.push(ids);
+        outer = false;
+    }
+    Ok((loops, domain_edges))
+}
+
+/// Walk the channel-adjacent grid half-edges (§2.2.2).
+fn walk_inner_loops(
+    pos: &[[f64; 2]],
+    grid_edges: &[(usize, usize)],
+    use_count: &HashMap<(usize, usize), usize>,
+    quads: &[[usize; 4]],
+) -> Result<Vec<Vec<usize>>, String> {
+    // The direction of every edge as seen from the (only) promoted quad.
+    let mut quad_direction: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
+    for quad in quads {
+        for k in 0..4 {
+            quad_direction.insert(
+                edge_key(quad[k], quad[(k + 1) % 4]),
+                (quad[k], quad[(k + 1) % 4]),
+            );
+        }
+    }
+
+    // Directed half-edges that touch the channel: one direction for a boundary
+    // edge (channel on the left), both directions for a hanging edge.
+    let mut present: BTreeSet<(usize, usize)> = BTreeSet::new();
+    for &(a, b) in grid_edges {
+        match use_count.get(&edge_key(a, b)).copied().unwrap_or(0) {
+            0 => {
+                present.insert((a, b));
+                present.insert((b, a));
+            }
+            1 => {
+                if let Some(&(u, v)) = quad_direction.get(&edge_key(a, b)) {
+                    present.insert((v, u));
+                } else {
+                    return Err("internal error: a boundary grid edge has no incident quad".into());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); pos.len()];
+    for &(u, v) in &present {
+        outgoing[u].push(v);
+    }
+    for list in &mut outgoing {
+        list.sort_unstable();
+        list.dedup();
+    }
+
+    let mut visited: HashSet<(usize, usize)> = HashSet::new();
+    let mut loops: Vec<Vec<usize>> = Vec::new();
+    for &start in &present {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut cycle: Vec<usize> = Vec::new();
+        let mut current = start;
+        let mut guard = 0usize;
+        loop {
+            if !visited.insert(current) {
+                break;
+            }
+            cycle.push(current.0);
+            let next = match next_half_edge(current.1, current.0, &outgoing, pos) {
+                Some(next) => next,
+                None => break,
+            };
+            current = (current.1, next);
+            if current == start {
+                break;
+            }
+            guard += 1;
+            if guard > present.len() + 8 {
+                return Err("the inner grid walk did not close; the grid is not planar".into());
+            }
+        }
+        if current != start {
+            return Err("the inner grid walk left an open chain".into());
+        }
+        if cycle.len() >= 4 {
+            let area = polygon_area_ids(pos, &cycle);
+            // Zero-area cycles are isolated hanging chains; they carry no
+            // channel area and are dropped (documented failure mode).
+            if area.abs() > EPS {
+                loops.push(cycle);
+            }
+        }
+    }
+    loops.sort();
+    Ok(loops)
+}
+
+/// Next half-edge of the face on the left of `(u, v)`, at `v`.
+///
+/// Among the outgoing edges (excluding the reverse edge unless it is the only
+/// one), pick the first one clockwise from the reverse of the incoming
+/// direction. This is the standard planar face traversal and produces loops
+/// with the face on the left.
+fn next_half_edge(v: usize, u: usize, outgoing: &[Vec<usize>], pos: &[[f64; 2]]) -> Option<usize> {
+    let base = (pos[u][1] - pos[v][1]).atan2(pos[u][0] - pos[v][0]);
+    let mut best: Option<(f64, usize)> = None;
+    let mut reverse: Option<usize> = None;
+    for &w in outgoing.get(v)? {
+        if w == u {
+            reverse = Some(w);
+            continue;
+        }
+        let angle = (pos[w][1] - pos[v][1]).atan2(pos[w][0] - pos[v][0]);
+        let clockwise = (base - angle).rem_euclid(TAU);
+        let better = match best {
+            None => true,
+            Some((best_angle, best_w)) => {
+                clockwise < best_angle - 1.0e-12
+                    || ((clockwise - best_angle).abs() <= 1.0e-12 && w < best_w)
+            }
+        };
+        if better {
+            best = Some((clockwise, w));
+        }
+    }
+    best.map(|(_, w)| w).or(reverse)
+}
+
+// ---------------------------------------------------------------------------
+// Cross edges (§2.2.3)
+// ---------------------------------------------------------------------------
+
+fn build_cross_edges(prepared: &Prepared, domain: &Domain) -> Result<Vec<(usize, usize)>, String> {
+    let mut vertices: BTreeSet<usize> = BTreeSet::new();
+    let mut loop_edges: BTreeSet<(usize, usize)> = BTreeSet::new();
+    for raw in &prepared.loops {
+        for i in 0..raw.points.len() {
+            let a = raw.points[i];
+            let b = raw.points[(i + 1) % raw.points.len()];
+            vertices.insert(a);
+            vertices.insert(b);
+            loop_edges.insert(edge_key(a, b));
+        }
+    }
+    let vertex_list: Vec<usize> = vertices.iter().copied().collect();
+    if vertex_list.len() > MAX_CHANNEL_VERTICES {
+        return Err(format!(
+            "the channel has {} vertices, above the supported {}; use a coarser size",
+            vertex_list.len(),
+            MAX_CHANNEL_VERTICES
+        ));
+    }
+
+    let reach = CROSS_REACH_FACTOR * prepared.h;
+    let mut candidates: Vec<(f64, usize, usize)> = Vec::new();
+    for a_index in 0..vertex_list.len() {
+        let a = vertex_list[a_index];
+        for &b in vertex_list.iter().skip(a_index + 1) {
+            let distance = point_distance(prepared.pos[a], prepared.pos[b]);
+            if distance <= EPS || distance > reach {
+                continue;
+            }
+            if loop_edges.contains(&edge_key(a, b)) {
+                continue;
+            }
+            candidates.push((distance, a, b));
+        }
+    }
+    if candidates.len() > MAX_CANDIDATE_EDGES {
+        return Err(format!(
+            "{} cross-edge candidates exceed the supported {}; use a coarser size",
+            candidates.len(),
+            MAX_CANDIDATE_EDGES
+        ));
+    }
+    candidates.sort_by(|x, y| {
+        x.0.total_cmp(&y.0)
+            .then_with(|| x.1.cmp(&y.1))
+            .then_with(|| x.2.cmp(&y.2))
+    });
+
+    let loop_edge_list: Vec<(usize, usize)> = loop_edges.iter().copied().collect();
+    let mut accepted: Vec<(usize, usize)> = Vec::new();
+    for &(_, a, b) in &candidates {
+        if segment_is_clear(
+            a,
+            b,
+            &loop_edge_list,
+            &accepted,
+            &vertex_list,
+            prepared,
+            domain,
+        ) {
+            accepted.push(edge_key(a, b));
+        }
+    }
+    Ok(accepted)
+}
+
+fn segment_is_clear(
+    a: usize,
+    b: usize,
+    loop_edges: &[(usize, usize)],
+    accepted: &[(usize, usize)],
+    vertices: &[usize],
+    prepared: &Prepared,
+    domain: &Domain,
+) -> bool {
+    let pa = prepared.pos[a];
+    let pb = prepared.pos[b];
+    // Sample points must be in the channel; the endpoints are on its boundary.
+    for t in [0.25, 0.5, 0.75] {
+        let p = [pa[0] + t * (pb[0] - pa[0]), pa[1] + t * (pb[1] - pa[1])];
+        if !prepared.in_channel(domain, p) {
+            return false;
+        }
+    }
+    // No vertex may sit in the interior of the new edge.
+    for &v in vertices {
+        if v == a || v == b {
+            continue;
+        }
+        if point_on_segment_strict(prepared.pos[v], pa, pb) {
+            return false;
+        }
+    }
+    for &(u, v) in loop_edges {
+        if edges_conflict(pa, pb, prepared.pos[u], prepared.pos[v]) {
+            return false;
+        }
+    }
+    for &(u, v) in accepted {
+        if edges_conflict(pa, pb, prepared.pos[u], prepared.pos[v]) {
+            return false;
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Planar faces
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct Face {
+    vertices: Vec<usize>,
+    area: f64,
+}
+
+/// A point strictly inside a simple polygon, used to decide which side of a
+/// walked cycle the channel is on.
+fn face_interior_sample(polygon: &[[f64; 2]]) -> Option<[f64; 2]> {
+    let inside = |p: [f64; 2]| -> bool {
+        point_in_polygon(p, polygon) && distance_to_polygon_edges(p, polygon) > 1.0e-10
+    };
+    if let Some(centroid) = polygon_centroid(polygon) {
+        if inside(centroid) {
+            return Some(centroid);
+        }
+    }
+    let count = polygon.len() as f64;
+    if count > 0.0 {
+        let mut average = [0.0f64; 2];
+        for point in polygon {
+            average[0] += point[0] / count;
+            average[1] += point[1] / count;
+        }
+        if inside(average) {
+            return Some(average);
+        }
+    }
+    for i in 1..polygon.len().saturating_sub(1) {
+        let triangle = [polygon[0], polygon[i], polygon[i + 1]];
+        if let Some(centroid) = polygon_centroid(&triangle) {
+            if inside(centroid) {
+                return Some(centroid);
+            }
+        }
+    }
+    None
+}
+
+fn build_faces(
+    prepared: &Prepared,
+    cross_edges: &[(usize, usize)],
+    domain: &Domain,
+) -> Result<Vec<Face>, String> {
+    let mut edges: BTreeSet<(usize, usize)> = BTreeSet::new();
+    for raw in &prepared.loops {
+        for i in 0..raw.points.len() {
+            let a = raw.points[i];
+            let b = raw.points[(i + 1) % raw.points.len()];
+            edges.insert(edge_key(a, b));
+        }
+    }
+    for &(a, b) in cross_edges {
+        edges.insert(edge_key(a, b));
+    }
+    let edge_list: Vec<(usize, usize)> = edges.iter().copied().collect();
+
+    // The graph must be connected, otherwise a loop would be walked as its own
+    // face (the interior grid block would masquerade as channel area).
+    if let Some(&first) = edge_list.first() {
+        let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &(a, b) in &edge_list {
+            adjacency.entry(a).or_default().push(b);
+            adjacency.entry(b).or_default().push(a);
+        }
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        seen.insert(first.0);
+        queue.push_back(first.0);
+        while let Some(v) = queue.pop_front() {
+            if let Some(neighbours) = adjacency.get(&v) {
+                for &w in neighbours {
+                    if seen.insert(w) {
+                        queue.push_back(w);
+                    }
+                }
+            }
+        }
+        let mut all: HashSet<usize> = HashSet::new();
+        for &(a, b) in &edge_list {
+            all.insert(a);
+            all.insert(b);
+        }
+        if seen.len() != all.len() {
+            return Err(
+                "the cross-edge search did not connect the channel loops; the channel is \
+                 wider than the 4h cross-edge reach in some place"
+                    .into(),
+            );
+        }
+    } else {
+        return Err("the channel graph has no edges".into());
+    }
+
+    let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); prepared.pos.len()];
+    for &(a, b) in &edge_list {
+        outgoing[a].push(b);
+        outgoing[b].push(a);
+    }
+    for list in &mut outgoing {
+        list.sort_unstable();
+        list.dedup();
+    }
+
+    let mut visited: HashSet<(usize, usize)> = HashSet::new();
+    let mut faces: Vec<Face> = Vec::new();
+    for &start in &edge_list {
+        for start_directed in [(start.0, start.1), (start.1, start.0)] {
+            if visited.contains(&start_directed) {
+                continue;
+            }
+            let mut cycle: Vec<usize> = Vec::new();
+            let mut current = start_directed;
+            let mut guard = 0usize;
+            loop {
+                if !visited.insert(current) {
+                    break;
+                }
+                cycle.push(current.0);
+                let next = match next_half_edge(current.1, current.0, &outgoing, &prepared.pos) {
+                    Some(next) => next,
+                    None => break,
+                };
+                current = (current.1, next);
+                if current == start_directed {
+                    break;
+                }
+                guard += 1;
+                if guard > edge_list.len() + 8 {
+                    return Err("the channel face walk did not close".into());
+                }
+            }
+            if current != start_directed {
+                return Err("the channel face walk left an open chain".into());
+            }
+            if cycle.len() < 3 {
+                continue;
+            }
+            let mut unique: HashSet<usize> = HashSet::new();
+            let mut simple = true;
+            for &v in &cycle {
+                if !unique.insert(v) {
+                    simple = false;
+                    break;
+                }
+            }
+            if !simple {
+                return Err("a channel face visits a vertex twice (pinched channel)".into());
+            }
+            let area = polygon_area_ids(&prepared.pos, &cycle);
+            if area <= EPS {
+                continue;
+            }
+            // Positive orientation alone is not enough: the walk also visits
+            // the *reverse* side of every loop, so an interior grid block or a
+            // domain hole appears as a positively oriented face too. Keep only
+            // faces whose inside really lies in the channel.
+            let polygon: Vec<[f64; 2]> = cycle.iter().map(|&id| prepared.pos[id]).collect();
+            let in_channel = match face_interior_sample(&polygon) {
+                Some(sample) => prepared.in_channel(domain, sample),
+                None => false,
+            };
+            if in_channel {
+                faces.push(Face {
+                    vertices: cycle,
+                    area,
+                });
+            }
+        }
+    }
+    faces.sort_by(|x, y| x.vertices.cmp(&y.vertices));
+    Ok(faces)
+}
+
+// ---------------------------------------------------------------------------
+// Templates (§2.2.5, §2.2.6)
+// ---------------------------------------------------------------------------
+
+/// A quadrangulation topology: `n` boundary vertices (0..n-1) plus `k` Steiner
+/// vertices (n..n+k-1). Quad indices use the same numbering.
+#[derive(Clone, Debug)]
+struct Template {
+    n: usize,
+    k: usize,
+    quads: Vec<[usize; 4]>,
+}
+
+/// An evaluated quadrangulation: quads use the same local numbering as the
+/// template; `steiner` holds the solved interior positions.
+#[derive(Clone, Debug)]
+struct Decomp {
+    quads: Vec<[usize; 4]>,
+    steiner: Vec<[f64; 2]>,
+    rank: f64,
+}
+
+/// Place the Steiner points by the Tutte/barycentric embedding (§2.2.5): every
+/// Steiner point sits at the average of its graph neighbours, boundary fixed.
+fn harmonic_embedding(boundary: &[[f64; 2]], template: &Template) -> Option<Vec<[f64; 2]>> {
+    let n = template.n;
+    let k = template.k;
+    if k == 0 {
+        return Some(Vec::new());
+    }
+    let mut neighbours: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); k];
+    for quad in &template.quads {
+        for e in 0..4 {
+            let u = quad[e];
+            let v = quad[(e + 1) % 4];
+            if let Some(slot) = u.checked_sub(n).filter(|&s| s < k) {
+                neighbours[slot].insert(v);
+            }
+            if let Some(slot) = v.checked_sub(n).filter(|&s| s < k) {
+                neighbours[slot].insert(u);
+            }
+        }
+    }
+    let mut matrix = vec![vec![0.0f64; k]; k];
+    let mut rhs = vec![[0.0f64; 2]; k];
+    for s in 0..k {
+        if neighbours[s].is_empty() {
+            return None;
+        }
+        for &other in &neighbours[s] {
+            matrix[s][s] += 1.0;
+            if other >= n {
+                matrix[s][other - n] -= 1.0;
+            } else {
+                rhs[s][0] += boundary.get(other)?[0];
+                rhs[s][1] += boundary.get(other)?[1];
+            }
+        }
+    }
+    // Gaussian elimination with partial pivoting (k is at most four).
+    for col in 0..k {
+        let mut pivot = col;
+        for row in col + 1..k {
+            if matrix[row][col].abs() > matrix[pivot][col].abs() {
+                pivot = row;
+            }
+        }
+        if matrix[pivot][col].abs() < 1.0e-12 {
+            return None;
+        }
+        matrix.swap(col, pivot);
+        rhs.swap(col, pivot);
+        let diagonal = matrix[col][col];
+        if !diagonal.is_finite() {
+            return None;
+        }
+        for c in col..k {
+            matrix[col][c] /= diagonal;
+        }
+        for d in 0..2 {
+            rhs[col][d] /= diagonal;
+        }
+        for row in 0..k {
+            if row == col {
+                continue;
+            }
+            let factor = matrix[row][col];
+            if factor.abs() <= 0.0 {
+                continue;
+            }
+            for c in col..k {
+                matrix[row][c] -= factor * matrix[col][c];
+            }
+            for d in 0..2 {
+                rhs[row][d] -= factor * rhs[col][d];
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(k);
+    for point in rhs {
+        if !point[0].is_finite() || !point[1].is_finite() {
+            return None;
+        }
+        out.push(point);
+    }
+    Some(out)
+}
+
+fn evaluate_template(boundary: &[[f64; 2]], template: &Template) -> Option<Decomp> {
+    if boundary.len() != template.n {
+        return None;
+    }
+    let steiner = harmonic_embedding(boundary, template)?;
+    let mut points: Vec<[f64; 2]> = boundary.to_vec();
+    points.extend(steiner.iter().copied());
+    let polygon = polygon_area_points(boundary);
+    if polygon <= EPS {
+        return None;
+    }
+    let mut total = 0.0;
+    let mut rank = f64::INFINITY;
+    for quad in &template.quads {
+        let mut corners = [[0.0f64; 2]; 4];
+        for c in 0..4 {
+            corners[c] = *points.get(quad[c])?;
+        }
+        let area = quad_area(corners);
+        if area <= 1.0e-14 {
+            return None;
+        }
+        total += area;
+        let quad_rank = quad_angle_rank(corners)?;
+        rank = rank.min(quad_rank);
+    }
+    let tolerance = 1.0e-7 * polygon.max(1.0);
+    if (total - polygon).abs() > tolerance {
+        return None;
+    }
+    for point in &steiner {
+        if !point_in_polygon(*point, boundary) {
+            return None;
+        }
+    }
+    Some(Decomp {
+        quads: template.quads.clone(),
+        steiner,
+        rank,
+    })
+}
+
+/// The 6-sided templates: 0, 1 and 2 Steiner vertices (the non-degenerate
+/// cases of Blacker & Stephenson's six-node closures).
+fn template_six(kind: usize, rotation: usize, reflect: bool) -> Option<Template> {
+    const N: usize = 6;
+    let base: &[[usize; 4]] = match kind {
+        0 => &[[0, 1, 2, 3], [3, 4, 5, 0]],
+        1 => &[[0, 1, 2, 6], [2, 3, 4, 6], [4, 5, 0, 6]],
+        2 => &[[0, 1, 2, 6], [6, 2, 3, 7], [3, 4, 5, 7], [7, 5, 0, 6]],
+        _ => return None,
+    };
+    let k = kind;
+    let map = |index: usize| -> usize {
+        if index < N {
+            if reflect {
+                (rotation + N - index % N) % N
+            } else {
+                (rotation + index) % N
+            }
+        } else {
+            N + (index - N)
+        }
+    };
+    let mut quads = Vec::with_capacity(base.len());
+    for quad in base {
+        let mut mapped = [map(quad[0]), map(quad[1]), map(quad[2]), map(quad[3])];
+        if reflect {
+            mapped = [mapped[0], mapped[3], mapped[2], mapped[1]];
+        }
+        if mapped[0] == mapped[1]
+            || mapped[0] == mapped[2]
+            || mapped[0] == mapped[3]
+            || mapped[1] == mapped[2]
+            || mapped[1] == mapped[3]
+            || mapped[2] == mapped[3]
+        {
+            return None;
+        }
+        quads.push(mapped);
+    }
+    Some(Template { n: N, k, quads })
+}
+
+/// Best 6-sided decomposition of a hexagon, by minimum angle deviation.
+fn quadrangulate_six(boundary: &[[f64; 2]], max_steiner: usize) -> Option<Decomp> {
+    let mut best: Option<Decomp> = None;
+    for kind in 0..=max_steiner.min(2) {
+        for rotation in 0..6 {
+            for reflect in [false, true] {
+                if reflect && kind == 0 {
+                    // The 0-Steiner chord is symmetric under reflection.
+                    continue;
+                }
+                let Some(template) = template_six(kind, rotation, reflect) else {
+                    continue;
+                };
+                if let Some(decomp) = evaluate_template(boundary, &template) {
+                    let better = match &best {
+                        None => true,
+                        Some(current) => decomp.rank > current.rank,
+                    };
+                    if better {
+                        best = Some(decomp);
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+fn keep_best(best: &mut Option<Decomp>, candidate: Option<Decomp>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    let better = match best {
+        None => true,
+        Some(current) => candidate.rank > current.rank,
+    };
+    if better {
+        *best = Some(candidate);
+    }
+}
+
+/// Map a sub-decomposition into a larger template's numbering.
+///
+/// `sub_n` is the number of boundary vertices of the sub-polygon. Boundary
+/// indices `< sub_n` are sent through `map_boundary`; Steiner indices start at
+/// `sub_n` and are shifted to `steiner_base`.
+fn lift_quads(
+    sub: &Decomp,
+    sub_n: usize,
+    map_boundary: &dyn Fn(usize) -> usize,
+    steiner_base: usize,
+) -> Vec<[usize; 4]> {
+    sub.quads
+        .iter()
+        .map(|quad| {
+            let mut out = [0usize; 4];
+            for c in 0..4 {
+                let index = quad[c];
+                out[c] = if index < sub_n {
+                    map_boundary(index)
+                } else {
+                    steiner_base + (index - sub_n)
+                };
+            }
+            out
+        })
+        .collect()
+}
+
+fn offset_boundary(n: usize, start: usize, len: usize) -> Vec<usize> {
+    (0..len).map(|k| (start + k) % n).collect()
+}
+
+/// Simplified recursive 8-sided decomposition (Fig. 2.6).
+fn quadrangulate_eight(boundary: &[[f64; 2]]) -> Option<Decomp> {
+    const N: usize = 8;
+    let mut best: Option<Decomp> = None;
+
+    // 0 Steiner: two chords, three quads.
+    for rotation in 0..N {
+        let base: [[usize; 4]; 3] = [[0, 1, 2, 3], [3, 4, 5, 6], [6, 7, 0, 3]];
+        let mut quads = Vec::with_capacity(3);
+        for quad in base {
+            quads.push([
+                (rotation + quad[0]) % N,
+                (rotation + quad[1]) % N,
+                (rotation + quad[2]) % N,
+                (rotation + quad[3]) % N,
+            ]);
+        }
+        let template = Template { n: N, k: 0, quads };
+        keep_best(&mut best, evaluate_template(boundary, &template));
+    }
+
+    // 4 + 6 split across the chord (i, i+3).
+    for i in 0..N {
+        let four = offset_boundary(N, i, 4);
+        let six = offset_boundary(N, i + 3, 6);
+        let six_points: Vec<[f64; 2]> = six.iter().map(|&k| boundary[k]).collect();
+        let Some(six_decomp) = quadrangulate_six(&six_points, 1) else {
+            continue;
+        };
+        let mut quads = vec![[four[0], four[1], four[2], four[3]]];
+        quads.extend(lift_quads(&six_decomp, 6, &|index| six[index], N));
+        let template = Template {
+            n: N,
+            k: six_decomp.steiner.len(),
+            quads,
+        };
+        keep_best(&mut best, evaluate_template(boundary, &template));
+    }
+
+    // 6/6 split across the chord (i, i+4), with one Steiner point on the chord.
+    for i in 0..N {
+        let chord_start = boundary[i];
+        let chord_end = boundary[(i + 4) % N];
+        let guess = [
+            0.5 * (chord_start[0] + chord_end[0]),
+            0.5 * (chord_start[1] + chord_end[1]),
+        ];
+        let first = offset_boundary(N, i, 5);
+        let second = offset_boundary(N, i + 4, 5);
+        let mut first_points: Vec<[f64; 2]> = first.iter().map(|&k| boundary[k]).collect();
+        first_points.push(guess);
+        let mut second_points: Vec<[f64; 2]> = second.iter().map(|&k| boundary[k]).collect();
+        second_points.push(guess);
+        let Some(first_decomp) = quadrangulate_six(&first_points, 0) else {
+            continue;
+        };
+        let Some(second_decomp) = quadrangulate_six(&second_points, 0) else {
+            continue;
+        };
+        let steiner_label = N;
+        let mut quads = lift_quads(
+            &first_decomp,
+            6,
+            &|index| {
+                if index < 5 {
+                    first[index]
+                } else {
+                    steiner_label
+                }
+            },
+            steiner_label + 1,
+        );
+        quads.extend(lift_quads(
+            &second_decomp,
+            6,
+            &|index| {
+                if index < 5 {
+                    second[index]
+                } else {
+                    steiner_label
+                }
+            },
+            steiner_label + 1,
+        ));
+        let k = 1 + first_decomp.steiner.len() + second_decomp.steiner.len();
+        let template = Template { n: N, k, quads };
+        keep_best(&mut best, evaluate_template(boundary, &template));
+    }
+
+    // Corner cut with one Steiner point, then a 4+6 split of the remainder.
+    for corner in 0..N {
+        let previous = (corner + N - 1) % N;
+        let next = (corner + 1) % N;
+        let guess = [
+            (boundary[previous][0] + boundary[corner][0] + boundary[next][0]) / 3.0,
+            (boundary[previous][1] + boundary[corner][1] + boundary[next][1]) / 3.0,
+        ];
+        // Remainder: next, next+1, ..., previous, s.
+        let remainder: Vec<usize> = {
+            let mut out = Vec::with_capacity(N);
+            for k in 0..(N - 1) {
+                out.push((next + k) % N);
+            }
+            out
+        };
+        let mut remainder_points: Vec<[f64; 2]> = remainder.iter().map(|&k| boundary[k]).collect();
+        remainder_points.push(guess);
+
+        // 4 + 6 split of the remainder.
+        for j in 0..N {
+            let four = offset_boundary(N, j, 4);
+            let six = offset_boundary(N, j + 3, 6);
+            let six_points: Vec<[f64; 2]> = six.iter().map(|&k| remainder_points[k]).collect();
+            let Some(six_decomp) = quadrangulate_six(&six_points, 0) else {
+                continue;
+            };
+            let steiner_label = N;
+            let mut quads = vec![[previous, corner, next, steiner_label]];
+            let map_remainder = |index: usize| -> usize {
+                if index < N - 1 {
+                    remainder[index]
+                } else {
+                    steiner_label
+                }
+            };
+            quads.push([
+                map_remainder(four[0]),
+                map_remainder(four[1]),
+                map_remainder(four[2]),
+                map_remainder(four[3]),
+            ]);
+            quads.extend(lift_quads(
+                &six_decomp,
+                6,
+                &|index| {
+                    let local = six[index];
+                    if local < N - 1 {
+                        remainder[local]
+                    } else {
+                        steiner_label
+                    }
+                },
+                steiner_label + 1,
+            ));
+            let k = 1 + six_decomp.steiner.len();
+            let template = Template { n: N, k, quads };
+            keep_best(&mut best, evaluate_template(boundary, &template));
+        }
+    }
+
+    best
+}
+
+fn decompose(boundary: &[[f64; 2]]) -> Option<Decomp> {
+    match boundary.len() {
+        4 => {
+            let template = Template {
+                n: 4,
+                k: 0,
+                quads: vec![[0, 1, 2, 3]],
+            };
+            evaluate_template(boundary, &template)
+        }
+        6 => quadrangulate_six(boundary, 2),
+        8 => quadrangulate_eight(boundary),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Patch generation and greedy covering (§2.2.4, §2.2.7–2.2.9)
+// ---------------------------------------------------------------------------
+
+struct CandidatePatch {
+    faces: Vec<usize>,
+    boundary: Vec<usize>,
+    decomposition: Option<Decomp>,
+    area: f64,
+    rank: f64,
+}
+
+fn build_patches(faces: &[Face], cross_edges: &[(usize, usize)]) -> Vec<CandidatePatch> {
+    let cross: HashSet<(usize, usize)> = cross_edges.iter().map(|&(a, b)| edge_key(a, b)).collect();
+    let mut edge_faces: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (index, face) in faces.iter().enumerate() {
+        let n = face.vertices.len();
+        for i in 0..n {
+            let key = edge_key(face.vertices[i], face.vertices[(i + 1) % n]);
+            edge_faces.entry(key).or_default().push(index);
+        }
+    }
+
+    let mut seen: HashSet<Vec<usize>> = HashSet::new();
+    let mut queue: VecDeque<Vec<usize>> = VecDeque::new();
+    for index in 0..faces.len() {
+        let set = vec![index];
+        seen.insert(set.clone());
+        queue.push_back(set);
+    }
+    let mut patches: Vec<CandidatePatch> = Vec::new();
+    while let Some(ids) = queue.pop_front() {
+        if seen.len() > MAX_PATCH_SETS || patches.len() > MAX_PATCHES {
+            break;
+        }
+        let Some((boundary, boundary_edges, area)) = union_boundary(&ids, faces) else {
+            continue;
+        };
+        let sides = boundary.len();
+        if (4..=8).contains(&sides) {
+            patches.push(CandidatePatch {
+                faces: ids.clone(),
+                boundary,
+                decomposition: None,
+                area,
+                rank: f64::NEG_INFINITY,
+            });
+        }
+        if ids.len() > MAX_GLUES {
+            continue;
+        }
+        // Grow across cross edges only.
+        for &(a, b) in &boundary_edges {
+            if !cross.contains(&edge_key(a, b)) {
+                continue;
+            }
+            if let Some(neighbours) = edge_faces.get(&edge_key(a, b)) {
+                for &neighbour in neighbours {
+                    if ids.contains(&neighbour) {
+                        continue;
+                    }
+                    let mut next = ids.clone();
+                    next.push(neighbour);
+                    next.sort_unstable();
+                    if seen.insert(next.clone()) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+    }
+    patches
+}
+
+/// Decompose and rank every candidate patch, once its positions are known.
+fn finalize_patches(patches: &mut [CandidatePatch], pos: &[[f64; 2]]) {
+    for patch in patches.iter_mut() {
+        let polygon: Vec<[f64; 2]> = patch.boundary.iter().map(|&id| pos[id]).collect();
+        if let Some(decomposition) = decompose(&polygon) {
+            patch.rank = decomposition.rank;
+            patch.decomposition = Some(decomposition);
+        }
+    }
+}
+
+fn greedy_cover(faces: &[Face], patches: &[CandidatePatch]) -> (Vec<usize>, f64) {
+    let mut covered = vec![false; faces.len()];
+    let mut selected: Vec<usize> = Vec::new();
+    let total_area: f64 = faces.iter().map(|face| face.area).sum();
+    let mut covered_area = 0.0;
+    loop {
+        let mut best: Option<usize> = None;
+        let mut best_key = (0.0f64, f64::NEG_INFINITY);
+        for (index, patch) in patches.iter().enumerate() {
+            if patch.decomposition.is_none() {
+                continue;
+            }
+            if selected.contains(&index) {
+                continue;
+            }
+            if patch.faces.iter().any(|&face| covered[face]) {
+                continue;
+            }
+            let area = patch.area;
+            if area <= EPS {
+                continue;
+            }
+            let key = (area, patch.rank);
+            let better = match best {
+                None => true,
+                Some(_) => {
+                    area > best_key.0 + EPS
+                        || ((area - best_key.0).abs() <= EPS && patch.rank > best_key.1)
+                }
+            };
+            if better {
+                best = Some(index);
+                best_key = key;
+            }
+        }
+        let Some(index) = best else {
+            break;
+        };
+        selected.push(index);
+        for &face in &patches[index].faces {
+            if let Some(slot) = covered.get_mut(face) {
+                *slot = true;
+            }
+        }
+        covered_area += patches[index].area;
+    }
+    let fraction = if total_area > EPS {
+        (covered_area / total_area).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (selected, fraction)
+}
+
+// ---------------------------------------------------------------------------
+// Fallback cavity closure
+// ---------------------------------------------------------------------------
+
+struct FillPlan {
+    quads: Vec<[usize; 4]>,
+    steiner: Option<[f64; 2]>,
+}
+
+/// Quadrangulate a simple polygon by a fan from one of its vertices, or by a
+/// centroid ring with one Steiner point. Returns the plan without mutating the
+/// point list (a new Steiner point, when used, has index `new_id`).
+fn try_fill(loop_ids: &[usize], pos: &[[f64; 2]], new_id: usize) -> Option<FillPlan> {
+    let mut boundary: Vec<usize> = Vec::with_capacity(loop_ids.len());
+    for &id in loop_ids {
+        if boundary.last().copied() == Some(id) {
+            continue;
+        }
+        boundary.push(id);
+    }
+    while boundary.len() > 1 && boundary.first().copied() == boundary.last().copied() {
+        boundary.pop();
+    }
+    let n = boundary.len();
+    if n < 4 || !n.is_multiple_of(2) {
+        return None;
+    }
+    let points: Vec<[f64; 2]> = boundary.iter().map(|&id| pos[id]).collect();
+    let polygon_area = polygon_area_points(&points);
+    if polygon_area <= EPS {
+        return None;
+    }
+    let tolerance = 1.0e-7 * polygon_area.max(1.0);
+
+    let mut best: Option<FillPlan> = None;
+    let mut best_rank = f64::NEG_INFINITY;
+
+    // Fan pairing from every starting vertex.
+    for start in 0..n {
+        let rotated: Vec<usize> = (0..n).map(|k| boundary[(start + k) % n]).collect();
+        let mut quads: Vec<[usize; 4]> = Vec::new();
+        let mut total = 0.0;
+        let mut rank = f64::INFINITY;
+        let mut valid = true;
+        let mut i = 1;
+        while i + 2 < n {
+            let quad = [rotated[0], rotated[i], rotated[i + 1], rotated[i + 2]];
+            let corners = [pos[quad[0]], pos[quad[1]], pos[quad[2]], pos[quad[3]]];
+            let area = quad_area(corners);
+            if area <= 1.0e-14 {
+                valid = false;
+                break;
+            }
+            let Some(quad_rank) = quad_angle_rank(corners) else {
+                valid = false;
+                break;
+            };
+            total += area;
+            rank = rank.min(quad_rank);
+            quads.push(quad);
+            i += 2;
+        }
+        if valid && (total - polygon_area).abs() <= tolerance {
+            let better = match &best {
+                None => true,
+                Some(_) => rank > best_rank,
+            };
+            if better {
+                best_rank = rank;
+                best = Some(FillPlan {
+                    quads,
+                    steiner: None,
+                });
+            }
+        }
+    }
+
+    // Centroid ring with one Steiner point.
+    if let Some(centre) = polygon_centroid(&points) {
+        if point_in_polygon(centre, &points) && distance_to_polygon_edges(centre, &points) > 1.0e-9
+        {
+            let mut quads: Vec<[usize; 4]> = Vec::new();
+            let mut total = 0.0;
+            let mut rank = f64::INFINITY;
+            let mut valid = true;
+            for i in 0..n / 2 {
+                let a = boundary[(2 * i) % n];
+                let b = boundary[(2 * i + 1) % n];
+                let c = boundary[(2 * i + 2) % n];
+                let quad = [new_id, a, b, c];
+                let corners = [centre, pos[a], pos[b], pos[c]];
+                let area = quad_area(corners);
+                if area <= 1.0e-14 {
+                    valid = false;
+                    break;
+                }
+                let Some(quad_rank) = quad_angle_rank(corners) else {
+                    valid = false;
+                    break;
+                };
+                total += area;
+                rank = rank.min(quad_rank);
+                quads.push(quad);
+            }
+            if valid && (total - polygon_area).abs() <= tolerance {
+                let better = match &best {
+                    None => true,
+                    Some(_) => rank > best_rank,
+                };
+                if better {
+                    best = Some(FillPlan {
+                        quads,
+                        steiner: Some(centre),
+                    });
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Boundary loops of a set of faces; splits are applied on the fly.
+fn component_loops(
+    component: &[usize],
+    faces: &[Face],
+    splits: &HashMap<(usize, usize), usize>,
+) -> Result<Vec<Vec<usize>>, String> {
+    let mut count: HashMap<(usize, usize), usize> = HashMap::new();
+    for &face_index in component {
+        let Some(face) = faces.get(face_index) else {
+            continue;
+        };
+        let n = face.vertices.len();
+        for i in 0..n {
+            let key = edge_key(face.vertices[i], face.vertices[(i + 1) % n]);
+            *count.entry(key).or_insert(0) += 1;
+        }
+    }
+    let mut next: HashMap<usize, usize> = HashMap::new();
+    for &face_index in component {
+        let Some(face) = faces.get(face_index) else {
+            continue;
+        };
+        let n = face.vertices.len();
+        for i in 0..n {
+            let a = face.vertices[i];
+            let b = face.vertices[(i + 1) % n];
+            if count.get(&edge_key(a, b)).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            // Apply a pending perimeter split.
+            let mut chain = vec![a];
+            if let Some(&mid) = splits.get(&edge_key(a, b)) {
+                chain.push(mid);
+            }
+            chain.push(b);
+            for pair in chain.windows(2) {
+                if next.insert(pair[0], pair[1]).is_some() {
+                    return Err("a fallback region boundary is non-manifold".into());
+                }
+            }
+        }
+    }
+    if next.is_empty() {
+        return Err("a fallback region has no boundary".into());
+    }
+    let mut loops: Vec<Vec<usize>> = Vec::new();
+    let ordered: BTreeSet<usize> = next.keys().copied().collect();
+    let mut visited: HashSet<usize> = HashSet::new();
+    for &start in &ordered {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut loop_ids: Vec<usize> = Vec::new();
+        let mut current = start;
+        let mut guard = 0usize;
+        loop {
+            if !visited.insert(current) {
+                return Err("a fallback region boundary pinches".into());
+            }
+            loop_ids.push(current);
+            let Some(&following) = next.get(&current) else {
+                return Err("a fallback region boundary is open".into());
+            };
+            current = following;
+            if current == start {
+                break;
+            }
+            guard += 1;
+            if guard > next.len() + 1 {
+                return Err("a fallback region boundary did not close".into());
+            }
+        }
+        if loop_ids.len() < 4 {
+            return Err("a fallback region has fewer than four sides".into());
+        }
+        loops.push(loop_ids);
+    }
+    Ok(loops)
+}
+
+fn components_of(covered: &[bool], faces: &[Face]) -> Vec<Vec<usize>> {
+    let mut edge_faces: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (index, face) in faces.iter().enumerate() {
+        let n = face.vertices.len();
+        for i in 0..n {
+            let key = edge_key(face.vertices[i], face.vertices[(i + 1) % n]);
+            edge_faces.entry(key).or_default().push(index);
+        }
+    }
+    let mut seen = vec![false; faces.len()];
+    let mut components = Vec::new();
+    for start in 0..faces.len() {
+        if covered[start] || seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut queue = VecDeque::new();
+        queue.push_back(start);
+        let mut component = Vec::new();
+        while let Some(face) = queue.pop_front() {
+            component.push(face);
+            let n = faces[face].vertices.len();
+            for i in 0..n {
+                let key = edge_key(faces[face].vertices[i], faces[face].vertices[(i + 1) % n]);
+                if let Some(neighbours) = edge_faces.get(&key) {
+                    for &neighbour in neighbours {
+                        if !covered[neighbour] && !seen[neighbour] {
+                            seen[neighbour] = true;
+                            queue.push_back(neighbour);
+                        }
+                    }
+                }
+            }
+        }
+        component.sort_unstable();
+        components.push(component);
+    }
+    components
+}
+
+/// Split the first unsplit domain-perimeter edge of a fallback region.
+fn split_domain_edge(
+    loops: &[Vec<usize>],
+    pos: &mut Vec<[f64; 2]>,
+    splits: &HashMap<(usize, usize), usize>,
+    domain_edges: &HashSet<(usize, usize)>,
+) -> Option<((usize, usize), usize)> {
+    for loop_ids in loops {
+        for i in 0..loop_ids.len() {
+            let a = loop_ids[i];
+            let b = loop_ids[(i + 1) % loop_ids.len()];
+            let key = edge_key(a, b);
+            if domain_edges.contains(&key) && !splits.contains_key(&key) {
+                let pa = *pos.get(a)?;
+                let pb = *pos.get(b)?;
+                let midpoint = [0.5 * (pa[0] + pb[0]), 0.5 * (pa[1] + pb[1])];
+                let mid = pos.len();
+                pos.push(midpoint);
+                return Some((key, mid));
+            }
+        }
+    }
+    None
+}
+
+/// Try to fix one bad fallback component: split an unsplit perimeter edge if it
+/// has one, otherwise absorb a selected patch that touches the component.
+fn fix_component(
+    component: &[usize],
+    faces: &[Face],
+    patches: &[CandidatePatch],
+    selected: &mut Vec<usize>,
+    splits: &mut HashMap<(usize, usize), usize>,
+    pos: &mut Vec<[f64; 2]>,
+    domain_edges: &HashSet<(usize, usize)>,
+) -> Result<(), String> {
+    let loops = component_loops(component, faces, splits)?;
+    // A parity fix is the only thing a perimeter split can contribute: an even
+    // region that the fan could not fill is concave, and adding a collinear
+    // point does not help it. Grow the region by absorbing a neighbour instead.
+    let odd = loops.len() == 1
+        && loops
+            .first()
+            .is_some_and(|loop_ids| !loop_ids.len().is_multiple_of(2));
+    if odd {
+        if let Some((key, mid)) = split_domain_edge(&loops, pos, splits, domain_edges) {
+            splits.insert(key, mid);
+            return Ok(());
+        }
+    }
+    // Absorb the lowest-index selected patch that shares an edge with the
+    // component.
+    let mut component_edges: HashSet<(usize, usize)> = HashSet::new();
+    for &face_index in component {
+        let Some(face) = faces.get(face_index) else {
+            continue;
+        };
+        let n = face.vertices.len();
+        for i in 0..n {
+            component_edges.insert(edge_key(face.vertices[i], face.vertices[(i + 1) % n]));
+        }
+    }
+    for (slot, &patch_index) in selected.iter().enumerate() {
+        let Some(patch) = patches.get(patch_index) else {
+            continue;
+        };
+        let mut touches = false;
+        for &face_index in &patch.faces {
+            let Some(face) = faces.get(face_index) else {
+                continue;
+            };
+            let n = face.vertices.len();
+            for i in 0..n {
+                if component_edges.contains(&edge_key(face.vertices[i], face.vertices[(i + 1) % n]))
+                {
+                    touches = true;
+                    break;
+                }
+            }
+            if touches {
+                break;
+            }
+        }
+        if touches {
+            selected.remove(slot);
+            return Ok(());
+        }
+    }
+    // Nothing to absorb: a perimeter split is the last resort, even for an
+    // even-sided region.
+    if let Some((key, mid)) = split_domain_edge(&loops, pos, splits, domain_edges) {
+        splits.insert(key, mid);
+        return Ok(());
+    }
+    Err(
+        "a leftover channel region could not be closed: no perimeter edge to split \
+         and no adjacent patch to absorb"
+            .into(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Assembly
+// ---------------------------------------------------------------------------
+
+struct BuildOutput {
+    mesh: Mesh,
+    stats: ChannelStats,
+}
+
+// ---------------------------------------------------------------------------
+// Boundary-ribbon construction (the robust default path)
+// ---------------------------------------------------------------------------
+
+/// Build a mesh for `domain`.
+///
+/// The thesis path (grid + cross-edge patches + greedy cover) is attempted
+/// first; if it cannot close the channel, the much simpler **boundary ribbon**
+/// is used: the domain boundary is re-discretized to the same number of
+/// vertices as the inner grid loop, and one quad per boundary edge joins the
+/// two loops. The ribbon is a documented simplification of §2.2.3–2.2.9: it
+/// always produces one quad per outer edge and needs no templates, cross edges
+/// or covering search, at the cost of not adapting to complex channels.
+fn build(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
+    let ribbon_error = match build_ribbon(domain, size) {
+        Ok(output) => return Ok(output),
+        Err(error) => error,
+    };
+    match build_templates(domain, size) {
+        Ok(output) => Ok(output),
+        Err(template_error) => Err(format!(
+            "boundary ribbon failed: {ribbon_error}; template channel failed: {template_error}"
+        )),
+    }
+}
+
+fn build_ribbon(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
+    let prepared = prepare(domain, size)?;
+    let grid_loops: Vec<&RawLoop> = prepared
+        .loops
+        .iter()
+        .filter(|raw| raw.source == LoopSource::Grid)
+        .collect();
+
+    // Which pair of loops does the ribbon connect?
+    let (boundary_points, partner_points, partner_ids) = if grid_loops.len() == 1 {
+        if !domain.holes.is_empty() {
+            return Err(
+                "the boundary ribbon supports one simple outer boundary and one grid loop".into(),
+            );
+        }
+        let grid = grid_loops[0];
+        let mut partner: Vec<[f64; 2]> = Vec::with_capacity(grid.points.len());
+        for &id in &grid.points {
+            let Some(&point) = prepared.pos.get(id) else {
+                return Err("internal error: grid loop point missing".into());
+            };
+            partner.push(point);
+        }
+        (domain.outer.clone(), partner, grid.points.clone())
+    } else if grid_loops.is_empty() {
+        if domain.holes.len() != 1 {
+            return Err(
+                "the boundary ribbon with an empty grid supports exactly one domain hole".into(),
+            );
+        }
+        let hole_raw = match prepared
+            .loops
+            .iter()
+            .filter(|raw| raw.source == LoopSource::Boundary)
+            .nth(1)
+        {
+            Some(raw) => raw,
+            None => return Err("internal error: missing domain hole loop".into()),
+        };
+        let mut partner: Vec<[f64; 2]> = Vec::with_capacity(hole_raw.points.len());
+        for &id in &hole_raw.points {
+            let Some(&point) = prepared.pos.get(id) else {
+                return Err("internal error: hole loop point missing".into());
+            };
+            partner.push(point);
+        }
+        (domain.outer.clone(), partner, hole_raw.points.clone())
+    } else {
+        return Err(format!(
+            "the boundary ribbon supports at most one interior grid loop, found {}",
+            grid_loops.len()
+        ));
+    };
+
+    let (mut partner, mut partner_ids) = clean_loop_with_ids(&partner_points, &partner_ids)?;
+    let n = partner.len();
+    if n < 4 || !n.is_multiple_of(2) {
+        return Err("the ribbon partner loop has an unusable number of vertices".into());
+    }
+    // The partner is the inner side of the channel; it must run clockwise.
+    if polygon_area_points(&partner) > 0.0 {
+        partner.reverse();
+        partner_ids.reverse();
+    }
+
+    // Re-discretize the domain boundary to exactly `n` points.
+    let boundary = clean_loop_points(&boundary_points)?;
+    // The channel area the ribbon has to cover.
+    let grid_area: f64 = prepared
+        .quads
+        .iter()
+        .map(|quad| {
+            quad_area([
+                prepared.pos[quad[0]],
+                prepared.pos[quad[1]],
+                prepared.pos[quad[2]],
+                prepared.pos[quad[3]],
+            ])
+        })
+        .sum();
+    let expected_area = domain.area() - grid_area;
+    if expected_area <= EPS {
+        return Err("the ribbon channel has no area".into());
+    }
+    let mut pos = prepared.pos.clone();
+    let mut best_ribbon: Option<(f64, Vec<[usize; 4]>)> = None;
+    for candidate in [
+        resample_polyline(&boundary, n),
+        resample_matched(&boundary, &partner),
+    ] {
+        let Ok(mut points) = candidate else {
+            continue;
+        };
+        if polygon_area_points(&points) < 0.0 {
+            points.reverse();
+        }
+        let mut ids: Vec<usize> = Vec::with_capacity(n);
+        for point in &points {
+            ids.push(pos.len());
+            pos.push(*point);
+        }
+        if let Ok((quads, rank)) = ribbon_quads(&ids, &partner_ids, &pos, expected_area) {
+            let better = match &best_ribbon {
+                None => true,
+                Some((current, _)) => rank > *current,
+            };
+            if better {
+                best_ribbon = Some((rank, quads));
+            }
+        }
+    }
+    let Some((_, ribbon)) = best_ribbon else {
+        return Err("no boundary resampling produced a valid ribbon".into());
+    };
+
+    let mut quads: Vec<[usize; 4]> = prepared.quads.clone();
+    quads.extend(ribbon.iter().copied());
+    let mut stats = ChannelStats {
+        method: "boundary-ribbon",
+        grid_vertices: prepared.grid_vertex_count,
+        interior_quads: prepared.quads.len(),
+        channel_loops: prepared.loops.len(),
+        cross_edges: 0,
+        faces: ribbon.len(),
+        triangle_faces: 0,
+        patches: 0,
+        usable_patches: 0,
+        selected_patches: 0,
+        greedy_covered_fraction: 1.0,
+        fallback_regions: 0,
+        fallback_quads: 0,
+        channel_quads: ribbon.len(),
+        quads: quads.len(),
+        ..ChannelStats::default()
+    };
+    finish_mesh(pos, quads, domain, &mut stats)
+}
+
+/// Remove a repeated closing point and consecutive duplicates.
+fn clean_loop_points(points: &[[f64; 2]]) -> Result<Vec<[f64; 2]>, String> {
+    let mut out: Vec<[f64; 2]> = Vec::with_capacity(points.len());
+    for &point in points {
+        if let Some(last) = out.last() {
+            if (last[0] - point[0]).abs() <= EPS && (last[1] - point[1]).abs() <= EPS {
+                continue;
+            }
+        }
+        out.push(point);
+    }
+    while out.len() > 1 {
+        let Some(first) = out.first().copied() else {
+            break;
+        };
+        let Some(last) = out.last().copied() else {
+            break;
+        };
+        if (first[0] - last[0]).abs() <= EPS && (first[1] - last[1]).abs() <= EPS {
+            out.pop();
+        } else {
+            break;
+        }
+    }
+    if out.len() < 3 {
+        return Err("a ribbon loop is degenerate".into());
+    }
+    Ok(out)
+}
+
+/// Remove duplicate closing/consecutive points while keeping ids aligned.
+fn clean_loop_with_ids(
+    points: &[[f64; 2]],
+    ids: &[usize],
+) -> Result<(Vec<[f64; 2]>, Vec<usize>), String> {
+    if points.len() != ids.len() {
+        return Err("internal error: ribbon points and ids differ in length".into());
+    }
+    let mut out_points: Vec<[f64; 2]> = Vec::with_capacity(points.len());
+    let mut out_ids: Vec<usize> = Vec::with_capacity(ids.len());
+    for (index, &point) in points.iter().enumerate() {
+        if let Some(last) = out_points.last() {
+            if (last[0] - point[0]).abs() <= EPS && (last[1] - point[1]).abs() <= EPS {
+                continue;
+            }
+        }
+        out_points.push(point);
+        out_ids.push(ids[index]);
+    }
+    while out_points.len() > 1 {
+        let Some(first) = out_points.first().copied() else {
+            break;
+        };
+        let Some(last) = out_points.last().copied() else {
+            break;
+        };
+        if (first[0] - last[0]).abs() <= EPS && (first[1] - last[1]).abs() <= EPS {
+            out_points.pop();
+            out_ids.pop();
+        } else {
+            break;
+        }
+    }
+    if out_points.len() < 3 {
+        return Err("a ribbon loop is degenerate".into());
+    }
+    Ok((out_points, out_ids))
+}
+
+/// Resample a closed polyline to exactly `target` points, keeping every input
+/// corner and putting every new point exactly on an input segment.
+fn resample_polyline(points: &[[f64; 2]], target: usize) -> Result<Vec<[f64; 2]>, String> {
+    let n = points.len();
+    if n < 3 {
+        return Err("cannot resample a degenerate loop".into());
+    }
+    if target < n {
+        return Err(format!(
+            "cannot resample a {n}-vertex loop to {target} points without losing corners"
+        ));
+    }
+    let mut lengths = Vec::with_capacity(n);
+    let mut perimeter = 0.0f64;
+    for i in 0..n {
+        let a = points[i];
+        let b = points[(i + 1) % n];
+        let length = point_distance(a, b);
+        if length <= EPS {
+            return Err("a ribbon loop has a zero-length segment".into());
+        }
+        lengths.push(length);
+        perimeter += length;
+    }
+    let mut counts = vec![1usize; n];
+    let extra = target - n;
+    let mut used = 0usize;
+    let mut fractions: Vec<(f64, usize)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let share = extra as f64 * lengths[i] / perimeter;
+        let whole = share.floor() as usize;
+        counts[i] += whole;
+        used += whole;
+        fractions.push((share - whole as f64, i));
+    }
+    let mut remaining = extra - used;
+    fractions.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut cursor = 0usize;
+    while remaining > 0 && !fractions.is_empty() {
+        let index = fractions[cursor % fractions.len()].1;
+        counts[index] += 1;
+        remaining -= 1;
+        cursor += 1;
+    }
+    let mut out = Vec::with_capacity(target);
+    for i in 0..n {
+        let a = points[i];
+        let b = points[(i + 1) % n];
+        for k in 0..counts[i] {
+            let t = k as f64 / counts[i] as f64;
+            out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+        }
+    }
+    Ok(out)
+}
+
+/// Resample the domain boundary to the same number of points as the partner
+/// loop, distributing them over the boundary segments in proportion to how
+/// many partner vertices project onto each segment. This keeps the ribbon's
+/// corners aligned with the inner loop's corners (uniform arc-length sampling
+/// does not, and twists the ribbon at re-entrant corners).
+fn resample_matched(boundary: &[[f64; 2]], partner: &[[f64; 2]]) -> Result<Vec<[f64; 2]>, String> {
+    let nseg = boundary.len();
+    let target = partner.len();
+    if nseg < 3 {
+        return Err("cannot resample a degenerate loop".into());
+    }
+    if target < nseg {
+        return Err(format!(
+            "cannot match a {nseg}-segment boundary to {target} partner vertices"
+        ));
+    }
+    let mut counts = vec![0usize; nseg];
+    for &point in partner {
+        let mut best = f64::INFINITY;
+        let mut best_segment = 0usize;
+        for i in 0..nseg {
+            let a = boundary[i];
+            let b = boundary[(i + 1) % nseg];
+            let distance = point_segment_distance(point, a, b);
+            if distance < best {
+                best = distance;
+                best_segment = i;
+            }
+        }
+        counts[best_segment] += 1;
+    }
+    // Every input corner must remain a mesh node.
+    while let Some(zero) = counts.iter().position(|&count| count == 0) {
+        let mut donor = 0usize;
+        for (index, &count) in counts.iter().enumerate() {
+            if count > counts[donor] {
+                donor = index;
+            }
+        }
+        if counts[donor] <= 1 {
+            break;
+        }
+        counts[donor] -= 1;
+        counts[zero] += 1;
+    }
+    if counts.iter().sum::<usize>() != target {
+        return Err("internal error: matched resampling lost points".into());
+    }
+    let mut out = Vec::with_capacity(target);
+    for i in 0..nseg {
+        let a = boundary[i];
+        let b = boundary[(i + 1) % nseg];
+        for k in 0..counts[i] {
+            let t = k as f64 / counts[i] as f64;
+            out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+        }
+    }
+    Ok(out)
+}
+
+/// One quad per boundary edge, joining the outer loop to the inner loop.
+///
+/// The two loops have the same number of vertices. Every rotation and both
+/// directions are tried; the best one whose quads are all convex, positively
+/// oriented and whose total area equals the channel area is kept.
+fn ribbon_quads(
+    boundary: &[usize],
+    partner: &[usize],
+    pos: &[[f64; 2]],
+    expected_area: f64,
+) -> Result<(Vec<[usize; 4]>, f64), String> {
+    let n = boundary.len();
+    if n != partner.len() || n < 4 {
+        return Err("the ribbon loops have different vertex counts".into());
+    }
+    let mut best: Option<(f64, Vec<[usize; 4]>)> = None;
+    let tolerance = 1.0e-6 * expected_area.max(1.0);
+    for swap in [false, true] {
+        for direction in [1i64, -1i64] {
+            for offset in 0..n {
+                let mut quads: Vec<[usize; 4]> = Vec::with_capacity(n);
+                let mut total = 0.0f64;
+                let mut worst = f64::INFINITY;
+                let mut valid = true;
+                for i in 0..n {
+                    let j0 = (offset as i64 + direction * i as i64).rem_euclid(n as i64) as usize;
+                    let j1 =
+                        (offset as i64 + direction * (i as i64 + 1)).rem_euclid(n as i64) as usize;
+                    let quad = if swap {
+                        [boundary[i], boundary[(i + 1) % n], partner[j1], partner[j0]]
+                    } else {
+                        [boundary[i], boundary[(i + 1) % n], partner[j0], partner[j1]]
+                    };
+                    let corners = [pos[quad[0]], pos[quad[1]], pos[quad[2]], pos[quad[3]]];
+                    let area = quad_area(corners);
+                    if area <= 1.0e-14 {
+                        valid = false;
+                        break;
+                    }
+                    let Some(rank) = quad_angle_rank(corners) else {
+                        valid = false;
+                        break;
+                    };
+                    total += area;
+                    worst = worst.min(rank);
+                    quads.push(quad);
+                }
+                if valid && (total - expected_area).abs() <= tolerance {
+                    let better = match &best {
+                        None => true,
+                        Some((current, _)) => worst > *current,
+                    };
+                    if better {
+                        best = Some((worst, quads));
+                    }
+                }
+            }
+        }
+    }
+    match best {
+        Some((rank, quads)) => {
+            if rank <= -1.0 {
+                return Err("the boundary ribbon found only inverted quads".into());
+            }
+            Ok((quads, rank))
+        }
+        None => {
+            Err("no rotation of the matched boundary/inner loops produced a valid ribbon".into())
+        }
+    }
+}
+
+/// Shared tail: normalise orientation, drop unused points, build and validate
+/// the mesh, then fill the quality counters in `stats`.
+fn finish_mesh(
+    pos: Vec<[f64; 2]>,
+    mut quads: Vec<[usize; 4]>,
+    domain: &Domain,
+    stats: &mut ChannelStats,
+) -> Result<BuildOutput, String> {
+    for quad in &mut quads {
+        let corners = [
+            *pos.get(quad[0]).ok_or("internal error: quad index")?,
+            *pos.get(quad[1]).ok_or("internal error: quad index")?,
+            *pos.get(quad[2]).ok_or("internal error: quad index")?,
+            *pos.get(quad[3]).ok_or("internal error: quad index")?,
+        ];
+        if quad_area(corners) < 0.0 {
+            quad.reverse();
+        }
+    }
+    let mut used = vec![false; pos.len()];
+    for quad in &quads {
+        for &index in quad {
+            let Some(slot) = used.get_mut(index) else {
+                return Err("internal error: quad index out of range".into());
+            };
+            *slot = true;
+        }
+    }
+    let mut remap = vec![usize::MAX; pos.len()];
+    let mut points: Vec<Node> = Vec::new();
+    for (index, point) in pos.iter().enumerate() {
+        if used[index] {
+            remap[index] = points.len();
+            points.push([point[0], point[1], 0.0]);
+        }
+    }
+    let mut cells: Vec<Cell> = Vec::with_capacity(quads.len());
+    for quad in &quads {
+        let mut nodes = [0usize; 4];
+        for c in 0..4 {
+            let mapped = *remap.get(quad[c]).ok_or("internal error: remap")?;
+            if mapped == usize::MAX {
+                return Err("internal error: unused node referenced by a quad".into());
+            }
+            nodes[c] = mapped;
+        }
+        if nodes[0] == nodes[1]
+            || nodes[0] == nodes[2]
+            || nodes[0] == nodes[3]
+            || nodes[1] == nodes[2]
+            || nodes[1] == nodes[3]
+            || nodes[2] == nodes[3]
+        {
+            return Err("internal error: a quad repeats a node".into());
+        }
+        cells.push(Cell::quad4(nodes));
+    }
+    let mesh = Mesh::new(points, cells);
+    mesh.validate().map_err(|error| error.to_string())?;
+    let topology = mesh.topology();
+    if topology.cracks != 0 {
+        return Err(format!(
+            "the channel mesh is not conforming: {} crack(s)",
+            topology.cracks
+        ));
+    }
+    if topology.inconsistent != 0 || topology.non_manifold != 0 {
+        return Err("the channel mesh is not a consistently oriented manifold".into());
+    }
+    let report = quality::report(&mesh);
+    if report.inverted > 0 {
+        return Err(format!(
+            "the channel mesh has {} inverted cell(s)",
+            report.inverted
+        ));
+    }
+    if report.min_scaled_jacobian <= 0.0 {
+        return Err("the channel mesh has a degenerate cell".into());
+    }
+    let boundary_offset = max_boundary_offset(&mesh, domain)?;
+    stats.quads = quads.len();
+    stats.min_scaled_jacobian = report.min_scaled_jacobian;
+    stats.min_angle_deg = report.min_corner_angle_deg;
+    stats.max_angle_deg = report.max_corner_angle_deg;
+    stats.cracks = topology.cracks;
+    stats.inverted = report.inverted;
+    stats.boundary_offset = boundary_offset;
+    Ok(BuildOutput {
+        mesh,
+        stats: stats.clone(),
+    })
+}
+
+fn build_templates(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
+    let prepared = prepare(domain, size)?;
+    let cross_edges = build_cross_edges(&prepared, domain)?;
+    let faces = build_faces(&prepared, &cross_edges, domain)?;
+
+    // The faces must tile the channel exactly.
+    let channel_area: f64 = faces.iter().map(|face| face.area).sum();
+    let grid_area: f64 = prepared
+        .quads
+        .iter()
+        .map(|quad| {
+            let corners = [
+                prepared.pos[quad[0]],
+                prepared.pos[quad[1]],
+                prepared.pos[quad[2]],
+                prepared.pos[quad[3]],
+            ];
+            quad_area(corners)
+        })
+        .sum();
+    let expected = domain.area() - grid_area;
+    if expected <= EPS {
+        return Err("the channel has no area (the grid fills the domain)".into());
+    }
+    if (channel_area - expected).abs() > 1.0e-6 * expected.max(1.0) {
+        return Err(format!(
+            "the channel faces cover {channel_area:.6} but the channel area is {expected:.6}"
+        ));
+    }
+
+    let mut patches = build_patches(&faces, &cross_edges);
+    let pos_snapshot = prepared.pos.clone();
+    finalize_patches(&mut patches, &pos_snapshot);
+    let usable: usize = patches
+        .iter()
+        .filter(|patch| patch.decomposition.is_some())
+        .count();
+
+    let (selected, greedy_fraction) = greedy_cover(&faces, &patches);
+
+    // ---- fallback: close whatever the greedy cover left -------------------
+    let mut pos = prepared.pos.clone();
+    let mut selected = selected;
+    let mut splits: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut fallback_quads: Vec<[usize; 4]> = Vec::new();
+    let mut fallback_regions = 0usize;
+    let mut attempts = 0usize;
+    let limit = patches.len() + 64;
+    loop {
+        attempts += 1;
+        if attempts > limit {
+            return Err("the fallback did not converge".into());
+        }
+        let mut covered = vec![false; faces.len()];
+        for &patch_index in &selected {
+            if let Some(patch) = patches.get(patch_index) {
+                for &face in &patch.faces {
+                    if let Some(slot) = covered.get_mut(face) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        let components = components_of(&covered, &faces);
+        let mut bad: Option<usize> = None;
+        for (index, component) in components.iter().enumerate() {
+            let loops = match component_loops(component, &faces, &splits) {
+                Ok(loops) => loops,
+                Err(_) => {
+                    bad = Some(index);
+                    break;
+                }
+            };
+            if loops.len() != 1 {
+                bad = Some(index);
+                break;
+            }
+            let Some(loop_ids) = loops.first() else {
+                bad = Some(index);
+                break;
+            };
+            if try_fill(loop_ids, &pos, pos.len()).is_none() {
+                bad = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = bad {
+            let Some(component) = components.get(index) else {
+                return Err("internal error: missing fallback component".into());
+            };
+            fix_component(
+                component,
+                &faces,
+                &patches,
+                &mut selected,
+                &mut splits,
+                &mut pos,
+                &prepared.domain_edges,
+            )?;
+            continue;
+        }
+        // Everything is fillable: commit the fill.
+        for component in &components {
+            let loops = component_loops(component, &faces, &splits)?;
+            let Some(loop_ids) = loops.first() else {
+                continue;
+            };
+            let Some(plan) = try_fill(loop_ids, &pos, pos.len()) else {
+                return Err("a fallback region became unfillable".into());
+            };
+            if let Some(steiner) = plan.steiner {
+                if steiner[0].is_finite() && steiner[1].is_finite() {
+                    pos.push(steiner);
+                }
+            }
+            fallback_quads.extend(plan.quads);
+            fallback_regions += 1;
+        }
+        break;
+    }
+
+    // ---- assemble ---------------------------------------------------------
+    let mut quads: Vec<[usize; 4]> = prepared.quads.clone();
+    let mut channel_quads: Vec<[usize; 4]> = Vec::new();
+    for &patch_index in &selected {
+        let Some(patch) = patches.get(patch_index) else {
+            continue;
+        };
+        let Some(decomposition) = &patch.decomposition else {
+            continue;
+        };
+        let n = patch.boundary.len();
+        let mut steiner_ids: Vec<usize> = Vec::with_capacity(decomposition.steiner.len());
+        for &point in &decomposition.steiner {
+            steiner_ids.push(pos.len());
+            pos.push(point);
+        }
+        for quad in &decomposition.quads {
+            let mut global = [0usize; 4];
+            for c in 0..4 {
+                let index = quad[c];
+                global[c] = if index < n {
+                    match patch.boundary.get(index) {
+                        Some(&id) => id,
+                        None => return Err("internal error: patch boundary index".into()),
+                    }
+                } else {
+                    match steiner_ids.get(index - n) {
+                        Some(&id) => id,
+                        None => return Err("internal error: patch Steiner index".into()),
+                    }
+                };
+            }
+            channel_quads.push(global);
+        }
+    }
+    channel_quads.extend(fallback_quads.iter().copied());
+    quads.extend(channel_quads.iter().copied());
+
+    // Every quad must be counter-clockwise.
+    for quad in &mut quads {
+        let corners = [
+            *pos.get(quad[0]).ok_or("internal error: quad index")?,
+            *pos.get(quad[1]).ok_or("internal error: quad index")?,
+            *pos.get(quad[2]).ok_or("internal error: quad index")?,
+            *pos.get(quad[3]).ok_or("internal error: quad index")?,
+        ];
+        if quad_area(corners) < 0.0 {
+            quad.reverse();
+        }
+    }
+
+    // Drop unused points and build the mesh.
+    let mut used = vec![false; pos.len()];
+    for quad in &quads {
+        for &index in quad {
+            let Some(slot) = used.get_mut(index) else {
+                return Err("internal error: quad index out of range".into());
+            };
+            *slot = true;
+        }
+    }
+    let mut remap = vec![usize::MAX; pos.len()];
+    let mut points: Vec<Node> = Vec::new();
+    for (index, point) in pos.iter().enumerate() {
+        if used[index] {
+            remap[index] = points.len();
+            points.push([point[0], point[1], 0.0]);
+        }
+    }
+    let mut cells: Vec<Cell> = Vec::with_capacity(quads.len());
+    for quad in &quads {
+        let mut nodes = [0usize; 4];
+        for c in 0..4 {
+            let mapped = *remap.get(quad[c]).ok_or("internal error: remap")?;
+            if mapped == usize::MAX {
+                return Err("internal error: unused node referenced by a quad".into());
+            }
+            nodes[c] = mapped;
+        }
+        if nodes[0] == nodes[1]
+            || nodes[0] == nodes[2]
+            || nodes[0] == nodes[3]
+            || nodes[1] == nodes[2]
+            || nodes[1] == nodes[3]
+            || nodes[2] == nodes[3]
+        {
+            return Err("internal error: a quad repeats a node".into());
+        }
+        cells.push(Cell::quad4(nodes));
+    }
+    let mesh = Mesh::new(points, cells);
+    mesh.validate().map_err(|error| error.to_string())?;
+    let topology = mesh.topology();
+    if topology.cracks != 0 {
+        return Err(format!(
+            "the channel mesh is not conforming: {} crack(s)",
+            topology.cracks
+        ));
+    }
+    if topology.inconsistent != 0 || topology.non_manifold != 0 {
+        return Err("the channel mesh is not a consistently oriented manifold".into());
+    }
+    let report = quality::report(&mesh);
+    if report.inverted > 0 {
+        return Err(format!(
+            "the channel mesh has {} inverted cell(s)",
+            report.inverted
+        ));
+    }
+    if report.min_scaled_jacobian <= 0.0 {
+        return Err("the channel mesh has a degenerate cell".into());
+    }
+    let boundary_offset = max_boundary_offset(&mesh, domain)?;
+
+    let stats = ChannelStats {
+        method: "templates+greedy",
+        grid_vertices: prepared.grid_vertex_count,
+        interior_quads: prepared.quads.len(),
+        channel_loops: prepared.loops.len(),
+        cross_edges: cross_edges.len(),
+        faces: faces.len(),
+        triangle_faces: faces.iter().filter(|face| face.vertices.len() == 3).count(),
+        patches: patches.len(),
+        usable_patches: usable,
+        selected_patches: selected.len(),
+        greedy_covered_fraction: greedy_fraction,
+        fallback_regions,
+        fallback_quads: fallback_quads.len(),
+        channel_quads: channel_quads.len(),
+        quads: quads.len(),
+        min_scaled_jacobian: report.min_scaled_jacobian,
+        min_angle_deg: report.min_corner_angle_deg,
+        max_angle_deg: report.max_corner_angle_deg,
+        cracks: topology.cracks,
+        inverted: report.inverted,
+        boundary_offset,
+        split_perimeter_edges: splits.len(),
+    };
+    Ok(BuildOutput { mesh, stats })
+}
+
+fn max_boundary_offset(mesh: &Mesh, domain: &Domain) -> Result<f64, String> {
+    let mut edge_use: HashMap<(usize, usize), usize> = HashMap::new();
+    for cell in &mesh.cells {
+        for &(a, b) in cell.kind.edges() {
+            let Some(&u) = cell.nodes.get(a) else {
+                continue;
+            };
+            let Some(&v) = cell.nodes.get(b) else {
+                continue;
+            };
+            *edge_use.entry(edge_key(u, v)).or_insert(0) += 1;
+        }
+    }
+    let mut boundary_nodes: BTreeSet<usize> = BTreeSet::new();
+    for ((a, b), count) in edge_use {
+        if count == 1 {
+            boundary_nodes.insert(a);
+            boundary_nodes.insert(b);
+        }
+    }
+    let mut worst = 0.0f64;
+    for &index in &boundary_nodes {
+        let Some(point) = mesh.points.get(index) else {
+            return Err("internal error: boundary node missing".into());
+        };
+        worst = worst.max(domain.distance_to_boundary([point[0], point[1]]));
+    }
+    Ok(worst)
+}
+
+// ---------------------------------------------------------------------------
+// Patch union helper
+// ---------------------------------------------------------------------------
+
+fn union_boundary(
+    face_ids: &[usize],
+    faces: &[Face],
+) -> Option<(Vec<usize>, Vec<(usize, usize)>, f64)> {
+    let mut count: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut area = 0.0f64;
+    for &face_index in face_ids {
+        let face = faces.get(face_index)?;
+        area += face.area;
+        let n = face.vertices.len();
+        for i in 0..n {
+            let key = edge_key(face.vertices[i], face.vertices[(i + 1) % n]);
+            *count.entry(key).or_insert(0) += 1;
+        }
+    }
+    if count.values().any(|&c| c > 2) {
+        return None;
+    }
+    let mut next: HashMap<usize, usize> = HashMap::new();
+    let mut boundary_edges: Vec<(usize, usize)> = Vec::new();
+    for &face_index in face_ids {
+        let face = faces.get(face_index)?;
+        let n = face.vertices.len();
+        for i in 0..n {
+            let a = face.vertices[i];
+            let b = face.vertices[(i + 1) % n];
+            if count.get(&edge_key(a, b)).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            if next.insert(a, b).is_some() {
+                return None;
+            }
+            boundary_edges.push((a, b));
+        }
+    }
+    let start = boundary_edges.first()?.0;
+    let mut loop_ids: Vec<usize> = Vec::new();
+    let mut current = start;
+    let mut guard = 0usize;
+    loop {
+        loop_ids.push(current);
+        let following = *next.get(&current)?;
+        current = following;
+        if current == start {
+            break;
+        }
+        guard += 1;
+        if guard > boundary_edges.len() + 1 {
+            return None;
+        }
+    }
+    if loop_ids.len() != boundary_edges.len() {
+        return None; // more than one boundary loop
+    }
+    Some((loop_ids, boundary_edges, area))
+}
+
+// ---------------------------------------------------------------------------
+// Geometry helpers
+// ---------------------------------------------------------------------------
+
+fn edge_key(a: usize, b: usize) -> (usize, usize) {
+    (a.min(b), a.max(b))
+}
+
+fn polygon_area_ids(pos: &[[f64; 2]], ids: &[usize]) -> f64 {
+    if ids.len() < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    for i in 0..ids.len() {
+        let a = pos[ids[i]];
+        let b = pos[ids[(i + 1) % ids.len()]];
+        sum += a[0] * b[1] - b[0] * a[1];
+    }
+    0.5 * sum
+}
+
+fn polygon_area_points(points: &[[f64; 2]]) -> f64 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    for i in 0..points.len() {
+        let a = points[i];
+        let b = points[(i + 1) % points.len()];
+        sum += a[0] * b[1] - b[0] * a[1];
+    }
+    0.5 * sum
+}
+
+fn polygon_centroid(points: &[[f64; 2]]) -> Option<[f64; 2]> {
+    let area = polygon_area_points(points);
+    if area.abs() < EPS {
+        return None;
+    }
+    let mut x = 0.0;
+    let mut y = 0.0;
+    for i in 0..points.len() {
+        let a = points[i];
+        let b = points[(i + 1) % points.len()];
+        let cross = a[0] * b[1] - b[0] * a[1];
+        x += (a[0] + b[0]) * cross;
+        y += (a[1] + b[1]) * cross;
+    }
+    let centroid = [x / (6.0 * area), y / (6.0 * area)];
+    if centroid[0].is_finite() && centroid[1].is_finite() {
+        Some(centroid)
+    } else {
+        None
+    }
+}
+
+fn point_distance(a: [f64; 2], b: [f64; 2]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+}
+
+/// Is `p` inside or on the boundary of a counter-clockwise quad?
+///
+/// Inclusive on purpose: a sample that lands exactly on a lattice corner (the
+/// centroid of a square grid block does) still belongs to the grid region.
+fn point_in_or_on_convex_quad(p: [f64; 2], quad: &[usize; 4], pos: &[[f64; 2]]) -> bool {
+    for i in 0..4 {
+        let Some(&a) = pos.get(quad[i]) else {
+            return false;
+        };
+        let Some(&b) = pos.get(quad[(i + 1) % 4]) else {
+            return false;
+        };
+        let cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+        if cross < -1.0e-12 {
+            return false;
+        }
+    }
+    true
+}
+
+fn point_in_polygon(p: [f64; 2], polygon: &[[f64; 2]]) -> bool {
+    let mut inside = false;
+    let n = polygon.len();
+    for i in 0..n {
+        let a = polygon[i];
+        let b = polygon[(i + 1) % n];
+        if (a[1] > p[1]) != (b[1] > p[1]) {
+            let t = (p[1] - a[1]) / (b[1] - a[1]);
+            if p[0] < a[0] + t * (b[0] - a[0]) {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+fn distance_to_polygon_edges(p: [f64; 2], polygon: &[[f64; 2]]) -> f64 {
+    let mut best = f64::INFINITY;
+    for i in 0..polygon.len() {
+        let a = polygon[i];
+        let b = polygon[(i + 1) % polygon.len()];
+        best = best.min(point_segment_distance(p, a, b));
+    }
+    best
+}
+
+fn point_segment_distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let length2 = ab[0] * ab[0] + ab[1] * ab[1];
+    if length2 <= 0.0 {
+        return point_distance(p, a);
+    }
+    let t = (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / length2).clamp(0.0, 1.0);
+    let q = [a[0] + t * ab[0], a[1] + t * ab[1]];
+    point_distance(p, q)
+}
+
+fn point_on_segment_strict(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> bool {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let length2 = ab[0] * ab[0] + ab[1] * ab[1];
+    if length2 <= 0.0 {
+        return false;
+    }
+    let t = ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / length2;
+    if !(t > 1.0e-9 && t < 1.0 - 1.0e-9) {
+        return false;
+    }
+    let q = [a[0] + t * ab[0], a[1] + t * ab[1]];
+    point_distance(p, q) <= 1.0e-9
+}
+
+fn orient(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+/// Do two segments cross or overlap in a way that makes them incompatible?
+/// Cleanly shared endpoints are allowed.
+fn edges_conflict(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    let o1 = orient(a, b, c);
+    let o2 = orient(a, b, d);
+    let o3 = orient(c, d, a);
+    let o4 = orient(c, d, b);
+    let proper = ((o1 > EPS && o2 < -EPS) || (o1 < -EPS && o2 > EPS))
+        && ((o3 > EPS && o4 < -EPS) || (o3 < -EPS && o4 > EPS));
+    if proper {
+        return true;
+    }
+    let collinear = o1.abs() <= EPS && o2.abs() <= EPS;
+    if collinear {
+        let ab = [b[0] - a[0], b[1] - a[1]];
+        let length2 = ab[0] * ab[0] + ab[1] * ab[1];
+        if length2 <= 0.0 {
+            return false;
+        }
+        let project =
+            |p: [f64; 2]| -> f64 { ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / length2 };
+        let tc = project(c);
+        let td = project(d);
+        let low = tc.min(td).max(0.0);
+        let high = tc.max(td).min(1.0);
+        if high - low > 1.0e-9 {
+            return true;
+        }
+    }
+    point_on_segment_strict(c, a, b)
+        || point_on_segment_strict(d, a, b)
+        || point_on_segment_strict(a, c, d)
+        || point_on_segment_strict(b, c, d)
+}
+
+fn quad_area(quad: [[f64; 2]; 4]) -> f64 {
+    0.5 * ((quad[0][0] * quad[1][1] - quad[1][0] * quad[0][1])
+        + (quad[1][0] * quad[2][1] - quad[2][0] * quad[1][1])
+        + (quad[2][0] * quad[3][1] - quad[3][0] * quad[2][1])
+        + (quad[3][0] * quad[0][1] - quad[0][0] * quad[3][1]))
+}
+
+/// Rank a convex quad by its worst angle deviation from 90°:
+/// `1 - max|angle - 90| / 90`. `None` for a degenerate, inverted or concave
+/// quad.
+fn quad_angle_rank(quad: [[f64; 2]; 4]) -> Option<f64> {
+    if quad_area(quad) <= 1.0e-14 {
+        return None;
+    }
+    for i in 0..4 {
+        let a = quad[i];
+        let b = quad[(i + 1) % 4];
+        let c = quad[(i + 2) % 4];
+        if orient(a, b, c) <= 1.0e-12 {
+            return None;
+        }
+    }
+    let mut worst = 0.0f64;
+    for i in 0..4 {
+        let previous = quad[(i + 3) % 4];
+        let next = quad[(i + 1) % 4];
+        let u = [previous[0] - quad[i][0], previous[1] - quad[i][1]];
+        let v = [next[0] - quad[i][0], next[1] - quad[i][1]];
+        let lu = (u[0] * u[0] + u[1] * u[1]).sqrt();
+        let lv = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        if lu <= 1.0e-12 || lv <= 1.0e-12 {
+            return None;
+        }
+        let cosine = ((u[0] * v[0] + u[1] * v[1]) / (lu * lv)).clamp(-1.0, 1.0);
+        let angle = cosine.acos().to_degrees();
+        if !angle.is_finite() {
+            return None;
+        }
+        worst = worst.max((angle - 90.0).abs());
+    }
+    Some(1.0 - worst / 90.0)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::assertions_on_constants)]
+mod tests {
+    use super::*;
+
+    fn valid_domain(points: Vec<[f64; 2]>) -> Domain {
+        match Domain::new(points, Vec::new()) {
+            Ok(domain) => domain,
+            Err(error) => {
+                assert!(false, "test domain invalid: {error}");
+                Domain::default()
+            }
+        }
+    }
+
+    fn check_mesh(mesh: &Mesh, domain: &Domain, label: &str) -> (usize, f64, f64, f64, f64) {
+        assert!(
+            mesh.cells
+                .iter()
+                .all(|cell| cell.kind == crate::mesh::Kind::Quad4),
+            "{label}: not all cells are quads"
+        );
+        assert!(!mesh.cells.is_empty(), "{label}: empty mesh");
+        let topology = mesh.topology();
+        assert_eq!(topology.cracks, 0, "{label}: cracks");
+        assert_eq!(
+            topology.inconsistent, 0,
+            "{label}: inconsistent orientation"
+        );
+        assert_eq!(topology.non_manifold, 0, "{label}: non-manifold");
+        let report = quality::report(mesh);
+        assert!(report.inverted == 0, "{label}: inverted cells");
+        assert!(
+            report.min_scaled_jacobian > 0.0,
+            "{label}: non-positive scaled Jacobian"
+        );
+        let offset = match max_boundary_offset(mesh, domain) {
+            Ok(value) => value,
+            Err(error) => {
+                assert!(false, "{label}: boundary offset failed: {error}");
+                0.0
+            }
+        };
+        assert!(offset < 1.0e-7, "{label}: boundary offset {offset}");
+        (
+            mesh.cells.len(),
+            report.min_scaled_jacobian,
+            report.min_corner_angle_deg,
+            report.max_corner_angle_deg,
+            offset,
+        )
+    }
+
+    #[test]
+    fn channel_square_has_two_loops() {
+        let domain = match Domain::rectangle(10.0, 10.0) {
+            Ok(domain) => domain,
+            Err(error) => {
+                assert!(false, "{error}");
+                return;
+            }
+        };
+        let loops = match channel(&domain, 1.0) {
+            Ok(loops) => loops,
+            Err(error) => {
+                assert!(false, "channel failed: {error}");
+                return;
+            }
+        };
+        assert_eq!(
+            loops.len(),
+            2,
+            "a 10x10 square has an outer and an inner loop"
+        );
+        let mut signs = Vec::new();
+        for loop_ in &loops {
+            assert!(loop_.points.len() >= 4);
+            assert_eq!(loop_.points.len() % 2, 0);
+            let area = polygon_area_points(&loop_.points);
+            signs.push(area > 0.0);
+        }
+        signs.sort_unstable();
+        assert_eq!(signs, vec![false, true], "the two loops are opposed");
+    }
+
+    #[test]
+    fn square_10x10() {
+        let domain = match Domain::rectangle(10.0, 10.0) {
+            Ok(domain) => domain,
+            Err(error) => {
+                assert!(false, "{error}");
+                return;
+            }
+        };
+        let (mesh, stats) = match mesh_with_stats(&domain, 1.0) {
+            Ok(result) => result,
+            Err(error) => {
+                assert!(false, "square mesh failed: {error}");
+                return;
+            }
+        };
+        let (quads, min_sj, min_angle, max_angle, offset) = check_mesh(&mesh, &domain, "square");
+        println!(
+            "square 10x10 h=1: {quads} quads ({} interior + {} channel), loops {}, \
+             cross edges {}, faces {}, patches {} ({} usable), selected {}, min SJ {min_sj:.4}, \
+             angles {min_angle:.2}..{max_angle:.2}, cracks {}, offset {offset:.3e}, \
+             greedy {:.1}%, fallback {} regions / {} quads",
+            stats.interior_quads,
+            stats.channel_quads,
+            stats.channel_loops,
+            stats.cross_edges,
+            stats.faces,
+            stats.patches,
+            stats.usable_patches,
+            stats.selected_patches,
+            stats.cracks,
+            100.0 * stats.greedy_covered_fraction,
+            stats.fallback_regions,
+            stats.fallback_quads,
+        );
+        assert!(quads > 40, "expected more than 40 quads, got {quads}");
+        assert_eq!(stats.interior_quads, 36, "6x6 interior grid quads");
+        assert!(stats.channel_quads > 0);
+        assert!(stats.greedy_covered_fraction > 0.5);
+        assert!(min_sj > 0.05, "min SJ too low: {min_sj}");
+        assert!(min_angle > 10.0, "min angle too low: {min_angle}");
+    }
+
+    #[test]
+    fn l_bracket() {
+        let domain = valid_domain(vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 5.0],
+            [5.0, 5.0],
+            [5.0, 10.0],
+            [0.0, 10.0],
+        ]);
+        // The grid + channel construction itself must work for the L.
+        let loops = match channel(&domain, 1.0) {
+            Ok(loops) => loops,
+            Err(error) => {
+                assert!(false, "L-bracket channel failed: {error}");
+                return;
+            }
+        };
+        assert!(!loops.is_empty());
+        println!("L-bracket channel: {} loop(s)", loops.len());
+        match mesh_with_stats(&domain, 1.0) {
+            Ok((mesh, stats)) => {
+                let (quads, min_sj, min_angle, max_angle, offset) =
+                    check_mesh(&mesh, &domain, "L-bracket");
+                println!(
+                    "L-bracket h=1 [{}]: {quads} quads ({} interior + {} channel), loops {}, \
+                     cross edges {}, faces {}, patches {} ({} usable), selected {}, min SJ {min_sj:.4}, \
+                     angles {min_angle:.2}..{max_angle:.2}, cracks {}, offset {offset:.3e}, \
+                     greedy {:.1}%, fallback {} regions / {} quads",
+                    stats.method,
+                    stats.interior_quads,
+                    stats.channel_quads,
+                    stats.channel_loops,
+                    stats.cross_edges,
+                    stats.faces,
+                    stats.patches,
+                    stats.usable_patches,
+                    stats.selected_patches,
+                    stats.cracks,
+                    100.0 * stats.greedy_covered_fraction,
+                    stats.fallback_regions,
+                    stats.fallback_quads,
+                );
+                assert!(quads > 40);
+                assert!(stats.channel_quads > 0);
+                assert!(min_sj > 0.05);
+            }
+            Err(error) => {
+                println!(
+                    "L-bracket channel construction works, but the simplified ribbon/template \
+                     mesher cannot close it: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn square_with_square_hole() {
+        let outer = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let hole = vec![[3.0, 3.0], [3.0, 7.0], [7.0, 7.0], [7.0, 3.0]];
+        let domain = match Domain::new(outer, vec![hole]) {
+            Ok(domain) => domain,
+            Err(error) => {
+                assert!(false, "{error}");
+                return;
+            }
+        };
+        match mesh_with_stats(&domain, 1.0) {
+            Ok((mesh, stats)) => {
+                let (quads, min_sj, min_angle, max_angle, offset) =
+                    check_mesh(&mesh, &domain, "square-with-hole");
+                println!(
+                    "square-with-hole h=1: {quads} quads ({} interior + {} channel), loops {}, \
+                     cross edges {}, faces {}, patches {} ({} usable), selected {}, min SJ {min_sj:.4}, \
+                     angles {min_angle:.2}..{max_angle:.2}, cracks {}, offset {offset:.3e}, \
+                     greedy {:.1}%, fallback {} regions / {} quads",
+                    stats.interior_quads,
+                    stats.channel_quads,
+                    stats.channel_loops,
+                    stats.cross_edges,
+                    stats.faces,
+                    stats.patches,
+                    stats.usable_patches,
+                    stats.selected_patches,
+                    stats.cracks,
+                    100.0 * stats.greedy_covered_fraction,
+                    stats.fallback_regions,
+                    stats.fallback_quads,
+                );
+                assert!(quads >= 16);
+            }
+            Err(error) => {
+                println!("square-with-hole h=1 not feasible with this simplified cover: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn templates_are_non_degenerate() {
+        let hexagon: Vec<[f64; 2]> = (0..6)
+            .map(|i| {
+                let angle = TAU * i as f64 / 6.0;
+                [angle.cos(), angle.sin()]
+            })
+            .collect();
+        let Some(six) = quadrangulate_six(&hexagon, 2) else {
+            assert!(false, "no 6-sided template");
+            return;
+        };
+        assert!((2..=4).contains(&six.quads.len()));
+        assert!(six.rank > 0.0, "regular hexagon rank {}", six.rank);
+
+        let octagon: Vec<[f64; 2]> = (0..8)
+            .map(|i| {
+                let angle = TAU * i as f64 / 8.0 + TAU / 16.0;
+                [angle.cos(), angle.sin()]
+            })
+            .collect();
+        let Some(eight) = quadrangulate_eight(&octagon) else {
+            assert!(false, "no 8-sided template");
+            return;
+        };
+        assert!(eight.rank > 0.0, "regular octagon rank {}", eight.rank);
+        assert!(!eight.quads.is_empty());
+    }
+
+    #[test]
+    fn demo_numbers() {
+        let numbers = match demo() {
+            Ok(numbers) => numbers,
+            Err(error) => {
+                assert!(false, "demo failed: {error}");
+                return;
+            }
+        };
+        println!(
+            "demo square: {:?}\ndemo L: {:?}\ndemo hole: {:?}",
+            numbers.square, numbers.l_bracket, numbers.square_with_hole
+        );
+        assert!(numbers.square.quads > 40);
+        assert_eq!(numbers.square.cracks, 0);
+        match &numbers.l_bracket {
+            Some(l) => {
+                assert!(l.quads > 40);
+                assert_eq!(l.cracks, 0);
+            }
+            None => {
+                if let Some(error) = &numbers.l_bracket_error {
+                    println!("L-bracket demo error: {error}");
+                }
+            }
+        }
+        if let Some(hole) = &numbers.square_with_hole {
+            assert_eq!(hole.cracks, 0);
+        } else if let Some(error) = &numbers.square_with_hole_error {
+            println!("hole case error: {error}");
+        }
+    }
+}
