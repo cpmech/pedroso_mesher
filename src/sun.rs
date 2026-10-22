@@ -1979,10 +1979,38 @@ pub fn perturb_low_quads(
     tris: &[[usize; 3]],
     size: f64,
     rounds: usize,
+    domain: Option<&crate::two_d::Domain>,
 ) -> (Vec<Node>, Vec<[usize; 4]>, Vec<[usize; 3]>, usize) {
     let mut pts = points.to_vec();
     let quads = quads.to_vec();
     let tris = tris.to_vec();
+    // Boundary nodes may only slide **along** the domain boundary. Moving them
+    // freely improves the margin while pushing the mesh off the geometry it was
+    // built for (measured: 0.57 x size on plate-hole 1 mm and 1.92 on the ring;
+    // the gate cannot see it). Without a domain the boundary nodes are left alone.
+    let mut edge_count: HashMap<(usize, usize), usize> = HashMap::new();
+    for cell in quads
+        .iter()
+        .map(|q| q.as_slice())
+        .chain(tris.iter().map(|t| t.as_slice()))
+    {
+        for i in 0..cell.len() {
+            let a = cell[i];
+            let b = cell[(i + 1) % cell.len()];
+            *edge_count.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    let mut on_boundary = vec![false; pts.len()];
+    for ((a, b), n) in edge_count {
+        if n == 1 {
+            if a < on_boundary.len() {
+                on_boundary[a] = true;
+            }
+            if b < on_boundary.len() {
+                on_boundary[b] = true;
+            }
+        }
+    }
     let mut incident: HashMap<usize, Vec<usize>> = HashMap::new();
     for (id, q) in quads.iter().enumerate() {
         for &v in q {
@@ -2014,7 +2042,17 @@ pub fn perturb_low_quads(
             for radius in [0.02 * size, 0.05 * size, 0.1 * size] {
                 for k in 0..8 {
                     let a = std::f64::consts::TAU * k as f64 / 8.0;
-                    let candidate = [here[0] + radius * a.cos(), here[1] + radius * a.sin()];
+                    let mut candidate = [here[0] + radius * a.cos(), here[1] + radius * a.sin()];
+                    if on_boundary[v] {
+                        // A boundary node may slide along the polyline, never off it.
+                        match domain {
+                            Some(d) => {
+                                let (p, q, _) = d.nearest_segment(candidate);
+                                candidate = project_on_segment(candidate, p, q);
+                            }
+                            None => continue,
+                        }
+                    }
                     pts[v] = [candidate[0], candidate[1], 0.0];
                     let score = margin(&pts, v);
                     pts[v] = [here[0], here[1], 0.0];
@@ -2208,6 +2246,17 @@ fn normalize_quad(points: &[Node], q: [usize; 4]) -> [usize; 4] {
 
 /// The bilinear scaled Jacobian minima used by the quality contract. It may be
 /// negative when a corner is inverted; [`quad_sj`] is the positive-only view.
+/// Closest point to `p` on the segment `a`-`b`.
+fn project_on_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+    let d = [b[0] - a[0], b[1] - a[1]];
+    let len2 = d[0] * d[0] + d[1] * d[1];
+    if len2 <= 1.0e-24 {
+        return a;
+    }
+    let t = (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1]) / len2).clamp(0.0, 1.0);
+    [a[0] + t * d[0], a[1] + t * d[1]]
+}
+
 fn quad_min_sj(points: &[Node], quad: &[usize; 4]) -> f64 {
     const XI: [[f64; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
     let p = [
@@ -2319,10 +2368,77 @@ mod tests {
             quad_min_sj(&points, &quads[0]) <= 1e-9,
             "input is degenerate"
         );
-        let (pts, quads, tris, moved) = perturb_low_quads(&points, &quads, &[], 1.0, 200);
+        let domain = crate::two_d::Domain::rectangle(2.0, 1.0).unwrap();
+        let (pts, quads, tris, moved) =
+            perturb_low_quads(&points, &quads, &[], 1.0, 200, Some(&domain));
         assert!(moved > 0, "the degenerate corner was not moved");
         assert!(quad_min_sj(&pts, &quads[0]) >= 0.2, "{:?}", quads[0]);
         assert!(tris.is_empty());
+    }
+
+    /// A 4 x 4 node grid (3 x 3 quads) with the interior node 6 pulled onto the
+    /// diagonal of its quad, so that quad has three collinear nodes.
+    fn grid_with_a_degenerate_quad() -> (Vec<Node>, Vec<[usize; 4]>) {
+        let mut points = Vec::new();
+        for j in 0..4 {
+            for i in 0..4 {
+                points.push([i as f64, j as f64, 0.0]);
+            }
+        }
+        points[6] = [1.5, 1.5, 0.0];
+        let mut quads = Vec::new();
+        for j in 0..3 {
+            for i in 0..3 {
+                let a = j * 4 + i;
+                quads.push([a, a + 1, a + 5, a + 4]);
+            }
+        }
+        (points, quads)
+    }
+
+    #[test]
+    fn an_interior_degenerate_quad_is_perturbed_away() {
+        let domain = crate::two_d::Domain::rectangle(3.0, 3.0).unwrap();
+        let (points, quads) = grid_with_a_degenerate_quad();
+        // The quad 5-6-10-9 has 5, 6 and 10 collinear after moving node 6.
+        let bad = [5usize, 6, 10, 9];
+        assert!(quads.contains(&bad));
+        assert!(quad_min_sj(&points, &bad) <= 1.0e-9, "input is degenerate");
+        let before = points.clone();
+        let (pts, out, _, moved) = perturb_low_quads(&points, &quads, &[], 1.0, 200, Some(&domain));
+        assert!(moved > 0, "no move was made");
+        assert!(quad_min_sj(&pts, &bad) >= 0.2, "{:?}", bad);
+        // The boundary nodes are on the domain boundary and must not move.
+        for (i, p) in before.iter().enumerate() {
+            let boundary = i % 4 == 0 || i % 4 == 3 || !(4..12).contains(&i);
+            if boundary {
+                assert!((pts[i][0] - p[0]).abs() < 1.0e-12 && (pts[i][1] - p[1]).abs() < 1.0e-12);
+            }
+        }
+        assert_eq!(out, quads);
+    }
+
+    #[test]
+    fn without_a_domain_the_boundary_nodes_are_left_alone() {
+        let points = vec![
+            [0.0, 0.0, 0.0],
+            [0.5, 0.25, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let quads = [[0, 1, 2, 3]];
+        let (pts, _, _, _) = perturb_low_quads(&points, &quads, &[], 1.0, 20, None);
+        for (a, b) in points.iter().zip(pts.iter()) {
+            assert!((a[0] - b[0]).abs() < 1.0e-12 && (a[1] - b[1]).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn a_point_projects_onto_its_segment() {
+        let p = project_on_segment([0.5, 0.3], [0.0, 0.0], [1.0, 0.0]);
+        assert!((p[0] - 0.5).abs() < 1.0e-12 && p[1].abs() < 1.0e-12);
+        let p = project_on_segment([-1.0, 2.0], [0.0, 0.0], [1.0, 0.0]);
+        assert!(p[0].abs() < 1.0e-12 && p[1].abs() < 1.0e-12);
     }
 
     #[test]

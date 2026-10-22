@@ -71,6 +71,43 @@ impl Gate {
     }
 }
 
+/// Largest distance of a **boundary node** from the domain boundary.
+///
+/// A conforming planar mesh has every boundary node on the domain polyline, so
+/// this is ~1e-15 (floating point). A larger value means the mesh no longer sits
+/// on the geometry it was built for — the gate's quality numbers cannot see that,
+/// because moving a boundary node inward can even improve them. Measured on the
+/// ring: a perturbation pass moved boundary nodes up to 0.1 x size per round and
+/// the mesh stuck out of the quarter annulus by ~0.1 mm.
+pub fn boundary_offset(domain: &crate::two_d::Domain, mesh: &Mesh) -> f64 {
+    let mut count: HashMap<(usize, usize), usize> = HashMap::new();
+    for cell in &mesh.cells {
+        for i in 0..cell.nodes.len() {
+            let a = cell.nodes[i];
+            let b = cell.nodes[(i + 1) % cell.nodes.len()];
+            *count.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    let mut on_boundary = vec![false; mesh.points.len()];
+    for ((a, b), n) in count {
+        if n == 1 {
+            if a < on_boundary.len() {
+                on_boundary[a] = true;
+            }
+            if b < on_boundary.len() {
+                on_boundary[b] = true;
+            }
+        }
+    }
+    let mut worst: f64 = 0.0;
+    for (i, p) in mesh.points.iter().enumerate() {
+        if on_boundary[i] {
+            worst = worst.max(domain.distance_to_boundary([p[0], p[1]]));
+        }
+    }
+    worst
+}
+
 /// Measure a mesh against the gate.
 pub fn gate(mesh: &Mesh) -> Gate {
     let report = quality::report(mesh);
@@ -182,6 +219,33 @@ mod tests {
         assert_eq!(g.inverted, 1);
         assert!(!g.passes());
         assert!(g.reason().unwrap_or_default().contains("inverted"));
+    }
+
+    #[test]
+    fn a_boundary_node_off_the_domain_is_measured() {
+        use crate::two_d::Domain;
+        let domain = Domain::rectangle(1.0, 1.0).unwrap();
+        let mesh = Mesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [0.5, 0.25, 0.0], // pulled inside the bottom edge
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            vec![Cell::quad4([0, 1, 2, 3])],
+        );
+        let offset = boundary_offset(&domain, &mesh);
+        assert!((offset - 0.25).abs() < 1.0e-12, "{offset}");
+        let on = Mesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            vec![Cell::quad4([0, 1, 2, 3])],
+        );
+        assert!(boundary_offset(&domain, &on) < 1.0e-12);
     }
 
     #[test]

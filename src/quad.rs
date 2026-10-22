@@ -51,6 +51,9 @@ pub struct Stats {
     /// a failing mesh keeps would otherwise mask them).
     pub quads_only_sj: f64,
     pub quads_only_angle_deg: f64,
+    /// Largest distance of a boundary node from the domain boundary (0 when the
+    /// mesh sits on its geometry; the gate cannot see a boundary moved inward).
+    pub boundary_offset: f64,
     /// Present when [`Route::TwoStage`] ran.
     pub two_stage: Option<twostage::TwoStageStats>,
 }
@@ -88,6 +91,9 @@ pub struct Unsupported {
     /// The gate's first reason, e.g. "2 triangle(s) left".
     pub reason: String,
     pub refusals: Refusals,
+    /// The mesh that failed the gate. Kept for diagnosis (drawing it is how the
+    /// failures are understood); it must not be shipped as a result.
+    pub mesh: Mesh,
 }
 
 /// Why [`mesh_quads`] did not return a mesh.
@@ -179,6 +185,7 @@ pub fn mesh_quads_with_route(
         parity_splits,
         quads_only_sj: report.min_scaled_jacobian,
         quads_only_angle_deg: report.min_corner_angle_deg,
+        boundary_offset: verify::boundary_offset(domain, &mesh),
         two_stage,
     };
     let timing = Timing {
@@ -186,6 +193,28 @@ pub fn mesh_quads_with_route(
         conversion,
         total: t0.elapsed().as_secs_f64(),
     };
+    // Geometry conformity: a boundary node moved inward can improve every gate
+    // number while the mesh no longer sits on the domain. Check it explicitly.
+    let diagonal = mesh
+        .points
+        .iter()
+        .fold((f64::NEG_INFINITY, f64::NEG_INFINITY), |acc, p| {
+            (acc.0.max(p[0].abs()), acc.1.max(p[1].abs()))
+        });
+    let tolerance = 1.0e-6 * diagonal.0.max(diagonal.1).max(1.0);
+    let offset = verify::boundary_offset(domain, &mesh);
+    if offset > tolerance {
+        return Err(QuadError::Unsupported(Box::new(Unsupported {
+            gate,
+            raw_gate,
+            stats,
+            timing,
+            route,
+            reason: format!("a boundary node is {offset:.2e} off the domain boundary"),
+            refusals,
+            mesh,
+        })));
+    }
     if !gate.passes() {
         return Err(QuadError::Unsupported(Box::new(Unsupported {
             gate,
@@ -195,6 +224,7 @@ pub fn mesh_quads_with_route(
             route,
             reason: gate.reason().unwrap_or_default(),
             refusals,
+            mesh,
         })));
     }
     Ok(QuadMesh {
@@ -294,7 +324,7 @@ fn quality_passes(mesh: &mut Mesh, domain: &Domain, size: f64) -> (usize, usize,
     let (points, quads, tris, degenerate_after) =
         sun::repair_degenerate_quads(&mesh.points, &quad_cells(mesh), &tri_cells(mesh), 0.25, 8);
     let (points, quads, tris, perturbations) =
-        sun::perturb_low_quads(&points, &quads, &tris, size, 200);
+        sun::perturb_low_quads(&points, &quads, &tris, size, 200, Some(domain));
     *mesh = Mesh::new(points, cells_of(&quads, &tris));
     (
         low_repairs,
@@ -455,6 +485,7 @@ mod tests {
                     route: Route::Front,
                     reason: u.reason.clone(),
                     refusals: Refusals::default(),
+                    mesh: Mesh::new(Vec::new(), Vec::new()),
                 }))
                 .to_string();
                 assert!(message.starts_with("not supported yet:"), "{message}");
