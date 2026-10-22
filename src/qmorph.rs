@@ -256,6 +256,14 @@ fn cross(a: Node, b: Node, c: Node) -> f64 {
 
 /// Convert a triangle mesh into quads.
 ///
+/// **The design policy is not enforced here.** The rules in the W3 design note —
+/// side nodes from the reachable unconverted region first, insertion only on a
+/// size mismatch, no trial-clone rollback, blocking around progress — are
+/// guidance for the implementation, not checks in this code. Nothing refuses a
+/// run that ignores them; the module simply produces a mesh. Measure what came
+/// out with [`crate::verify::gate`], which is what a claim of "all-quad" has to
+/// pass.
+///
 /// Returns the quads, the triangles that could not be converted, and the node
 /// set the conversion ended with (placement inserts nodes).
 pub fn convert(

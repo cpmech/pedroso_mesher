@@ -27,6 +27,7 @@ pub mod quadify;
 pub mod quality;
 pub mod recovery;
 pub mod two_d;
+pub mod verify;
 
 pub use bench::{Part, PARTS};
 pub use io::read_mesh_json;
