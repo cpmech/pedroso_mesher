@@ -152,6 +152,7 @@ fn aspects(mesh: &Mesh) -> (f64, f64) {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_row(
     part: &str,
     size: f64,
@@ -160,6 +161,7 @@ fn print_row(
     secs: f64,
     domain: &Domain,
     mesh: &Mesh,
+    stats: &alt_paving::Stats,
 ) {
     let verdict = if gate.passes() { "PASS" } else { "FAIL" };
     let reason = gate.reason().unwrap_or_default();
@@ -168,7 +170,7 @@ fn print_row(
         .unwrap_or_else(|| "n/a".to_string());
     let (p95, max) = aspects(mesh);
     println!(
-        "{part:12} {size:4} {kind:4} q={:6} tri={:4} inv={:3} ovl={:2} sj={:.3} ang={:5.1} cr={:3} {verdict:4} {reason:24} {secs:.2} v4={v4} off={:.1e} ar={p95:.1} armax={max:.1}",
+        "{part:12} {size:4} {kind:4} q={:6} tri={:4} inv={:3} ovl={:2} sj={:.3} ang={:5.1} cr={:3} {verdict:4} {reason:24} {secs:.2} v4={v4} off={:.1e} ar={p95:.1} armax={max:.1} rows={} core={} rnd={}",
         gate.quads,
         gate.triangles,
         gate.inverted,
@@ -177,6 +179,9 @@ fn print_row(
         gate.min_corner_angle_deg,
         gate.cracks,
         verify::boundary_offset(domain, mesh),
+        stats.row_quads,
+        stats.core_quads,
+        stats.row_rounds,
     );
 }
 
@@ -190,8 +195,8 @@ fn run(name: &str, domain: &Domain, size: f64) {
         }
     };
     let start = Instant::now();
-    let raw = match alt_paving::mesh(domain, &sizing) {
-        Ok(mesh) => mesh,
+    let (raw, stats) = match alt_paving::mesh_with_stats(domain, &sizing) {
+        Ok(pair) => pair,
         Err(e) => {
             println!("{name:12} {size:4} raw  ERROR {e}");
             println!("{name:12} {size:4} post ERROR {e}");
@@ -200,7 +205,7 @@ fn run(name: &str, domain: &Domain, size: f64) {
     };
     let elapsed = start.elapsed().as_secs_f64();
     let raw_gate = verify::gate(&raw);
-    print_row(name, size, "raw", &raw_gate, elapsed, domain, &raw);
+    print_row(name, size, "raw", &raw_gate, elapsed, domain, &raw, &stats);
 
     let post_start = Instant::now();
     let mut mesh = raw;
@@ -225,13 +230,14 @@ fn run(name: &str, domain: &Domain, size: f64) {
         post_start.elapsed().as_secs_f64(),
         domain,
         &mesh,
+        &stats,
     );
 }
 
 fn main() {
     println!(
-        "{:12} {:>4} {:4} {:>7} {:>5} {:>4} {:>3} {:>6} {:>6} {:>4} {:4} {:24} {:>4} {:>5} {:>8} {:>5} {:>7}",
-        "part", "size", "row", "quads", "tri", "inv", "ovl", "minSJ", "minAng", "crk", "gate", "reason", "secs", "v4", "offset", "ar", "armax"
+        "{:12} {:>4} {:4} {:>7} {:>5} {:>4} {:>3} {:>6} {:>6} {:>4} {:4} {:24} {:>4} {:>5} {:>8} {:>5} {:>7} {:>5} {:>6} {:>6}",
+        "part", "size", "row", "quads", "tri", "inv", "ovl", "minSJ", "minAng", "crk", "gate", "reason", "secs", "v4", "offset", "ar", "armax", "rows", "core", "rounds"
     );
     run(
         "plate-hole",

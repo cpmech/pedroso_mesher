@@ -10,18 +10,22 @@
 //!
 //! What is implemented
 //! -------------------
-//! * Boundary sampling: each closed loop is sampled at (at most) the requested
-//!   size, keeping every geometric vertex on the polyline. Rows of a sharp
-//!   corner are kept at least `1.25 h` away from the corner, which is what makes
-//!   the miter projection at that corner a pair of *convex* quads; sampling a
-//!   node exactly `h` from a corner would collapse them.
+//! * Boundary sampling: each closed loop is sampled near the requested size,
+//!   keeping every geometric vertex on the polyline. A short polyline segment
+//!   may be kept whole (up to about `1.35 h`) rather than split into collinear
+//!   nodes, and a sharp corner is left `2.4 h` clear on each straight side.
+//!   The clearance is what gives the row generator enough room to keep more
+//!   than one row alive at a corner; `1.25 h` also works but stops after one
+//!   row. Sampling a node exactly `h` from a corner collapses the corner quads.
 //! * Row choice (§2.4): loops are visited smallest perimeter first; a loop is
-//!   advanced by a full row between consecutive corners / around the loop.
+//!   advanced by a full row around the loop, one row at a time, until the next
+//!   row would be invalid. `mesh_with_stats` reports how many quads came from
+//!   rows and how many from the residual closure.
 //! * Row generation (§2.6): a row-side node is projected along the interior
 //!   angle bisector at the mitered offset distance `h / sin(α/2)`. At a sharp
 //!   *convex* corner the projection is pushed a further `0.25 h` along the
 //!   bisector; this rounds the new front slightly, which is what keeps the two
-//!   corner quads convex when the adjacent boundary node is only `1.25 h` away.
+//!   corner quads convex when the adjacent boundary node is `2.4 h` away.
 //!   A reflex corner keeps the plain miter. With a constant size field this is
 //!   the paper's projection.
 //! * Closure check and small-loop closure (§2.5): a 4-node front closes with one
@@ -35,8 +39,11 @@
 //! * Smoothing (§2.7): a global `smooth_mesh` pass at the end; the smoother is
 //!   the project's, not a paving-specific boundary smoother.
 //! * Cleanup (§2.11): `sun::repair_low_quads` and `sun::perturb_low_quads` run
-//!   on the finished mesh. They swap edges and move nodes; no element is
-//!   deleted. The common post-pass is run again by the example.
+//!   on the finished mesh, and a valence-driven edge swap replaces the shared
+//!   edge of two quads by the other diagonal of their hexagon whenever it
+//!   lowers the interior `sum |valence - 4|` and both new quads stay above the
+//!   gate. No element is deleted. The common post-pass is run again by the
+//!   example.
 //!
 //! What is not implemented
 //! -----------------------
@@ -50,9 +57,10 @@
 //!   corpus parts; with it every part is all-quad.
 //! * Seaming of negative/small front angles (§2.8), row adjustment with tucks
 //!   and wedges (§2.9) and perimeter-intersection connection (§2.10) are not
-//!   implemented. Their effect is approximated by the validity guard: a row
-//!   that would need one of them is refused and the residual is closed by the
-//!   fallback instead.
+//!   implemented. Their effect is approximated by the clearance/validity guard:
+//!   a row that would need one of them is refused and the residual is closed by
+//!   the fallback instead. This is why the ring still uses one row and the
+//!   matched core remains 55–83 % of the quads on the corpus (rows 17–45 %).
 //! * Anisotropic sizing, feature capture beyond the boundary segments, and
 //!   curved geometry (the boundary is the input polyline) are out of scope.
 //!
@@ -70,13 +78,36 @@ use crate::two_d::{pair_triangles_with, smooth_mesh, Domain, PairGuard, Sizing};
 /// A turn larger than this is treated as a geometric corner by the sampler.
 const CORNER_TURN: f64 = 30.0_f64 * std::f64::consts::PI / 180.0;
 /// Distance from a sharp corner to the first sampled boundary node, in sizes.
-const CORNER_MARGIN: f64 = 1.25;
+const CORNER_MARGIN: f64 = 2.4;
 /// The smallest front edge length a row may produce, in sizes.
 const MIN_EDGE: f64 = 0.08;
 /// New fronts closer than this to another front are refused, in sizes.
 const FRONT_GAP: f64 = 1.2;
 /// Rounds of rows before the residual closure takes over.
 const MAX_ROW_ROUNDS: usize = 32;
+
+/// How the quads of a run were produced.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    /// Quads produced by paving rows (including small-front closure).
+    pub row_quads: usize,
+    /// Quads produced by the residual Delaunay + matching (or fan) fallback.
+    pub core_quads: usize,
+    /// Paving rows committed.
+    pub row_rounds: usize,
+}
+
+impl Stats {
+    /// Share of the mesh produced by paving rows, in percent.
+    pub fn row_share(&self) -> f64 {
+        let total = self.row_quads + self.core_quads;
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * self.row_quads as f64 / total as f64
+        }
+    }
+}
 
 /// A closed front loop and the mesh built behind it.
 struct Paving {
@@ -86,6 +117,9 @@ struct Paving {
     /// Active front loops. Material is on the left of every loop.
     loops: Vec<Vec<usize>>,
     quads: Vec<[usize; 4]>,
+    row_quads: usize,
+    core_quads: usize,
+    row_rounds: usize,
 }
 
 impl Paving {
@@ -106,6 +140,12 @@ impl Paving {
 /// every front. The result is all-quad unless [`Mesh::topology`] reports a
 /// crack, which the tests check.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
+    mesh_with_stats(domain, sizing).map(|(mesh, _)| mesh)
+}
+
+/// Like [`mesh`], but also reports how much of the mesh came from paving rows
+/// and how much from the residual matching fallback.
+pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats), String> {
     if !sizing.size.is_finite() || sizing.size <= 0.0 {
         return Err("the element size must be positive and finite".to_string());
     }
@@ -150,6 +190,11 @@ pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
     if !paving.loops.is_empty() {
         fill_residual(&mut paving, domain, h)?;
     }
+    let stats = Stats {
+        row_quads: paving.row_quads,
+        core_quads: paving.core_quads,
+        row_rounds: paving.row_rounds,
+    };
 
     let cells: Vec<Cell> = paving.quads.iter().map(|q| Cell::quad4(*q)).collect();
     let mut mesh = Mesh::new(paving.points, cells);
@@ -174,6 +219,20 @@ pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
     let (p2, q2, _t, _moves) = sun::perturb_low_quads(&p1, &q1, &[], h, 100, Some(domain));
     mesh = Mesh::new(p2, q2.into_iter().map(Cell::quad4).collect());
     smooth_mesh(&mut mesh, domain, 20, h);
+    // §2.11: reduce the number of irregular interior nodes by swapping the
+    // shared edge of two quads for the other diagonal of their hexagon.
+    valence_cleanup(&mut mesh, 24);
+    // The swaps can make a quad thinner; a final node perturb recovers the
+    // angle/Jacobian margin without changing the topology (so v4 is unchanged).
+    let quads: Vec<[usize; 4]> = mesh
+        .cells
+        .iter()
+        .map(|c| [c.nodes[0], c.nodes[1], c.nodes[2], c.nodes[3]])
+        .collect();
+    let (p3, q3, _t, _moves) =
+        sun::perturb_low_quads(&mesh.points, &quads, &[], h, 100, Some(domain));
+    mesh = Mesh::new(p3, q3.into_iter().map(Cell::quad4).collect());
+    smooth_mesh(&mut mesh, domain, 10, h);
     let topo = mesh.topology();
     if mesh
         .cells
@@ -188,7 +247,7 @@ pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
             topo.cracks, topo.non_manifold, topo.inconsistent
         ));
     }
-    Ok(mesh)
+    Ok((mesh, stats))
 }
 
 // --------------------------------------------------------------------------- //
@@ -274,7 +333,7 @@ fn sample_loop(input: &[[f64; 2]], h: f64, ccw: bool) -> Result<Vec<[f64; 2]>, S
         let k = if span < 0.6 * h {
             0
         } else {
-            (span / h).ceil().max(1.0) as usize
+            (span / h).round().max(1.0) as usize
         };
         starts[i] = start;
         spans[i] = span;
@@ -333,6 +392,9 @@ fn sample(domain: &Domain, h: f64) -> Result<Paving, String> {
         fixed: Vec::new(),
         loops: Vec::new(),
         quads: Vec::new(),
+        row_quads: 0,
+        core_quads: 0,
+        row_rounds: 0,
     };
     let mut loops: Vec<Vec<[f64; 2]>> = Vec::new();
     loops.push(sample_loop(&domain.outer, h, true)?);
@@ -575,6 +637,8 @@ fn commit_row(paving: &mut Paving, li: usize, row: Row) {
     for p in row.new_points {
         paving.push_point(p, false);
     }
+    paving.row_quads += row.quads.len();
+    paving.row_rounds += 1;
     paving.quads.extend(row.quads);
     if let Some(slot) = paving.loops.get_mut(li) {
         *slot = row.new_loop;
@@ -597,6 +661,7 @@ fn close_small_fronts(paving: &mut Paving) {
             }
             if quad_ok(&paving.points, quad) {
                 paving.quads.push(quad);
+                paving.row_quads += 1;
                 paving.loops.remove(li);
                 continue;
             }
@@ -604,6 +669,7 @@ fn close_small_fronts(paving: &mut Paving) {
             if let Some((a, b)) = best_six_closure(&paving.points, &paving.loops[li]) {
                 paving.quads.push(a);
                 paving.quads.push(b);
+                paving.row_quads += 2;
                 paving.loops.remove(li);
                 continue;
             }
@@ -809,6 +875,7 @@ fn match_residual(paving: &mut Paving, extra: &[usize]) -> Result<(), Vec<[usize
     if !front_edges_covered(paving, &tris) {
         return Err(Vec::new());
     }
+    paving.core_quads += quads.len();
     paving.quads.extend(quads);
     Ok(())
 }
@@ -936,6 +1003,7 @@ fn fan_fill(paving: &mut Paving, domain: &Domain) -> Result<(), String> {
         }
         quads.push(quad);
     }
+    paving.core_quads += quads.len();
     paving.quads.extend(quads);
     paving.loops.clear();
     Ok(())
@@ -1038,6 +1106,204 @@ fn front_edges_covered(paving: &Paving, tris: &[[usize; 3]]) -> bool {
     true
 }
 
+/// Swap the shared edge of two quads when it reduces the interior irregularity
+/// `sum |valence - 4|` and both new quads stay inside the gate.
+///
+/// Two quads sharing an edge are a hexagon. Replacing the shared edge with one
+/// of the hexagon's other diagonals keeps two quads, changes four valences and
+/// does not touch the boundary. This is the §2.11 cleanup that reduces irregular
+/// nodes; it is purely topological.
+fn valence_cleanup(mesh: &mut Mesh, max_rounds: usize) {
+    for _ in 0..max_rounds {
+        let n = mesh.points.len();
+        let mut edge_owners: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        for (id, cell) in mesh.cells.iter().enumerate() {
+            if cell.kind != crate::mesh::Kind::Quad4 || cell.nodes.len() != 4 {
+                continue;
+            }
+            for i in 0..4 {
+                let a = cell.nodes[i];
+                let b = cell.nodes[(i + 1) % 4];
+                edge_owners
+                    .entry((a.min(b), a.max(b)))
+                    .or_default()
+                    .push(id);
+            }
+        }
+        let mut boundary = vec![false; n];
+        for (&(a, b), owners) in &edge_owners {
+            if owners.len() == 1 {
+                if a < n {
+                    boundary[a] = true;
+                }
+                if b < n {
+                    boundary[b] = true;
+                }
+            }
+        }
+        let mut valence: Vec<i32> = vec![0; n];
+        for cell in &mesh.cells {
+            if cell.kind != crate::mesh::Kind::Quad4 || cell.nodes.len() != 4 {
+                continue;
+            }
+            for &v in &cell.nodes {
+                if v < n {
+                    valence[v] += 1;
+                }
+            }
+        }
+        let mut edges: Vec<(usize, usize)> = edge_owners
+            .iter()
+            .filter(|(_, owners)| owners.len() == 2)
+            .map(|(&(a, b), _)| (a, b))
+            .collect();
+        edges.sort_unstable();
+
+        let interior_valence = |v: usize| -> i32 {
+            if boundary.get(v).copied().unwrap_or(true) {
+                4
+            } else {
+                valence.get(v).copied().unwrap_or(4)
+            }
+        };
+
+        let mut best: Option<(usize, usize, [usize; 4], [usize; 4], i32)> = None;
+        for &(a, b) in &edges {
+            let owners = &edge_owners[&(a, b)];
+            let Some(q1) = quad_ccw(&mesh.points, &mesh.cells[owners[0]].nodes) else {
+                continue;
+            };
+            let Some(q2) = quad_ccw(&mesh.points, &mesh.cells[owners[1]].nodes) else {
+                continue;
+            };
+            let Some((u, v, p, q, r, s)) = shared_hexagon(q1, q2) else {
+                continue;
+            };
+            let old_area =
+                signed_quad_area(&mesh.points, q1).abs() + signed_quad_area(&mesh.points, q2).abs();
+            for case in 0..2 {
+                let (qa, qb) = if case == 0 {
+                    ([p, q, u, r], [r, s, v, p])
+                } else {
+                    ([q, u, r, s], [s, v, p, q])
+                };
+                let (g1, g2) = if case == 0 { (p, r) } else { (q, s) };
+                let improves = interior_valence(u) > 4
+                    || interior_valence(v) > 4
+                    || interior_valence(g1) < 4
+                    || interior_valence(g2) < 4;
+                if !improves {
+                    continue;
+                }
+                let area = signed_quad_area(&mesh.points, qa).abs()
+                    + signed_quad_area(&mesh.points, qb).abs();
+                if (area - old_area).abs() > 1e-8 * old_area.max(1.0) {
+                    continue;
+                }
+                if !quad_gate_ok(&mesh.points, qa) || !quad_gate_ok(&mesh.points, qb) {
+                    continue;
+                }
+                let old_cost = valence_cost(&valence, &boundary, u, v, g1, g2, false);
+                let new_cost = valence_cost(&valence, &boundary, u, v, g1, g2, true);
+                let gain = old_cost - new_cost;
+                if gain <= 0 {
+                    continue;
+                }
+                if best
+                    .as_ref()
+                    .map(|candidate| gain > candidate.4)
+                    .unwrap_or(true)
+                {
+                    best = Some((owners[0], owners[1], qa, qb, gain));
+                }
+            }
+        }
+        let Some((first, second, qa, qb, _gain)) = best else {
+            break;
+        };
+        mesh.cells[first] = Cell::quad4(qa);
+        mesh.cells[second] = Cell::quad4(qb);
+    }
+}
+
+fn quad_ccw(points: &[Node], nodes: &[usize]) -> Option<[usize; 4]> {
+    if nodes.len() != 4 {
+        return None;
+    }
+    let mut q = [nodes[0], nodes[1], nodes[2], nodes[3]];
+    let area = signed_quad_area(points, q);
+    if area < 0.0 {
+        q.reverse();
+    }
+    if signed_quad_area(points, q).abs() < 1e-14 {
+        return None;
+    }
+    Some(q)
+}
+
+/// Rotate two CCW quads to `[u,v,p,q]` and `[v,u,r,s]`.
+fn shared_hexagon(
+    q1: [usize; 4],
+    q2: [usize; 4],
+) -> Option<(usize, usize, usize, usize, usize, usize)> {
+    for i in 0..4 {
+        let u = q1[i];
+        let v = q1[(i + 1) % 4];
+        for j in 0..4 {
+            if q2[j] == v && q2[(j + 1) % 4] == u {
+                let p = q1[(i + 2) % 4];
+                let q = q1[(i + 3) % 4];
+                let r = q2[(j + 2) % 4];
+                let s = q2[(j + 3) % 4];
+                return Some((u, v, p, q, r, s));
+            }
+        }
+    }
+    None
+}
+
+fn quad_gate_ok(points: &[Node], q: [usize; 4]) -> bool {
+    if signed_quad_area(points, q) <= 1e-12 {
+        return false;
+    }
+    let cell = Cell::quad4(q);
+    let sj = quality::scaled_jacobian(&cell, points);
+    if sj.iter().any(|&v| !v.is_finite() || v < 0.3) {
+        return false;
+    }
+    let angles = quality::quad_angles(&cell, points);
+    angles
+        .iter()
+        .all(|&a| a.is_finite() && (35.0..=160.0).contains(&a))
+}
+
+fn valence_cost(
+    valence: &[i32],
+    boundary: &[bool],
+    u: usize,
+    v: usize,
+    g1: usize,
+    g2: usize,
+    new: bool,
+) -> i32 {
+    let mut cost = 0;
+    for (k, &node) in [u, v, g1, g2].iter().enumerate() {
+        if boundary.get(node).copied().unwrap_or(true) {
+            continue;
+        }
+        let old = valence.get(node).copied().unwrap_or(4);
+        let delta = if !new {
+            0
+        } else if k < 2 {
+            -1
+        } else {
+            1
+        };
+        cost += (old + delta - 4).abs();
+    }
+    cost
+}
+
 // --------------------------------------------------------------------------- //
 // tests
 // --------------------------------------------------------------------------- //
@@ -1063,6 +1329,16 @@ mod tests {
         assert_eq!(gate.triangles, 0);
         assert!(gate.passes(), "{:?}", gate.reason());
         assert!(verify::boundary_offset(&domain, &mesh) < 1e-9);
+    }
+
+    #[test]
+    fn the_stats_split_the_quads_between_rows_and_core() {
+        let domain = Domain::rectangle(10.0, 10.0).unwrap();
+        let (mesh, stats) = mesh_with_stats(&domain, &Sizing::uniform(1.0).unwrap()).unwrap();
+        assert_eq!(stats.row_quads + stats.core_quads, mesh.cells.len());
+        assert!(stats.row_quads > 0);
+        assert!(stats.row_rounds > 0);
+        assert!(stats.row_share() > 0.0 && stats.row_share() < 100.0);
     }
 
     #[test]
