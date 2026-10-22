@@ -59,3 +59,5 @@ pub mod alt_l1;
 pub mod alt_decompose;
 
 pub mod alt_crossfield;
+
+pub mod config;

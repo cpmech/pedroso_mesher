@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::mesh::Mesh;
-use crate::smooth::{self, SmoothOutcome, SmoothOptions};
+use crate::smooth::{self, SmoothOptions, SmoothOutcome};
 use crate::stats::MeshStatistics;
 use crate::two_d::{Domain, Sizing};
 
@@ -68,7 +68,7 @@ impl Route {
 
 /// The configuration of one mesh generation: the route, its own options, and
 /// the shared smoothing stage.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MeshConfig {
     /// Which generator to run.
     pub route: Route,
@@ -82,23 +82,6 @@ pub struct MeshConfig {
     pub hybrid: crate::alt_hybrid::Options,
     pub untangle: crate::alt_untangle::Options,
     pub decompose: crate::alt_decompose::Options,
-}
-
-impl Default for MeshConfig {
-    fn default() -> Self {
-        Self {
-            route: Route::default(),
-            smoothing: SmoothOptions::default(),
-            quadtree: crate::alt_quadtree::Options::default(),
-            paving: crate::alt_paving::Options::default(),
-            bipartite: crate::alt_bipartite::Options::default(),
-            l1: crate::alt_l1::Options::default(),
-            crossfield: crate::alt_crossfield::Options::default(),
-            hybrid: crate::alt_hybrid::Options::default(),
-            untangle: crate::alt_untangle::Options::default(),
-            decompose: crate::alt_decompose::Options::default(),
-        }
-    }
 }
 
 impl MeshConfig {
@@ -278,7 +261,10 @@ mod tests {
         let text = MeshConfig::default().to_json();
         let back = MeshConfig::from_json(&text).unwrap();
         assert_eq!(back.route, MeshConfig::default().route);
-        assert_eq!(back.quadtree.cell_factor, MeshConfig::default().quadtree.cell_factor);
+        assert_eq!(
+            back.quadtree.cell_factor,
+            MeshConfig::default().quadtree.cell_factor
+        );
     }
 
     #[test]
@@ -287,7 +273,11 @@ mod tests {
         for route in Route::ALL {
             let config = MeshConfig::new(route);
             let out = generate(&domain, &sizing, &config).unwrap();
-            assert!(!out.mesh.cells.is_empty(), "{} produced no cells", route.name());
+            assert!(
+                !out.mesh.cells.is_empty(),
+                "{} produced no cells",
+                route.name()
+            );
             assert_eq!(out.route, route);
         }
     }

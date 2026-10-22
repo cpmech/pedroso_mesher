@@ -26,6 +26,10 @@ use crate::two_d::{smooth_mesh, triangulate, Domain, Sizing, TwoDError};
 use crate::twostage;
 use crate::verify::{self, Gate};
 
+pub use crate::config::{
+    generate_quad as mesh_quads_with_config, MeshConfig, MeshOutput, Route as Generator,
+};
+
 /// Which conversion stage feeds the pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
@@ -81,6 +85,8 @@ pub struct QuadMesh {
     pub timing: Timing,
     pub refusals: Refusals,
     pub route: Route,
+    /// The generator that produced the mesh (the conversion route stays `route`).
+    pub generator: crate::config::Route,
 }
 
 /// Why [`mesh_quads`] did not return a mesh: the measured result of a
@@ -257,6 +263,7 @@ pub fn mesh_quads_with_route(
         timing,
         refusals,
         route,
+        generator: crate::config::Route::Qmorph,
     })
 }
 

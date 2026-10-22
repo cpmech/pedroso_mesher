@@ -53,6 +53,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::mesh::{Cell, Kind, Mesh, Node};
 use crate::quad::{self, QuadError};
 use crate::two_d::{Domain, Sizing};
@@ -78,6 +80,30 @@ const MAX_SWAPS: usize = 600;
 /// not worth a quadratic time budget on a mesh the triangles already fail.
 const EVAL_BUDGET: usize = 1_500_000;
 
+/// Options for the untangle route.
+///
+/// The defaults are the measured constants of the route; changing a field only
+/// changes a loop bound or an evaluation cap, never the algorithm.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Options {
+    /// Rounds of coordinate search in each log-barrier untangling pass.
+    pub untangle_rounds: usize,
+    /// Upper bound on accepted interior edge swaps (at most one per round).
+    pub max_swaps: usize,
+    /// Deterministic cap on candidate evaluations in the two untangling passes.
+    pub eval_budget: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            untangle_rounds: UNTANGLE_ROUNDS,
+            max_swaps: MAX_SWAPS,
+            eval_budget: EVAL_BUDGET,
+        }
+    }
+}
+
 /// The measured result of one run: the product mesh and the improved mesh.
 pub struct Outcome {
     /// The mesh the product pipeline produced, before this pass (the raw row).
@@ -97,7 +123,16 @@ pub struct Outcome {
 /// Mesh a planar domain with the product pipeline, then untangle and reduce the
 /// singularities of the result.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
-    Ok(mesh_with_outcome(domain, sizing)?.improved)
+    mesh_with_options(domain, sizing, &Options::default())
+}
+
+/// [`mesh`] with explicit route options.
+pub fn mesh_with_options(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<Mesh, String> {
+    Ok(mesh_with_outcome_options(domain, sizing, options)?.improved)
 }
 
 /// [`mesh`], also returning the product mesh it started from and the counters.
@@ -105,6 +140,15 @@ pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
 /// The example uses this to print the raw (product) and post (improved) rows
 /// from one run of the product pipeline.
 pub fn mesh_with_outcome(domain: &Domain, sizing: &Sizing) -> Result<Outcome, String> {
+    mesh_with_outcome_options(domain, sizing, &Options::default())
+}
+
+/// [`mesh_with_outcome`] with explicit route options.
+pub fn mesh_with_outcome_options(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<Outcome, String> {
     let t0 = std::time::Instant::now();
     let raw = product_mesh(domain, sizing)?;
     let base_secs = t0.elapsed().as_secs_f64();
@@ -115,13 +159,13 @@ pub fn mesh_with_outcome(domain: &Domain, sizing: &Sizing) -> Result<Outcome, St
     let mut best_key = mesh_key(&best);
 
     // 1. Log-barrier untangling.
-    let first = untangle(domain, &best, size);
+    let first = untangle(domain, &best, size, options);
     consider(&mut best, &mut best_key, first);
     // 2. Valence-driven edge swaps plus the degenerate-corner repair.
-    let swapped = reduce_singularities(&best);
+    let swapped = reduce_singularities(&best, options);
     consider(&mut best, &mut best_key, swapped);
     // 3. Polish the quads the swaps created (a shorter second barrier pass).
-    let polish = untangle(domain, &best, size);
+    let polish = untangle(domain, &best, size, options);
     consider(&mut best, &mut best_key, polish);
 
     let improve_secs = t1.elapsed().as_secs_f64();
@@ -617,7 +661,7 @@ fn candidate_key(local: Local) -> (u8, OrderedF64) {
     (u8::from(local.valid), OrderedF64(local.objective))
 }
 
-fn untangle(domain: &Domain, mesh: &Mesh, size: f64) -> Mesh {
+fn untangle(domain: &Domain, mesh: &Mesh, size: f64, options: &Options) -> Mesh {
     let (quads, tris) = cells(mesh);
     let n = mesh.points.len();
     if quads.is_empty() || n == 0 {
@@ -672,7 +716,7 @@ fn untangle(domain: &Domain, mesh: &Mesh, size: f64) -> Mesh {
     let mut points = mesh.points.clone();
     let mut evaluations = 0usize;
     let mut exhausted = false;
-    for _round in 0..UNTANGLE_ROUNDS {
+    for _round in 0..options.untangle_rounds {
         let mut moved = false;
         for &v in &nodes {
             let Some(list) = incident_quads.get(v) else {
@@ -740,7 +784,7 @@ fn untangle(domain: &Domain, mesh: &Mesh, size: f64) -> Mesh {
             }
             let mut best: Option<((u8, OrderedF64), [f64; 2])> = None;
             for candidate in candidates {
-                if evaluations >= EVAL_BUDGET {
+                if evaluations >= options.eval_budget {
                     exhausted = true;
                     break;
                 }
@@ -828,7 +872,7 @@ struct Swap {
 /// positively oriented, at least 0.2 in corner Jacobian and 30 deg in corner
 /// angle, and must not recreate an existing edge. The gate is recomputed after
 /// each swap and a regression is rolled back.
-fn reduce_singularities(mesh: &Mesh) -> Mesh {
+fn reduce_singularities(mesh: &Mesh, options: &Options) -> Mesh {
     let (mut quads, tris) = cells(mesh);
     let n = mesh.points.len();
     if quads.is_empty() || n == 0 {
@@ -842,7 +886,7 @@ fn reduce_singularities(mesh: &Mesh) -> Mesh {
     let mut defect = valence_defect(mesh);
     let gate_floor = SJ_FLOOR - 1.0e-9;
 
-    for _ in 0..MAX_SWAPS {
+    for _ in 0..options.max_swaps {
         let swap = match best_swap(points, &quads, &tris, &baseline_gate) {
             Some(s) => s,
             None => break,
@@ -1145,7 +1189,7 @@ mod tests {
             verify::gate(&mesh).inverted > 0,
             "the test patch must start inverted"
         );
-        let out = untangle(&rectangle(3.0, 3.0), &mesh, 1.0);
+        let out = untangle(&rectangle(3.0, 3.0), &mesh, 1.0, &Options::default());
         let g = verify::gate(&out);
         assert_eq!(g.inverted, 0, "{:?}", g.reason());
         assert_eq!(g.cracks, 0);
@@ -1158,9 +1202,9 @@ mod tests {
         let quads = grid_quads(3, 3);
         let mesh = Mesh::new(points.clone(), cells_of(&quads, &[]));
         let domain = rectangle(3.0, 3.0);
-        let after = untangle(&domain, &mesh, 1.0);
+        let after = untangle(&domain, &mesh, 1.0, &Options::default());
         assert_eq!(after.points, points, "a regular mesh has no active node");
-        let after_swaps = reduce_singularities(&mesh);
+        let after_swaps = reduce_singularities(&mesh, &Options::default());
         assert_eq!(after_swaps.points, points);
         assert_eq!(after_swaps.cells.len(), mesh.cells.len());
         assert!(verify::gate(&after_swaps).passes());
@@ -1182,7 +1226,7 @@ mod tests {
         }
         let cells: Vec<Cell> = tris.iter().map(|t| Cell::tri3(*t)).collect();
         let mesh = Mesh::new(points, cells);
-        let out = untangle(&domain, &mesh, 2.0);
+        let out = untangle(&domain, &mesh, 2.0, &Options::default());
         let offset = verify::boundary_offset(&domain, &out);
         assert!(
             offset < 1.0e-9,
@@ -1220,7 +1264,7 @@ mod tests {
         let (regular_before, defect_before) = valence_quality(&mesh);
         assert_eq!(regular_before, 0);
         assert_eq!(defect_before, 1);
-        let out = reduce_singularities(&mesh);
+        let out = reduce_singularities(&mesh, &Options::default());
         let (regular_after, defect_after) = valence_quality(&out);
         assert_eq!(defect_after, 0);
         assert_eq!(regular_after, 1);
@@ -1238,6 +1282,25 @@ mod tests {
         assert!(mesh.cells.iter().all(|c| c.kind == Kind::Quad4));
         let g = verify::gate(&mesh);
         assert!(g.passes(), "{:?}", g.reason());
+        assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
+    }
+
+    #[test]
+    fn non_default_options_still_produce_a_valid_mesh() {
+        let domain = rectangle(8.0, 8.0);
+        let sizing = Sizing::uniform(1.0).unwrap();
+        let options = Options {
+            untangle_rounds: 4,
+            max_swaps: 50,
+            eval_budget: 250_000,
+        };
+        let mesh = mesh_with_options(&domain, &sizing, &options).unwrap();
+        assert!(mesh
+            .cells
+            .iter()
+            .all(|c| matches!(c.kind, Kind::Quad4 | Kind::Tri3)));
+        let g = verify::gate(&mesh);
+        assert_eq!(g.cracks, 0, "{:?}", g.reason());
         assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
     }
 }
