@@ -21,9 +21,10 @@
 //! shipped `two_d::mesh_2d` still calls `pair_triangles` with its own guards.
 //!
 //! **Measured, 2026-10-22: this route does not beat the shipped one.** The guard
-//! costs 3–10 % of the quads, and the remainder it protects is a set of thin
-//! sliver components whose two-triangle unions are non-convex, so the matcher
-//! pairs only 12–25 % of them. See the record for the table.
+//! moves coverage by −3 % to +6 % (it is not monotone), and the remainder it
+//! protects is a set of thin sliver components whose two-triangle unions are
+//! non-convex, so the matcher pairs only 20–35 % of them. See the record for the
+//! table.
 
 use std::collections::{HashMap, HashSet};
 
