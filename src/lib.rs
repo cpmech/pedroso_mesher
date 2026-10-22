@@ -61,3 +61,5 @@ pub mod alt_decompose;
 pub mod alt_crossfield;
 
 pub mod config;
+
+pub mod simons_channel;
