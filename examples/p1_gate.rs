@@ -53,8 +53,20 @@ fn stepped() -> Domain {
 }
 
 fn run(name: &str, d: &Domain, size: f64) {
+    run_with(name, d, size, false);
+}
+
+fn run_all_quad(name: &str, d: &Domain, size: f64) {
+    run_with(name, d, size, true);
+}
+
+fn run_with(name: &str, d: &Domain, size: f64, all_quad: bool) {
     let t = std::time::Instant::now();
-    let r = match mesh_2d(d, &Sizing::uniform(size).unwrap()) {
+    let mut sizing = Sizing::uniform(size).unwrap();
+    if all_quad {
+        sizing = sizing.all_quad();
+    }
+    let r = match mesh_2d(d, &sizing) {
         Ok(r) => r,
         Err(e) => {
             println!("{name:16} size {size:4}  ERROR {e}");
@@ -93,4 +105,15 @@ fn main() {
     run("l-bracket-2d", &l_bracket(), 2.0);
     run("ring-section", &ring(), 1.0);
     run("stepped-2d", &stepped(), 1.0);
+    println!("--- all-quad mode ---");
+    for (size, segments) in [(4.0, 16), (2.0, 24), (1.0, 48)] {
+        run_all_quad(
+            "plate-hole",
+            &Domain::plate_with_hole(100.0, 60.0, 10.0, segments).unwrap(),
+            size,
+        );
+    }
+    run_all_quad("l-bracket-2d", &l_bracket(), 2.0);
+    run_all_quad("ring-section", &ring(), 1.0);
+    run_all_quad("stepped-2d", &stepped(), 1.0);
 }

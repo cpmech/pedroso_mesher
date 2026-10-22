@@ -36,35 +36,38 @@ Rust, MIT licensed. No GPL, LGPL or AGPL dependency, and no external binary.
 >   discretisation has to suit the size field**; the mesher cannot fix a boundary
 >   that is already too fine.
 >
-> **What is still missing: all-quad.** With the floors relaxed to 0.05 / 10° /
-> 160° the matching leaves 2–234 triangles unpaired (3–4 %); they are kept as
-> `Tri3` elements so the mesh stays watertight.
+> **All-quad is opt-in, and only partly works.** `Sizing::uniform(size).all_quad()`
+> runs a *conforming refinement cascade*: each leftover triangle has its three
+> edges split at the midpoints and is fanned into three quads around its
+> centroid; every quad that gains a hanging node is split across the midpoint of
+> its opposite edge, and that split propagates until it reaches the boundary.
 >
-> Three closure designs have now been implemented and rejected, and the third
-> attempt explains why the problem is hard:
+> It is correct and safe — every closed component is checked for dangling edges
+> and the whole result is verified before it is returned — but it rarely
+> finishes:
 >
-> 1. **Pentagon split** (triangle + adjacent quad + interior point → two quads):
->    lost elements through a bookkeeping error, and once fixed still left cracks
->    by consuming a quad that bordered a second leftover triangle.
-> 2. **Pocket fan** (a connected pocket of leftovers, an even polygon, fanned
->    into `n/2` quads around one interior point): correct, but nearly useless.
->    The leftovers are *isolated single triangles*: across the six parts the
->    matcher leaves 423 pockets of size one — and a triangle is an odd polygon.
-> 3. **The parity wall.** An odd polygon cannot be quadrangulated round one
->    interior point: with a fan, the centre ends up on the boundary. Adding an
->    adjacent quad makes it worse (odd + 2 is still odd), and splitting a
->    neighbouring quad at the new edge midpoint puts a 180° corner in the quad,
->    which is degenerate. The clean fix is a *conforming refinement cascade*
->    (triangle → three quads, each neighbour quad split at the midpoint of its
->    opposite edge, propagating until a boundary), or edge flips in the
->    triangulation before matching as Blossom-Quad does. Both change the
->    triangulation; no post-hoc polygon surgery can do it.
+> | Part | default (quads / tri) | `all_quad` |
+> |---|---|---|
+> | plate-hole 4 mm | 301 / 2 | **340 / 0** |
+> | plate-hole 2 mm | 1301 / 34 | 1324 / 33 |
+> | plate-hole 1 mm | 5132 / 234 | 5132 / 234 |
+> | l-bracket 2 mm | 561 / 34 | 673 / 30 |
+> | ring 1 mm | 251 / 46 | 251 / 46 |
+> | stepped 1 mm | 1910 / 168 | 2011 / 166 |
 >
-> Whether it is worth it is now a measured question rather than a guess: the FEM
-> accuracy check showed that quad quality in the 9–32° range moves the stress
-> concentration by ~4 %, the order of the reference's own uncertainty, and that
-> resolution dominates. The triangles are a *robustness* concern (a sliver on the
-> stress path), not an accuracy one at this level.
+> **Why the wall, part two.** The leftovers cluster: a cascade from one triangle
+> very quickly reaches an edge that belongs to a triangle it is *not* closing,
+> and splitting that edge would leave the other triangle with an edge nothing
+> else has — a T-junction. Protecting those edges is necessary for validity and
+> fatal for coverage. Closing a neighbourhood of leftover triangles together
+> would help, but the cascade's chains then grow again (the 4 mm case costs +12 %
+> elements; uncapped, the 1 mm case costs +219 %).
+>
+> The honest conclusion after three designs: **all-quad cannot be reached by
+> post-processing the matching result.** It needs the leftovers not to exist —
+> edge flips before matching, as Blossom-Quad does — or a quad-first mesher
+> (paving). Both are P2 work, and the FEM check says the triangles are not
+> costing accuracy, so the default stays quad-dominant.
 
 ## What P0 provides
 

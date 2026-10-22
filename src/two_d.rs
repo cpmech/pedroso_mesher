@@ -188,6 +188,15 @@ fn point_segment_distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
 #[derive(Clone, Copy, Debug)]
 pub struct Sizing {
     pub size: f64,
+    /// Close every leftover triangle by a conforming refinement cascade.
+    ///
+    /// Off by default: the cascade is exact but expensive — the split of a
+    /// triangle's edge has to propagate through the quads until it reaches a
+    /// boundary, so the chain grows with the mesh. Measured on the corpus: +12 %
+    /// elements at 4 mm, +219 % at 1 mm, with the thinnest quads roughly halved
+    /// in quality. The triangles it removes cost accuracy only if a sliver lands
+    /// on the stress path (see the FEM check in the README).
+    pub all_quad: bool,
 }
 
 impl Sizing {
@@ -197,7 +206,16 @@ impl Sizing {
                 "the element size must be positive and finite",
             ));
         }
-        Ok(Sizing { size })
+        Ok(Sizing {
+            size,
+            all_quad: false,
+        })
+    }
+
+    /// Ask for a mesh with no triangles, at the cost of local refinement.
+    pub fn all_quad(mut self) -> Self {
+        self.all_quad = true;
+        self
     }
 
     pub fn size_at(&self, _p: [f64; 2]) -> f64 {
@@ -237,6 +255,10 @@ pub struct TwoDResult {
     pub unpaired: Vec<[usize; 3]>,
     pub stats: TwoDStats,
 }
+
+/// Longest cascade allowed for one triangle. Beyond this the triangle is kept:
+/// a chain that crosses the whole mesh costs more than the triangle it removes.
+const MAX_CASCADE_STEPS: usize = 64;
 
 /// Smoothing passes after closure.
 const SMOOTHING_ITERATIONS: usize = 80;
@@ -364,16 +386,33 @@ pub fn mesh_2d(domain: &Domain, sizing: &Sizing) -> Result<TwoDResult, TwoDError
     }
 
     let (quads, unpaired) = pair_triangles(&tris, &points);
+    let base_quads = quads.len();
+    // Close the leftovers by refinement when asked. A triangle that cannot be
+    // closed is kept as a triangle rather than half-modified.
+    let (quads, points, leftover) = if sizing.all_quad {
+        let (q, p, left) = close_by_refinement(&quads, &unpaired, &points, domain);
+        // The cascade can leave a T-junction where a midpoint lands on the domain
+        // boundary. Verify before trusting it: an invalid "all-quad" mesh is
+        // worse than an honest quad-dominant one.
+        let candidate = build_mesh(&points, &q, &left);
+        let topo = candidate.topology();
+        if topo.cracks == 0 && topo.inconsistent == 0 && topo.non_manifold == 0 {
+            (q, p, left)
+        } else {
+            (quads, points.clone(), unpaired.clone())
+        }
+    } else {
+        (quads, points.clone(), unpaired.clone())
+    };
     let stats = TwoDStats {
         points: points.len(),
         triangles: tris.len(),
         quads: quads.len(),
-        unpaired_triangles: unpaired.len(),
-        absorbed_triangles: 0,
+        unpaired_triangles: leftover.len(),
+        absorbed_triangles: quads.len().saturating_sub(base_quads),
     };
     // Leftover triangles stay in the mesh as triangles: dropping them would
     // leave a hole, which is worse than a quad-dominant result.
-    let leftover = unpaired;
     let mut cells: Vec<Cell> = quads.into_iter().map(Cell::quad4).collect();
     cells.extend(leftover.iter().map(|t| Cell::tri3(*t)));
     let mut mesh = Mesh::new(points, cells);
@@ -383,6 +422,13 @@ pub fn mesh_2d(domain: &Domain, sizing: &Sizing) -> Result<TwoDResult, TwoDError
         unpaired: Vec::new(),
         stats,
     })
+}
+
+/// Assemble a mesh from quads plus leftover triangles.
+fn build_mesh(points: &[Node], quads: &[[usize; 4]], leftover: &[[usize; 3]]) -> Mesh {
+    let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
+    cells.extend(leftover.iter().map(|t| Cell::tri3(*t)));
+    Mesh::new(points.to_vec(), cells)
 }
 
 /// Smooth nodes to raise the smallest corner angle without losing Jacobian.
@@ -732,7 +778,327 @@ fn pair_triangles(tris: &[[usize; 3]], points: &[Node]) -> (Vec<[usize; 4]>, Vec
     (quads, unpaired)
 }
 
-/// Build the quad from two triangles that share an edge.
+/// Strictly convex, counter-clockwise and non-degenerate.
+fn convex_ccw(q: &[[f64; 2]; 4]) -> bool {
+    let mut area = 0.0;
+    for i in 0..4 {
+        let a = q[i];
+        let b = q[(i + 1) % 4];
+        area += a[0] * b[1] - b[0] * a[1];
+    }
+    if area <= 1e-12 {
+        return false;
+    }
+    (0..4).all(|i| {
+        let a = q[(i + 3) % 4];
+        let b = q[i];
+        let c = q[(i + 1) % 4];
+        let u = [b[0] - a[0], b[1] - a[1]];
+        let v = [c[0] - b[0], c[1] - b[1]];
+        u[0] * v[1] - u[1] * v[0] > 0.0
+    })
+}
+
+/// The quality contract's scaled Jacobian, for a quad given as coordinates.
+fn quad_min_sj(q: &[[f64; 2]; 4]) -> f64 {
+    let pts: Vec<Node> = q.iter().map(|p| [p[0], p[1], 0.0]).collect();
+    let cell = Cell::quad4([0, 1, 2, 3]);
+    quality::scaled_jacobian(&cell, &pts)
+        .into_iter()
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Close leftover triangles by a conforming refinement cascade.
+///
+/// A triangle is an odd polygon: it cannot become quads without adding a vertex
+/// on its boundary. Splitting its three edges at their midpoints and joining
+/// them to the centroid gives three quads, but each midpoint is then a *hanging
+/// node* on the quad across that edge. That quad is split by joining the hanging
+/// node to the midpoint of its opposite edge, which creates a new hanging node
+/// further out, and the split propagates until it reaches the domain boundary,
+/// where a midpoint is simply a new boundary point.
+///
+/// Each triangle is attempted on its own copy: one that cannot be closed (a
+/// cycle, a split that would degenerate, a quad collecting three hanging nodes)
+/// is left as a triangle and reported, instead of sinking the whole mesh.
+fn close_by_refinement(
+    quads: &[[usize; 4]],
+    unpaired: &[[usize; 3]],
+    points: &[Node],
+    domain: &Domain,
+) -> (Vec<[usize; 4]>, Vec<Node>, Vec<[usize; 3]>) {
+    let mut out_quads = quads.to_vec();
+    let mut out_points = points.to_vec();
+    let mut leftover = Vec::new();
+
+    // Leftover triangles that share an edge must be closed together or not at
+    // all: closing one splits the shared edge, which would leave the other with
+    // an edge nothing else has — a crack.
+    let components = leftover_components(unpaired);
+    let mut remaining: Vec<[usize; 3]> = unpaired.to_vec();
+    let mut edges_of: Vec<std::collections::HashSet<(usize, usize)>> = Vec::new();
+    for component in &components {
+        let mut set = std::collections::HashSet::new();
+        for tri in component {
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                set.insert((a.min(b), a.max(b)));
+            }
+        }
+        edges_of.push(set);
+    }
+    for (index, component) in components.into_iter().enumerate() {
+        // edges of the triangles we are *not* closing: splitting one would leave
+        // that triangle with an edge nothing else has
+        let mut protected: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+        for (other, set) in edges_of.iter().enumerate() {
+            if other != index {
+                protected.extend(set.iter().copied());
+            }
+        }
+        let mut quads = out_quads.clone();
+        let mut pts = out_points.clone();
+        let mut ok = true;
+        for tri in &component {
+            match close_one(&quads, &pts, tri, &protected) {
+                Some((q, p)) => {
+                    quads = q;
+                    pts = p;
+                }
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && no_dangling_edges(&quads, &remaining, &component, &pts, domain) {
+            out_quads = quads;
+            out_points = pts;
+            remaining.retain(|t| !component.contains(t));
+        } else {
+            leftover.extend(component);
+        }
+    }
+    (out_quads, out_points, leftover)
+}
+
+/// True when no edge of the mesh is used exactly once off the domain boundary.
+///
+/// A cascade that splits an edge only one of the two cells sees leaves a
+/// T-junction: the edge is used once inside the domain, which is what this
+/// checks for. Boundary edges are legitimately used once.
+fn no_dangling_edges(
+    quads: &[[usize; 4]],
+    remaining: &[[usize; 3]],
+    component: &[[usize; 3]],
+    points: &[Node],
+    domain: &Domain,
+) -> bool {
+    let mut count: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+    for q in quads {
+        for i in 0..4 {
+            let (a, b) = (q[i], q[(i + 1) % 4]);
+            *count.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    for t in remaining.iter().filter(|t| !component.contains(t)) {
+        for i in 0..3 {
+            let (a, b) = (t[i], t[(i + 1) % 3]);
+            *count.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    for (&(a, b), &n) in &count {
+        if n == 2 {
+            continue;
+        }
+        let on_boundary = |v: usize| {
+            let p = [points[v][0], points[v][1]];
+            domain.distance_to_boundary(p) < 1e-9
+        };
+        if n == 1 && on_boundary(a) && on_boundary(b) {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// Groups of leftover triangles connected through shared edges.
+fn leftover_components(unpaired: &[[usize; 3]]) -> Vec<Vec<[usize; 3]>> {
+    let mut edge_owner: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+    let mut parent: Vec<usize> = (0..unpaired.len()).collect();
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for (i, tri) in unpaired.iter().enumerate() {
+        for k in 0..3 {
+            let (a, b) = (tri[k], tri[(k + 1) % 3]);
+            let key = (a.min(b), a.max(b));
+            if let Some(&other) = edge_owner.get(&key) {
+                let (ri, ro) = (find(&mut parent, i), find(&mut parent, other));
+                if ri != ro {
+                    parent[ri] = ro;
+                }
+            } else {
+                edge_owner.insert(key, i);
+            }
+        }
+    }
+    let mut groups: std::collections::HashMap<usize, Vec<[usize; 3]>> =
+        std::collections::HashMap::new();
+    for i in 0..unpaired.len() {
+        let root = find(&mut parent, i);
+        groups.entry(root).or_default().push(unpaired[i]);
+    }
+    groups.into_values().collect()
+}
+
+/// The cascade for one triangle, or `None` if it cannot be completed.
+///
+/// It is driven by *edges*: split an edge, and every quad that owns it gains a
+/// hanging node and must be split across its opposite edge, which enqueues that
+/// edge in turn. Each edge splits once and each quad splits once, so it ends.
+fn close_one(
+    quads: &[[usize; 4]],
+    points: &[Node],
+    tri: &[usize; 3],
+    protected: &std::collections::HashSet<(usize, usize)>,
+) -> Option<(Vec<[usize; 4]>, Vec<Node>)> {
+    let mut pts = points.to_vec();
+    let mut cells: Vec<Vec<usize>> = quads.iter().map(|q| q.to_vec()).collect();
+    let tri_cell = cells.len();
+    cells.push(tri.to_vec());
+
+    let mut mids: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+    let mut split: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut queue: Vec<(usize, usize)> = (0..3).map(|i| (tri[i], tri[(i + 1) % 3])).collect();
+    let mut steps = 0usize;
+
+    while let Some((a, b)) = queue.pop() {
+        steps += 1;
+        if steps > MAX_CASCADE_STEPS {
+            return None; // too expensive: keep the triangle
+        }
+        if protected.contains(&(a.min(b), a.max(b))) {
+            return None; // belongs to a triangle we are not closing
+        }
+        let m = midpoint(&mut pts, &mut mids, a, b);
+        let owners: Vec<usize> = (0..cells.len())
+            .filter(|&i| cells[i].len() == 4 && has_edge(&cells[i], a, b))
+            .collect();
+        for c in owners {
+            if !split.insert(c) {
+                continue;
+            }
+            let q = cells[c].clone();
+            let position = (0..4).find(|&i| {
+                let (x, y) = (q[i], q[(i + 1) % 4]);
+                (x.min(y), x.max(y)) == (a.min(b), a.max(b))
+            })?;
+            let (p0, p1, p2, p3) = (
+                q[position],
+                q[(position + 1) % 4],
+                q[(position + 2) % 4],
+                q[(position + 3) % 4],
+            );
+            if protected.contains(&(p2.min(p3), p2.max(p3))) {
+                return None;
+            }
+            let m2 = midpoint(&mut pts, &mut mids, p2, p3);
+            let two = [[p0, m, m2, p3], [m, p1, p2, m2]];
+            if !two.iter().all(|x| valid_quad(x, &pts)) {
+                return None;
+            }
+            cells[c] = two[0].to_vec();
+            cells.push(two[1].to_vec());
+            // the opposite edge is now split, so its neighbour must follow
+            queue.push((p2, p3));
+        }
+    }
+
+    // now the triangle: three quads around its centroid, using the midpoints the
+    // cascade put on its edges
+    let mut m = [0usize; 3];
+    for i in 0..3 {
+        let key = (tri[i].min(tri[(i + 1) % 3]), tri[i].max(tri[(i + 1) % 3]));
+        m[i] = *mids.get(&key)?;
+    }
+    let c = [
+        (pts[tri[0]][0] + pts[tri[1]][0] + pts[tri[2]][0]) / 3.0,
+        (pts[tri[0]][1] + pts[tri[1]][1] + pts[tri[2]][1]) / 3.0,
+    ];
+    pts.push([c[0], c[1], 0.0]);
+    let centre = pts.len() - 1;
+    let fan = [
+        [tri[0], m[0], centre, m[2]],
+        [tri[1], m[1], centre, m[0]],
+        [tri[2], m[2], centre, m[1]],
+    ];
+    if !fan.iter().all(|q| valid_quad(q, &pts)) {
+        return None;
+    }
+    cells[tri_cell] = fan[0].to_vec();
+    cells.push(fan[1].to_vec());
+    cells.push(fan[2].to_vec());
+
+    if cells.iter().any(|c| c.len() != 4) {
+        return None;
+    }
+    Some((
+        cells.iter().map(|c| [c[0], c[1], c[2], c[3]]).collect(),
+        pts,
+    ))
+}
+
+fn has_edge(cell: &[usize], a: usize, b: usize) -> bool {
+    (0..cell.len()).any(|i| {
+        let (x, y) = (cell[i], cell[(i + 1) % cell.len()]);
+        (x.min(y), x.max(y)) == (a.min(b), a.max(b))
+    })
+}
+
+fn midpoint(
+    pts: &mut Vec<Node>,
+    mids: &mut std::collections::HashMap<(usize, usize), usize>,
+    a: usize,
+    b: usize,
+) -> usize {
+    let key = (a.min(b), a.max(b));
+    if let Some(&m) = mids.get(&key) {
+        return m;
+    }
+    let p = [
+        0.5 * (pts[a][0] + pts[b][0]),
+        0.5 * (pts[a][1] + pts[b][1]),
+        0.0,
+    ];
+    pts.push(p);
+    let id = pts.len() - 1;
+    mids.insert(key, id);
+    id
+}
+
+fn valid_quad(q: &[usize; 4], pts: &[Node]) -> bool {
+    let coords = [
+        [pts[q[0]][0], pts[q[0]][1]],
+        [pts[q[1]][0], pts[q[1]][1]],
+        [pts[q[2]][0], pts[q[2]][1]],
+        [pts[q[3]][0], pts[q[3]][1]],
+    ];
+    convex_ccw(&coords) && quad_min_sj(&coords) > 0.02
+}
+
+/// Split a quad that has two hanging edges: opposite edges give two quads
+/// directly, adjacent edges give three quads around a centroid.
+/// Build the quad from two triangles that share an edge./// Build the quad from two triangles that share an edge.
 ///
 /// The shared edge must be taken in each triangle's own winding: triangle `a`
 /// traverses it one way, triangle `b` the other. Walking the *sorted* edge
@@ -842,6 +1208,32 @@ mod tests {
             let nodes: [usize; 4] = cell.nodes.as_slice().try_into().unwrap();
             assert!(is_convex_ccw(&nodes, &r.mesh.points), "{nodes:?}");
         }
+    }
+
+    #[test]
+    fn all_quad_mode_leaves_no_triangles_where_it_can_afford_it() {
+        // The 4 mm plate is small enough that every cascade finishes: the result
+        // has no triangles at all, and is still watertight.
+        let d = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
+        let r = mesh_2d(&d, &Sizing::uniform(4.0).unwrap().all_quad()).unwrap();
+        assert_eq!(r.stats.unpaired_triangles, 0, "{:?}", r.stats);
+        assert!(r.mesh.cells.iter().all(|c| c.kind == Kind::Quad4));
+        let topo = r.mesh.topology();
+        assert_eq!(topo.cracks, 0, "the cascade left a hole");
+        assert_eq!(topo.inconsistent, 0);
+        assert_eq!(topo.non_manifold, 0);
+    }
+
+    #[test]
+    fn all_quad_mode_is_watertight_on_a_fine_plate_too() {
+        // Fewer triangles close here (chains hit the step cap), but whatever is
+        // left is kept and the mesh must stay watertight.
+        let d = Domain::plate_with_hole(100.0, 60.0, 10.0, 24).unwrap();
+        let r = mesh_2d(&d, &Sizing::uniform(2.0).unwrap().all_quad()).unwrap();
+        let topo = r.mesh.topology();
+        assert_eq!(topo.cracks, 0);
+        let tris = r.mesh.cells.iter().filter(|c| c.kind == Kind::Tri3).count();
+        assert_eq!(tris, r.stats.unpaired_triangles);
     }
 
     #[test]
