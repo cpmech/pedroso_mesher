@@ -21,6 +21,7 @@ pub mod bench;
 pub mod io;
 pub mod mesh;
 pub mod msh;
+pub mod qmorph;
 pub mod quadify;
 pub mod quality;
 pub mod recovery;
