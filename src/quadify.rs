@@ -267,21 +267,6 @@ fn shape_score(points: &[Node], a: usize, b: usize, d: usize, c: usize) -> f64 {
     worst
 }
 
-fn neighbours(tris: &[[usize; 3]], alive: &[bool], v: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    for (i, t) in tris.iter().enumerate() {
-        if !alive[i] || !t.contains(&v) {
-            continue;
-        }
-        for &u in t {
-            if u != v && !out.contains(&u) {
-                out.push(u);
-            }
-        }
-    }
-    out
-}
-
 fn has_edge(tris: &[[usize; 3]], alive: &[bool], a: usize, b: usize) -> bool {
     tris.iter().enumerate().any(|(i, t)| {
         alive[i]

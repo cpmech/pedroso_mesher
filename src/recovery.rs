@@ -114,48 +114,7 @@ pub fn has_edge(tris: &[Tri], a: usize, b: usize) -> bool {
 }
 
 /// An edge that the open segment `a..b` crosses, chosen deterministically.
-fn first_crossing(tris: &[Tri], points: &[Node], a: usize, b: usize) -> Option<(usize, usize)> {
-    let p = points[a];
-    let q = points[b];
-    for t in tris {
-        for i in 0..3 {
-            let (u, v) = (t[i], t[(i + 1) % 3]);
-            if u == a || u == b || v == a || v == b {
-                continue;
-            }
-            if segments_cross(p, q, points[u], points[v]) {
-                return Some((u, v));
-            }
-        }
-    }
-    None
-}
-
 /// Flip edge `(u, v)` when its two triangles form a convex quadrilateral.
-fn flip_edge(tris: &mut [Tri], points: &[Node], u: usize, v: usize) -> bool {
-    let mut owners: Vec<usize> = (0..tris.len())
-        .filter(|&i| tris[i].contains(&u) && tris[i].contains(&v))
-        .collect();
-    if owners.len() != 2 {
-        return false;
-    }
-    let (p, q) = (apex(&tris[owners[0]], u, v), apex(&tris[owners[1]], u, v));
-    if p == q {
-        return false;
-    }
-    // the quad p-u-q-v must be convex: p and q on opposite sides of (u, v)
-    if side(points[u], points[v], points[p]) * side(points[u], points[v], points[q]) >= 0.0 {
-        return false;
-    }
-    if side(points[p], points[q], points[u]) * side(points[p], points[q], points[v]) >= 0.0 {
-        return false;
-    }
-    owners.sort_unstable();
-    tris[owners[0]] = [p, q, u];
-    tris[owners[1]] = [q, p, v];
-    true
-}
-
 fn apex(tri: &Tri, u: usize, v: usize) -> usize {
     *tri.iter()
         .find(|&&n| n != u && n != v)
