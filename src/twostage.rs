@@ -1,5 +1,12 @@
 //! Two-stage conversion: Q-Morph rows, then Blossom matching on the remainder.
 //!
+//! Stage 1 is the Q-Morph front of Owen et al. 1999 (corpus `owen-1999`), run
+//! with an **even-region guard**; stage 2 is the Blossom-Quad matching of
+//! Remacle et al. 2012 (corpus `remacle-2012`), reused from
+//! [`crate::two_d::pair_triangles_with`] with its own quality floor. This is an
+//! experimental conversion route; the shipped one is
+//! [`crate::two_d::mesh_2d`], which pairs the full triangulation.
+//!
 //! The hypothesis this module tests is in
 //! `Pedroso-Mesher-Handover-Next`: the last triangles left by the ordinary
 //! conversion survive because Q-Morph locks quads around a triangle before the
@@ -37,25 +44,39 @@ use crate::two_d::{pair_triangles_with, PairGuard};
 const MAX_MATCH_ROUNDS: usize = 8;
 
 /// Statistics of a two-stage conversion.
+///
+/// Counts are snapshots of the stages, not a conservation law: `front_quads` and
+/// `core_triangles` describe the state after stage 1, `matched_quads` and
+/// `unpaired` the state after stage 2. When `rejected_merge` is set, the matched
+/// quads are discarded and the stats still reflect the attempted merge, so
+/// `matched_quads` is reset to zero and `core_triangles` is restored.
 #[derive(Debug, Default, Clone)]
 pub struct TwoStageStats {
     /// Quads placed by the Q-Morph front.
     pub front_quads: usize,
+
     /// Triangles left for the matching stage.
     pub core_triangles: usize,
+
     /// Components of the remainder before matching (all even).
     pub core_components: usize,
+
     /// Quads produced by matching.
     pub matched_quads: usize,
+
     /// Interior edge flips tried to unblock a matching round.
     pub flips: usize,
+
     /// Triangles that matching could not pair.
     pub unpaired: usize,
+
     /// Matching rounds that ran.
     pub rounds: usize,
+
     /// Set when the merge failed the manifold/area validation and the front-only
     /// state was returned instead.
     pub rejected_merge: bool,
+
     /// Remainder triangles whose stored winding was reversed. The front's
     /// recovery flip writes both windings (see `qmorph::CellMesh::flip`), and a
     /// matcher needs one; they are normalised before pairing, not dropped.
@@ -63,15 +84,43 @@ pub struct TwoStageStats {
 }
 
 /// The result of a two-stage conversion.
+///
+/// `quads` and `triangles` are the final cells; `points` is the front's point
+/// set (matching never inserts a node), so every index in `quads`/`triangles`
+/// is valid for `points`.
 pub struct TwoStageResult {
+    /// The front's node set, in the XY plane; includes any placement insertion.
     pub points: Vec<Node>,
+
+    /// Front quads plus the quads the matcher committed, in that order.
     pub quads: Vec<[usize; 4]>,
+
+    /// Triangles the matcher could not pair (empty on a complete conversion).
     pub triangles: Vec<[usize; 3]>,
+
+    /// Stage counters; see [`TwoStageStats`].
     pub stats: TwoStageStats,
+
+    /// Q-Morph refusal counters from stage 1.
     pub refusals: Refusals,
 }
 
 /// Convert a triangle mesh into quads: Q-Morph front, then matching.
+///
+/// `size` is the target edge length in millimetres. The front runs with
+/// [`FrontStop::EvenComponents`], so every unconverted component it leaves has
+/// an even triangle count; the matcher then pairs the remainder under the guard
+/// `min SJ 0.05`, angles `[10, 160]` degrees. At most `MAX_MATCH_ROUNDS` rounds
+/// are attempted; a round either commits its pairs (when every triangle was
+/// paired) or flips edges around the unpaired ones and retries on the whole
+/// remainder.
+///
+/// # Postconditions
+///
+/// `points`, `quads` and `triangles` tile the input domain. When the merge
+/// validation fails, the function falls back to the front-only state
+/// (`stats.rejected_merge` is set, `stats.matched_quads` is zero and
+/// `triangles` is the front's remainder). The input slices are not modified.
 pub fn convert(tris: &[[usize; 3]], points: &[Node], size: f64) -> TwoStageResult {
     let front = qmorph::run_front(tris, points, size, FrontStop::EvenComponents);
     let mut stats = TwoStageStats {
@@ -83,6 +132,9 @@ pub fn convert(tris: &[[usize; 3]], points: &[Node], size: f64) -> TwoStageResul
     let mut quads = front.quads.clone();
     let mut region = front.triangles.clone();
     let points = front.points.clone();
+    // The front's recovery flip can leave a remainder triangle clockwise; the
+    // matcher (and `merge_is_valid`) assumes counter-clockwise. Normalise before
+    // pairing and count it — this is not a dropped triangle.
     stats.inverted_core = normalize_winding(&mut region, &points);
 
     // Pair the remainder greedily by rounds; a round that leaves triangles
@@ -100,6 +152,7 @@ pub fn convert(tris: &[[usize; 3]], points: &[Node], size: f64) -> TwoStageResul
         stats.rounds = round + 1;
         let (pairs, left) = pair_triangles_with(&region, &points, guard);
         if left.is_empty() {
+            // Perfect pairing: commit and stop. This is the all-quad exit.
             stats.matched_quads += pairs.len();
             matched.extend(pairs);
             region.clear();
@@ -157,6 +210,7 @@ fn normalize_winding(region: &mut [[usize; 3]], points: &[Node]) -> usize {
     fixed
 }
 
+/// Total absolute area of a triangle list, in square millimetres.
 fn triangle_area(tris: &[[usize; 3]], points: &[Node]) -> f64 {
     tris.iter()
         .map(|t| {
@@ -168,6 +222,7 @@ fn triangle_area(tris: &[[usize; 3]], points: &[Node]) -> f64 {
         .sum()
 }
 
+/// Absolute area of a quad, in square millimetres (shoelace, halved).
 fn quad_area(quad: &[usize; 4], points: &[Node]) -> f64 {
     let mut sum = 0.0;
     for i in 0..4 {
@@ -180,6 +235,12 @@ fn quad_area(quad: &[usize; 4], points: &[Node]) -> f64 {
 
 /// A quad and a triangle cell list must tile the same area they came from, and
 /// no two cells may share more than one edge.
+///
+/// The area tolerance is relative (`1e-6 * max(area, 1)`), so a large mesh is
+/// not rejected by accumulated rounding. The edge test detects two cells that
+/// overlap by sharing two edges; it deliberately does not require every interior
+/// edge to have two owners (the matcher's output is assumed to come from a
+/// triangulation that already tiles the region).
 fn merge_is_valid(
     quads: &[[usize; 4]],
     triangles: &[[usize; 3]],
@@ -228,6 +289,12 @@ fn merge_is_valid(
 /// interior to the unconverted region, so the quads around it are untouched and
 /// the mesh stays conforming. A flip is taken only when the two triangles form a
 /// convex quadrilateral (the other diagonal exists).
+///
+/// The two convexity calls check the same quadrilateral in opposite windings
+/// (`u-w-v-x` and its reverse `u-x-v-w`); a symmetric test of the two possible
+/// diagonals would need one of them reversed. At most one edge per triangle is
+/// flipped per call, and a triangle already flipped is skipped so the changes
+/// cannot conflict. Returns the number of flips applied.
 fn flip_around(region: &mut [[usize; 3]], unpaired: &[[usize; 3]], points: &[Node]) -> usize {
     let mut edge_to_tris: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
     for (id, t) in region.iter().enumerate() {

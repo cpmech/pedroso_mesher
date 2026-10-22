@@ -1,9 +1,12 @@
 //! Q-Morph: converting a triangle mesh into quads by advancing a front.
 //!
-//! This follows [[Pedroso-Mesher-W3-Design]]. Quads and triangles are cells of
-//! **one** mesh ([`CellMesh`]), so every operation — edge flip, node insertion,
-//! cell replacement — is expressed on one adjacency structure, and a flip can
-//! never cut through a quad that has already been placed.
+//! Implements the Q-Morph construction of Owen, Staten, Canann & Saigal (1999,
+//! "Q-Morph: an indirect approach to advancing front quad meshing"; corpus
+//! `owen-1999`). The module follows [[Pedroso-Mesher-W3-Design]] for the
+//! data-structure choices. Quads and triangles are cells of **one** mesh
+//! ([`CellMesh`]), so every operation — edge flip, node insertion, cell
+//! replacement — is expressed on one adjacency structure, and a flip can never
+//! cut through a quad that has already been placed.
 //!
 //! The front is the interface between the unconverted region and the meshed one.
 //! For a front edge `(a, b)` the procedure places two side nodes `c`, `d` at the
@@ -35,17 +38,30 @@
 //! Boundary loops are processed by ascending perimeter, so a hole's rows are
 //! laid before the outer loop's coarse rows reach it.
 //!
+//! **State machine.** `front_loop` repeatedly takes the front loops in
+//! ascending perimeter, tries the shortest edge of a loop, and restarts after a
+//! success. A refused edge is blocked until a quad touching one of its nodes is
+//! placed, which is rule 4. `try_quad` is the per-edge sequence: seed and
+//! orient the front triangle, find side nodes, pick and rank side pairs, recover
+//! the three unused sides, validate that the enclosed region is exactly the
+//! quad, optionally check the even-region guard, then commit. [`Refusals`]
+//! counts the refusing stage; a refusal is not an error, it is "try again after
+//! the front changes". Two hard stops bound a runaway front: `max_attempts`
+//! (200 per input triangle plus 10 000) and `max_triangles` (4 per input
+//! triangle plus 100).
+//!
 //! **Not implemented: the transition rules.** A front edge that disagrees with
 //! the field is not split or merged, and two fronts that meet are not stitched
 //! with a seam. The front fragments into small loops (many of them one
 //! triangle, three front edges) and those cannot be quadrangulated without
 //! changing the loop's parity. The leftover triangles are then handed to
-//! [`crate::sun::close_residuals`], Sun's residual-triangle walk with the
-//! boundary M2/M3 and M6 operations of Sun 2015 §5. On the six parts it closes
-//! plate-hole 4/2 mm and stepped completely (68→0, 292→0, 382→0) and leaves
-//! 2/3/6 triangles on plate-hole 1 mm, l-bracket and ring (962→2, 78→3,
-//! 64→6); those are isolated interior slivers that no pentagon recombination
-//! can move. The module documentation there records the geometric reason.
+//! [`crate::sun::close_residuals`], Sun et al.'s residual-triangle walk (corpus
+//! `sun-2015`, `sun-2016`) with the boundary M2/M3 and M6 operations of Sun
+//! 2015 §5. On the six parts it closes plate-hole 4/2 mm and stepped completely
+//! (68→0, 292→0, 382→0) and leaves 2/3/6 triangles on plate-hole 1 mm,
+//! l-bracket and ring (962→2, 78→3, 64→6); those are isolated interior slivers
+//! that no pentagon recombination can move. The module documentation there
+//! records the geometric reason.
 //!
 //! **The policy is not enforced by this code.** Nothing here refuses a run that
 //! ignores it; measure the mesh that came out with [`crate::verify::gate`].
@@ -55,13 +71,21 @@ use std::collections::{HashMap, HashSet};
 use crate::mesh::Node;
 
 /// A cell of the converting mesh: either a triangle or a quad.
+///
+/// The conversion replaces a group of live triangles by one quad; both kinds of
+/// cell stay in the same [`CellMesh`] so the front's adjacency always sees the
+/// quads that are already placed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cell {
+    /// An unconverted triangle, counter-clockwise.
     Tri([usize; 3]),
+
+    /// A placed quad, counter-clockwise.
     Quad([usize; 4]),
 }
 
 impl Cell {
+    /// Number of nodes of the cell (3 or 4).
     fn n_nodes(&self) -> usize {
         match self {
             Cell::Tri(_) => 3,
@@ -69,6 +93,7 @@ impl Cell {
         }
     }
 
+    /// The `i`-th node; `i` must be less than [`Cell::n_nodes`].
     fn node(&self, i: usize) -> usize {
         match self {
             Cell::Tri(t) => t[i],
@@ -82,46 +107,90 @@ impl Cell {
         (a.min(b), a.max(b))
     }
 
+    /// True for a triangle, false for a quad.
     fn is_tri(&self) -> bool {
         matches!(self, Cell::Tri(_))
     }
 }
 
 /// Reusable adjacency for [`CellMesh::front_loops`].
+///
+/// Kept across calls because rebuilding the vertex->edge map for every placed
+/// quad was the hottest part of the converter.
 #[derive(Default)]
 struct LoopScratch {
+    /// Edge ids incident to each vertex, for this call only; cleared at the end.
     at: Vec<Vec<usize>>,
+
+    /// Per-edge "already walked" flags, indexed like the sorted edge list.
     used: Vec<bool>,
 }
 
-/// Reusable marks for [`CellMesh::removing_fragments`].
+/// Reusable marks for [`CellMesh::removing_leaves_odd_component`] and
+/// [`CellMesh::live_tri_component_sizes`].
+///
+/// The stamp/generation pair avoids clearing a `Vec<bool>` over all cells for
+/// every candidate placement: a cell is marked when its stamp equals the current
+/// generation, and a generation wraps only after `u32::MAX` calls.
 #[derive(Default)]
 struct FragmentCheck {
+    /// Per-cell generation stamp; `stamp[id] == generation` means "already seen".
     stamp: Vec<u32>,
+
+    /// Current generation; incremented per call and reset on wrap-around.
     generation: u32,
+
+    /// DFS stack reused between components.
     stack: Vec<usize>,
 }
 
 /// A mesh whose cells are triangles and quads, with edge adjacency, a bucket
 /// index over edges (for recovery) and the current front.
+///
+/// Invariants maintained by `index_cell` / `unindex_cell`: every live cell
+/// appears exactly once in every edge list of its own edges; `front` is exactly
+/// the set of edges with one live triangle and at most one other (quad or no
+/// cell); `live_tris` equals the number of `Some(Cell::Tri(_))` cells; and
+/// `edge_buckets`/`node_edges` contain exactly the edges present in `edges`.
+/// A removed cell is `None`, not physically deleted, so ids stay stable.
 pub struct CellMesh {
+    /// All nodes in the XY plane (`z = 0`); placement may append to this.
     pub points: Vec<Node>,
+
+    /// Cells by id; `None` is a removed cell. Removed ids are never reused.
     pub cells: Vec<Option<Cell>>,
+
+    /// Edge key -> owning cell ids. An edge has at most two owners in a valid
+    /// mesh; a single owner is a front or domain-boundary edge.
     edges: HashMap<(usize, usize), Vec<usize>>,
+
     /// Bucket index over edges: recovery asks for the edges a segment crosses,
     /// and scanning the edge map for that is O(cells) per flip.
     edge_buckets: HashMap<(i64, i64), Vec<(usize, usize)>>,
+
+    /// Bucket side length, in millimetres; the size field, clamped to positive
+    /// at [`CellMesh::new`]. It also sets the insertion-spacing floor.
     bucket: f64,
+
     /// Edges at the interface between the converted and unconverted regions.
     front: HashSet<(usize, usize)>,
+
     /// Unconverted triangles still alive; kept as a counter so the runaway guard
     /// is O(1) rather than a scan of the cell list.
     live_tris: usize,
+
     /// Edges incident to each node, for side-edge definition by angle.
     node_edges: HashMap<usize, Vec<(usize, usize)>>,
 }
 
 impl CellMesh {
+    /// Build the converting mesh from an input triangulation.
+    ///
+    /// Every input triangle is a live cell and every edge is indexed; the front
+    /// starts as the domain boundary (edges with exactly one triangle and no
+    /// quad). `size` is the target edge length in millimetres and also sets the
+    /// edge-bucket size; a non-positive value is clamped to 1 there so the
+    /// bucket keys stay finite.
     pub fn new(points: &[Node], tris: &[[usize; 3]], size: f64) -> Self {
         let mut mesh = CellMesh {
             points: points.to_vec(),
@@ -142,6 +211,7 @@ impl CellMesh {
         mesh
     }
 
+    /// Integer bucket coordinate of `p` for [`CellMesh::edge_buckets`].
     fn bucket_key(&self, p: Node) -> (i64, i64) {
         (
             (p[0] / self.bucket).floor() as i64,
@@ -149,6 +219,13 @@ impl CellMesh {
         )
     }
 
+    /// Insert `edge` into every bucket its bounding box touches, and into the
+    /// two endpoints' node-edge lists.
+    ///
+    /// The edge is registered in all cells of the box (not just the endpoint
+    /// cells) because [`CellMesh::first_crossing`] scans a segment's whole
+    /// bounding box; over-registering is safe, missing an edge would make
+    /// recovery fail.
     fn add_edge_bucket(&mut self, edge: (usize, usize)) {
         let (a, b) = (self.points[edge.0], self.points[edge.1]);
         let (i0, j0) = self.bucket_key(a);
@@ -164,6 +241,7 @@ impl CellMesh {
         self.node_edges.entry(edge.1).or_default().push(edge);
     }
 
+    /// Remove `edge` from the same buckets and node-edge lists it was added to.
     fn remove_edge_bucket(&mut self, edge: (usize, usize)) {
         let (a, b) = (self.points[edge.0], self.points[edge.1]);
         let (i0, j0) = self.bucket_key(a);
@@ -190,6 +268,11 @@ impl CellMesh {
         }
     }
 
+    /// Add the cell's edges to the adjacency and refresh the front around them.
+    ///
+    /// Only the first owner of an edge registers it in the bucket index; the
+    /// second owner just appends to `edges`, and `refresh_front` then sees two
+    /// owners and removes the edge from the front.
     fn index_cell(&mut self, id: usize) {
         let Some(Some(cell)) = self.cells.get(id).copied() else {
             return;
@@ -212,6 +295,8 @@ impl CellMesh {
         }
     }
 
+    /// Remove the cell's edges from the adjacency, dropping an edge entirely
+    /// when its last owner goes away, and refresh the front around each.
     fn unindex_cell(&mut self, id: usize) {
         let Some(Some(cell)) = self.cells.get(id).copied() else {
             return;
@@ -234,6 +319,11 @@ impl CellMesh {
         }
     }
 
+    /// Recompute whether `edge` is a front edge and insert/remove it.
+    ///
+    /// Called after every index change on an edge; `is_front` is cheap (the
+    /// owner list is at most two entries), so no incremental bookkeeping is
+    /// kept beyond the set itself.
     fn refresh_front(&mut self, edge: (usize, usize)) {
         if self.is_front(edge) {
             self.front.insert(edge);
@@ -265,15 +355,20 @@ impl CellMesh {
         tris == 1
     }
 
+    /// Ids of the live (`Some`) cells, in ascending order.
     fn cell_ids(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.cells.len()).filter(|&i| self.cells[i].is_some())
     }
 
+    /// Owners of `edge`, or an empty slice when it is not in the mesh.
     fn edge_cells(&self, edge: (usize, usize)) -> &[usize] {
         self.edges.get(&edge).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// The unconverted triangles, in cell order.
+    ///
+    /// Cell order, not geometric order: the same mesh always yields the same
+    /// vector, which keeps the downstream Sun closure deterministic.
     fn triangles(&self) -> Vec<[usize; 3]> {
         self.cell_ids()
             .filter_map(|id| match self.cells[id] {
@@ -288,6 +383,11 @@ impl CellMesh {
     /// triangulation — the state the two-stage conversion hands to the matching
     /// stage. More than one means the front stranded islands, and a matching
     /// stage would leave one triangle per odd island.
+    ///
+    /// The sizes include only triangles; a quad between two islands does not
+    /// connect them. Returns an empty vector when no unconverted triangle is
+    /// left. Each component is found once (iterative DFS, shared-edge
+    /// adjacency), so the cost is linear in the number of live cells.
     pub fn live_tri_component_sizes(&self) -> Vec<usize> {
         let mut seen = vec![false; self.cells.len()];
         let mut sizes = Vec::new();
@@ -334,6 +434,11 @@ impl CellMesh {
     /// fine: parity of a triangulated region equals parity of its boundary, so
     /// an even component has an even boundary and a perfect pairing is possible
     /// (edge flips fix the structures where it is not).
+    /// The guard is conservative: it returns `true` as soon as **any** remaining
+    /// component is odd, even if the region being removed is not adjacent to it.
+    /// That is what the two-stage conversion wants — it refuses the placement,
+    /// not just the bad component. `region` ids are the triangles about to be
+    /// consumed by the new quad; `scratch` is reused across calls.
     fn removing_leaves_odd_component(&self, region: &[usize], scratch: &mut FragmentCheck) -> bool {
         let remaining = self.live_tris.saturating_sub(region.len());
         if remaining == 0 {
@@ -391,12 +496,15 @@ impl CellMesh {
         false
     }
 
+    /// Replace cell `id`, keeping the adjacency consistent (unindex, assign,
+    /// index).
     fn set_cell(&mut self, id: usize, cell: Cell) {
         self.unindex_cell(id);
         self.cells[id] = Some(cell);
         self.index_cell(id);
     }
 
+    /// Append a cell and return its new id; the id is never reused later.
     fn push_cell(&mut self, cell: Cell) -> usize {
         self.cells.push(Some(cell));
         let id = self.cells.len() - 1;
@@ -404,11 +512,14 @@ impl CellMesh {
         id
     }
 
+    /// Mark cell `id` as removed and unindex it. The slot becomes `None`; ids of
+    /// the other cells do not shift.
     fn remove_cell(&mut self, id: usize) {
         self.unindex_cell(id);
         self.cells[id] = None;
     }
 
+    /// True when the undirected edge `u`-`v` is present.
     fn has_edge(&self, u: usize, v: usize) -> bool {
         self.edges.contains_key(&(u.min(v), u.max(v)))
     }
@@ -560,6 +671,11 @@ impl CellMesh {
 
     /// Live triangles reachable from `seed` whose nodes are within `radius` of
     /// `origin`.
+    ///
+    /// A triangle is included when at least one of its nodes is within the
+    /// radius; the search does not cross a quad, so the region is a connected
+    /// patch of the unconverted triangulation. Used by
+    /// [`CellMesh::side_candidates`] and [`CellMesh::insert_near`].
     fn live_region(&self, seed: usize, origin: [f64; 2], radius: f64) -> Vec<usize> {
         let mut region = Vec::new();
         let mut seen = HashSet::new();
@@ -605,7 +721,11 @@ impl CellMesh {
     ///
     /// Every edge of the region the segment crosses must be shared by two live
     /// triangles; crossing a boundary edge or a quad edge means the segment has
-    /// left the unconverted region.
+    /// left the unconverted region. Edges incident to `p` or `q` are ignored
+    /// (they are the segment's own endpoints, not a crossing). A segment that
+    /// passes exactly through a vertex is not classified as crossing that
+    /// vertex's edges; the caller's candidate set is small enough that this
+    /// degeneracy is handled by the later region validation.
     fn segment_inside(&self, p: usize, q: usize, region: &[usize]) -> bool {
         let mut edges = HashSet::new();
         for &id in region {
@@ -695,6 +815,13 @@ impl CellMesh {
     }
 
     /// Insert a node at `p`, or as close to it as the reachable region allows.
+    ///
+    /// Searches the live region around `seed` for a triangle that strictly
+    /// contains `p`; if none does, the final scan covers every triangle in the
+    /// mesh (a fallback for a point that fell outside the region, e.g. after a
+    /// recovery flip). Returns the new node id, or `None` when `p` is too close
+    /// to a node of the triangle that would be split. Insertion is only called
+    /// for a size mismatch; it is never a rescue for a failed placement.
     fn insert_near(&mut self, seed: usize, p: [f64; 2]) -> Option<usize> {
         // Do not split a triangle with a point this close to an existing node:
         // the split would create an edge of a few percent of the local size, and
@@ -737,6 +864,7 @@ impl CellMesh {
     }
 
     /// True when `p` is at least `floor` from every node of `cells`.
+    /// True when `p` is at least `floor` from every node of `cells`.
     fn point_clear(&self, p: [f64; 2], cells: &[usize], floor: f64) -> bool {
         for &id in cells {
             let Some(Some(cell)) = self.cells.get(id) else {
@@ -752,6 +880,11 @@ impl CellMesh {
         true
     }
 
+    /// Split triangle `t` at `p` into three triangles around the new node.
+    ///
+    /// The first third reuses cell `id`; the other two get fresh ids. Returns
+    /// the new node id. The three new triangles keep `t`'s winding, because each
+    /// is `[t[k], t[k+1], v]` in the original cyclic order.
     fn split_triangle(&mut self, id: usize, t: [usize; 3], p: [f64; 2]) -> usize {
         self.points.push([p[0], p[1], 0.0]);
         let v = self.points.len() - 1;
@@ -762,6 +895,9 @@ impl CellMesh {
     }
 
     /// The triangle cell that owns the front edge `(u, v)`.
+    ///
+    /// A front edge has exactly one triangle by definition; this returns the
+    /// first triangle owner so a caller can recover the orientation.
     fn tri_owner(&self, u: usize, v: usize) -> Option<usize> {
         self.edge_cells((u.min(v), u.max(v)))
             .iter()
@@ -776,6 +912,12 @@ impl CellMesh {
 
     /// The triangle cells enclosed by the quad's four sides, if that region is
     /// exactly the quad.
+    ///
+    /// Grows from `seed` without crossing any of the quad's four sides, then
+    /// checks (a) no cell outside the quad is included, (b) every node of the
+    /// region is inside the quad, and (c) the summed triangle area equals the
+    /// quad area. Returns `None` if any of those fail, which means replacing the
+    /// region by the quad would overlap a neighbour or leave a gap.
     fn region(&self, seed: usize, quad: &[usize; 4]) -> Option<Vec<usize>> {
         let mut sides = HashSet::new();
         for i in 0..4 {
@@ -830,6 +972,12 @@ impl CellMesh {
     }
 
     /// Flip `(u, v)` when both adjacent cells are triangles forming a convex quad.
+    ///
+    /// The new diagonal is the other one of the quadrilateral; the two new
+    /// triangles are wound from `t1`'s traversal of the shared edge (see the
+    /// long comment in the body). Returns `false` without changing anything when
+    /// the quad is not strictly convex or the edge does not have exactly two
+    /// triangle owners.
     fn flip(&mut self, u: usize, v: usize) -> bool {
         let owners = self.edge_cells((u.min(v), u.max(v)));
         if owners.len() != 2 {
@@ -887,6 +1035,9 @@ impl CellMesh {
     /// Recover edge `(u, v)` by flipping crossing edges between live triangles.
     ///
     /// A partial recovery is a valid mesh; the caller does not roll it back.
+    /// The loop is bounded by the cell count (each iteration either succeeds or
+    /// flips an edge, and a flip cannot increase the cell count). Returns whether
+    /// the edge exists at the end.
     fn recover(&mut self, u: usize, v: usize) -> bool {
         for _ in 0..self.cells.len() {
             if self.has_edge(u, v) {
@@ -904,6 +1055,11 @@ impl CellMesh {
 
     /// A live edge the open segment `u..v` crosses, chosen from the edge buckets
     /// over the segment's bounding box rather than by scanning every edge.
+    ///
+    /// Candidates are sorted before testing, so the same mesh and segment always
+    /// flip the same edge; the bucket index can return an edge several times, so
+    /// it is deduplicated. Edges incident to `u` or `v` are skipped (the segment
+    /// touches them at its endpoints, it does not cross them).
     fn first_crossing(&self, u: usize, v: usize) -> Option<(usize, usize)> {
         let (p, q) = (self.points[u], self.points[v]);
         let (i0, j0) = self.bucket_key([p[0].min(q[0]), p[1].min(q[1]), 0.0]);
@@ -930,6 +1086,11 @@ impl CellMesh {
     }
 }
 
+/// True when `p` is strictly inside `tri` (no edge or vertex counts).
+///
+/// All three cross products must have the same sign with a `1e-12` tolerance;
+/// this accepts triangles wound either way, which is what the front needs before
+/// [`CellMesh::split_triangle`] has normalised anything.
 fn point_strictly_inside(points: &[Node], tri: [usize; 3], p: [f64; 2]) -> bool {
     let q = [p[0], p[1], 0.0];
     let d0 = cross(points[tri[0]], points[tri[1]], q);
@@ -938,6 +1099,12 @@ fn point_strictly_inside(points: &[Node], tri: [usize; 3], p: [f64; 2]) -> bool 
     (d0 > 1e-12 && d1 > 1e-12 && d2 > 1e-12) || (d0 < -1e-12 && d1 < -1e-12 && d2 < -1e-12)
 }
 
+/// True when node `v` is inside the (convex) quad, boundary included.
+///
+/// A point is inside when it is not strictly on one side of every edge; for a
+/// convex CCW quad that is exactly "no edge has it on the right". Concave quads
+/// are not expected at this call site (the quad was built from a candidate
+/// pair), but the test would be conservative for them.
 fn inside_quad(points: &[Node], quad: &[usize; 4], v: usize) -> bool {
     let p = points[v];
     let mut positive = 0;
@@ -953,6 +1120,7 @@ fn inside_quad(points: &[Node], quad: &[usize; 4], v: usize) -> bool {
     positive == 0 || negative == 0
 }
 
+/// Absolute area of a quad (the shoelace sum halved).
 fn quad_area(points: &[Node], quad: &[usize; 4]) -> f64 {
     let mut twice = 0.0;
     for i in 0..4 {
@@ -963,14 +1131,21 @@ fn quad_area(points: &[Node], quad: &[usize; 4]) -> f64 {
     twice / 2.0
 }
 
+/// Twice the signed area of triangle `a-b-c`: positive when counter-clockwise.
 fn cross(a: Node, b: Node, c: Node) -> f64 {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 }
 
+/// Side of the directed line `a -> b` on which `c` lies (the same cross product
+/// as [`cross`], named for the predicate it implements).
 fn side(a: Node, b: Node, c: Node) -> f64 {
     cross(a, b, c)
 }
 
+/// True when the open segments `p`-`q` and `r`-`s` cross at a single interior
+/// point. Collinear or touching segments return `false`; the front only needs
+/// strict crossings, and treating a touch as a crossing would make recovery
+/// flip forever.
 fn segments_cross(p: Node, q: Node, r: Node, s: Node) -> bool {
     let d1 = side(p, q, r);
     let d2 = side(p, q, s);
@@ -979,6 +1154,7 @@ fn segments_cross(p: Node, q: Node, r: Node, s: Node) -> bool {
     d1 * d2 < 0.0 && d3 * d4 < 0.0
 }
 
+/// Euclidean length of an edge, in millimetres.
 fn length(points: &[Node], edge: (usize, usize)) -> f64 {
     let (a, b) = (points[edge.0], points[edge.1]);
     ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt()
@@ -1014,30 +1190,63 @@ const MAX_PAIR_TRIALS: usize = 8;
 const MIN_INSERT_SPACING: f64 = 0.25;
 
 /// Why one front edge could not become a quad.
+///
+/// This is an internal classification: [`try_quad`] returns it, [`front_loop`]
+/// turns it into a [`Refusals`] counter and blocks the edge. It is not an error
+/// — the edge may become feasible after a neighbouring quad is placed.
 #[derive(Clone, Copy, Debug)]
 enum Refusal {
+    /// No seed triangle, no usable side node, or the front edge is degenerate.
     Placement,
+
+    /// Side pairs were found but none met the shape floors
+    /// (`MIN_QUAD_SJ`, `MIN_QUAD_ANGLE_DEG`).
     Shape,
+
+    /// One of the three missing sides could not be recovered by flips.
     Recovery,
+
+    /// The triangles enclosed by the candidate quad did not exactly fill it
+    /// (wrong boundary or wrong area).
     Region,
+
     /// The quad would have left an unconverted region of odd triangle count.
     OddRegion,
 }
 
 /// Counters for the stage at which a front edge failed.
+///
+/// One run produces one `Refusals`; the counters are independent (an edge can
+/// contribute to `attempts` several times and to one refusal stage per attempt),
+/// so they are diagnostic, not a partition. They are copied into
+/// [`FrontResult::refusals`] and, after the Sun closure, into
+/// [`convert_with_stats`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Refusals {
+    /// Number of times the front had no loop left to process.
     pub front_empty: usize,
+
+    /// Edges refused at `Refusal::Placement`.
     pub placement: usize,
+
+    /// Edges refused at `Refusal::Shape` (all candidate pairs too poor).
     pub invalid_quad: usize,
+
+    /// Edges whose three missing sides could not be recovered.
     pub recovery: usize,
+
+    /// Candidate quads whose enclosed region was not exactly the quad.
     pub region: usize,
+
     /// Placements refused to keep every unconverted region even.
     pub odd_region: usize,
+
     /// Nodes inserted because the front edge disagreed with the size field.
     pub mismatch_insertions: usize,
-    /// Front edges examined.
+
+    /// Front edges examined (including edges that later succeed).
     pub attempts: usize,
+
     /// The Sun residual-triangle walk that closes the leftovers.
     pub closure: crate::sun::CloseStats,
 }
@@ -1046,6 +1255,11 @@ pub struct Refusals {
 ///
 /// Returns the quads, the triangles that could not be converted, and the node
 /// set the conversion ended with (placement inserts nodes).
+///
+/// This is the full Q-Morph plus Sun route ([`convert_with_stats`]); the
+/// two-stage experimental route uses [`run_front`] directly so it can keep the
+/// front's state. The input triangles are not modified; the output cells tile
+/// the same domain, with no input triangle dropped silently.
 pub fn convert(
     tris: &[[usize; 3]],
     points: &[Node],
@@ -1069,13 +1283,26 @@ pub enum FrontStop {
 }
 
 /// The front's state when it stops.
+///
+/// This is a snapshot, not a mesh with adjacency: the quads, the leftover
+/// triangles and the (possibly extended) point set are the inputs a closure or
+/// matching stage needs. The quads and the leftover triangles partition the
+/// input: every input triangle is either inside a placed quad or in `triangles`.
 #[derive(Debug, Default)]
 pub struct FrontResult {
+    /// Nodes at the end of the front; may contain nodes inserted for a size
+    /// mismatch, so it is not necessarily the input slice.
     pub points: Vec<Node>,
+
+    /// Quads placed by the front, in placement order, counter-clockwise.
     pub quads: Vec<[usize; 4]>,
+
     /// The unconverted triangles, in cell order.
     pub triangles: Vec<[usize; 3]>,
+
+    /// Per-stage refusal counters for this run.
     pub refusals: Refusals,
+
     /// Connected-component sizes of `triangles`, largest first. One entry means
     /// the remainder is one triangulation.
     pub region_components: Vec<usize>,
@@ -1085,6 +1312,12 @@ pub struct FrontResult {
 ///
 /// [`convert_with_stats`] is this plus [`crate::sun::close_residuals`]; the
 /// two-stage conversion is this plus a triangle matching stage.
+///
+/// `size` is the target edge length in millimetres. `stop` selects the finishing
+/// rule: [`FrontStop::Exhaust`] drains the front, [`FrontStop::EvenComponents`]
+/// refuses a placement that would leave an odd unconverted component (see
+/// `CellMesh::removing_leaves_odd_component`). The returned
+/// [`FrontResult::points`] may be longer than `points` by the inserted nodes.
 pub fn run_front(tris: &[[usize; 3]], points: &[Node], size: f64, stop: FrontStop) -> FrontResult {
     let mut refusals = Refusals::default();
     let mut mesh = CellMesh::new(points, tris, size);
@@ -1101,6 +1334,17 @@ pub fn run_front(tris: &[[usize; 3]], points: &[Node], size: f64, stop: FrontSto
     }
 }
 
+/// The outer Q-Morph state machine: choose a front loop, choose an edge, try it.
+///
+/// `tris_len` is the *input* triangle count and sets both runaway bounds. The
+/// loop order and the per-loop edge order are deterministic (perimeter and
+/// length, with the edge key as the tie-break), so a run is reproducible.
+///
+/// The loop terminates in one of three ways: the front becomes empty
+/// (`front_empty` is incremented), no loop made progress (all remaining edges
+/// are blocked), or a runaway bound is hit. Every path leaves a valid mesh: a
+/// refused edge has changed nothing, and a successful placement removed only the
+/// triangles it covered.
 fn front_loop(
     mesh: &mut CellMesh,
     tris_len: usize,
@@ -1109,6 +1353,9 @@ fn front_loop(
     refusals: &mut Refusals,
     stop: FrontStop,
 ) {
+    // Rule 4's memory: an edge that failed stays blocked until a placed quad
+    // touches one of its nodes. The set only grows during a pass and is pruned
+    // on success, so it cannot stall the front permanently.
     let mut blocked: HashSet<(usize, usize)> = HashSet::new();
     let max_attempts = 200 * tris_len + 10_000;
     let max_triangles = 4 * tris_len + 100;
@@ -1187,6 +1434,13 @@ fn front_loop(
     }
 }
 
+/// Run the shipped Q-Morph route and return its cells plus the front counters.
+///
+/// This is [`run_front`] with [`FrontStop::Exhaust`] followed by the Sun
+/// residual closure ([`crate::sun::close_residuals`]). The returned tuple is
+/// `((quads, leftover_triangles, points), refusals)`. The closure may insert a
+/// boundary midpoint, which is why the returned points are the closure's, not
+/// the front's. `refusals.closure` describes the closure stage.
 pub fn convert_with_stats(
     tris: &[[usize; 3]],
     points: &[Node],
@@ -1200,16 +1454,39 @@ pub fn convert_with_stats(
     ((quads, leftover, points), refusals)
 }
 
+/// Summed edge length of a front loop, in millimetres.
 fn loop_perimeter(points: &[Node], edges: &[(usize, usize)]) -> f64 {
     edges.iter().map(|&e| length(points, e)).sum()
 }
 
 /// The design's size-mismatch test on the front edge itself.
+///
+/// A front edge outside `[0.5, 1.5] x target` is a candidate for having a node
+/// inserted; an edge inside the band must be placed with existing nodes. This is
+/// deliberately strict — insertion on every failure turned 604 triangles into
+/// 5 022 on the corpus.
 fn size_mismatch(span: f64, target: f64) -> bool {
     span < 0.5 * target || span > 1.5 * target
 }
 
 /// Try to build one quad on the front edge.
+///
+/// This is the per-edge step of the state machine, in order:
+///
+/// 1. find the seed triangle and orient the edge so the triangle is on the left;
+/// 2. find side nodes at both endpoints (existing edges by angle, then the
+///    reachable-region search) and insert only on a size mismatch;
+/// 3. rank the side pairs by `min(scaled Jacobian, sin(min angle))` and keep the
+///    best `MAX_PAIR_TRIALS`;
+/// 4. for each pair, recover the three missing sides by flips, check that the
+///    enclosed triangles are exactly the quad, and (in `EvenComponents` mode)
+///    that removing them leaves every unconverted component even;
+/// 5. commit: remove the enclosed triangles, add the quad, push it to `quads`.
+///
+/// A failure returns the [`Refusal`] of the last stage reached. Recovery flips
+/// are deliberately **not** rolled back: they are valid mesh operations and the
+/// next pair (or the next edge) benefits from them. Nothing is committed until
+/// step 5, so a failed attempt never loses a cell.
 fn try_quad(
     mesh: &mut CellMesh,
     edge: (usize, usize),
@@ -1331,6 +1608,11 @@ fn try_quad(
     });
     pairs.dedup_by(|left, right| left.1 == right.1);
 
+    // Try the best pairs in order. The three recovered sides are the quad's
+    // sides that are not the front edge: a-c, b-d and c-d (the front edge is
+    // a-b). Recovery may flip triangles the earlier pairs relied on, so the
+    // seed triangle is looked up again inside the loop; a pair that no longer
+    // encloses a region is simply skipped.
     let mut last = Refusal::Recovery;
     for &(_, quad) in pairs.iter().take(MAX_PAIR_TRIALS) {
         let seed = mesh.tri_owner(edge.0, edge.1).ok_or(Refusal::Placement)?;
@@ -1372,6 +1654,11 @@ fn try_quad(
 
 /// Insert the missing side node at the ideal position, clamped towards `origin`
 /// until it lands inside a live triangle.
+///
+/// The shares 1.0, 0.9, ..., 0.3 walk the point back along the inward normal in
+/// 10 % steps. The ideal position is one target length inward; a shorter move is
+/// accepted when the ideal one would fall outside the reachable region or too
+/// close to an existing node. Returns `None` if no share works.
 fn insert_along(
     mesh: &mut CellMesh,
     seed: usize,
@@ -1393,6 +1680,11 @@ fn insert_along(
 
 /// Scaled Jacobian and smallest corner angle of a quad, or `None` when the quad
 /// is not strictly convex.
+///
+/// Returns `(min scaled Jacobian, min corner angle in degrees)`. The convexity
+/// test is on the signed area (must be positive) and on the four cross products
+/// (must be positive), so a bowtie or a collinear corner returns `None` rather
+/// than a misleading metric.
 fn quad_metrics(points: &[Node], quad: &[usize; 4]) -> Option<(f64, f64)> {
     let coords = [
         [points[quad[0]][0], points[quad[0]][1]],
@@ -1442,6 +1734,11 @@ fn quad_metrics(points: &[Node], quad: &[usize; 4]) -> Option<(f64, f64)> {
 }
 
 /// The quality contract's scaled Jacobian, evaluated at the four corners.
+///
+/// This is the same bilinear map as `quality::scaled_jacobian`: at each
+/// reference corner, the determinant of the Jacobian divided by the product of
+/// its two column norms. The result is in `[-1, 1]` and is `NaN` for a quad with
+/// a zero-length Jacobian column; callers guard with `is_finite`.
 fn min_scaled_jacobian(p: &[[f64; 2]; 4]) -> f64 {
     const XI: [[f64; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
     let mut min = f64::INFINITY;
