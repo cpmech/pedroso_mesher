@@ -473,33 +473,45 @@ fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
                 ring.iter().map(|&u| mesh.points[u][0]).sum::<f64>() / ring.len() as f64,
                 ring.iter().map(|&u| mesh.points[u][1]).sum::<f64>() / ring.len() as f64,
             ];
-            let target = if on_boundary {
-                let (a, b, _) = domain.nearest_segment(current);
-                project_onto_segment(centroid, a, b, 0.15)
-            } else {
-                centroid
-            };
 
-            let before = local_quality(&incident[v], mesh);
-            let old = mesh.points[v];
-            mesh.points[v] = [target[0], target[1], 0.0];
-            let after = local_quality(&incident[v], mesh);
-            let spacing_ok = incident[v]
-                .iter()
-                .filter(|&&c| mesh.cells[c].kind == Kind::Quad4)
-                .all(|&c| {
-                    let q = &mesh.cells[c].nodes;
-                    (0..4).all(|i| {
-                        let a = mesh.points[q[i]];
-                        let b = mesh.points[q[(i + 1) % 4]];
-                        ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt() >= 0.15 * size
-                    })
-                });
-            let accepted = spacing_ok && after.0 > before.0 + 1e-6 && after.1 >= before.1 - 1e-9;
-            if accepted {
-                moved += 1;
+            // Candidate positions: the ring centroid, and points on two rings
+            // around the current position. Boundary nodes may only slide along
+            // their segment, which is where the worst angles live.
+            let mut candidates: Vec<[f64; 2]> = Vec::new();
+            if on_boundary {
+                let (a, b, _) = domain.nearest_segment(current);
+                for t in [0.1, 0.25, 0.4, 0.6, 0.75, 0.9] {
+                    candidates.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+                }
             } else {
-                mesh.points[v] = old;
+                candidates.push(centroid);
+                for (radius, steps) in [(0.3 * size, 8), (0.1 * size, 8)] {
+                    for k in 0..steps {
+                        let angle = std::f64::consts::TAU * k as f64 / steps as f64;
+                        candidates.push([
+                            current[0] + radius * angle.cos(),
+                            current[1] + radius * angle.sin(),
+                        ]);
+                    }
+                }
+            }
+
+            let mut best = current;
+            let mut best_f = node_objective(&incident[v], mesh);
+            for candidate in candidates {
+                if !spacing_ok(&incident[v], mesh, candidate, v, size) {
+                    continue;
+                }
+                mesh.points[v] = [candidate[0], candidate[1], 0.0];
+                let f = node_objective(&incident[v], mesh);
+                if f < best_f - 1e-9 {
+                    best = candidate;
+                    best_f = f;
+                }
+            }
+            mesh.points[v] = [best[0], best[1], 0.0];
+            if best != current {
+                moved += 1;
             }
         }
         if moved == 0 {
@@ -508,41 +520,72 @@ fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
     }
 }
 
-/// Closest point to `p` on segment `a..b`, kept at least `margin` (as a share of
-/// the segment) from either end so a node never lands on its neighbour.
-fn project_onto_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2], margin: f64) -> [f64; 2] {
-    let ab = [b[0] - a[0], b[1] - a[1]];
-    let length2 = ab[0] * ab[0] + ab[1] * ab[1];
-    if length2 <= 0.0 {
-        return a;
+/// Nodally based quality objective, in the spirit of Knupp (2000).
+///
+/// For every corner of every incident quad: `(1 - sin θ)²`, which is the
+/// deviation of the scaled Jacobian from 1, plus a logarithmic barrier on
+/// `sin θ` that grows without bound as an element collapses. The barrier is what
+/// makes the minimisation refused to invert an element, instead of needing the
+/// boolean guard the previous smoother used.
+fn node_objective(incident: &[usize], mesh: &Mesh) -> f64 {
+    let mut f = 0.0;
+    for &c in incident {
+        // A discrete search can step over the barrier: an inverted element must
+        // be infinitely bad, not merely poor.
+        if mesh.cells[c].kind == Kind::Quad4 {
+            let nodes: [usize; 4] = match mesh.cells[c].nodes.as_slice().try_into() {
+                Ok(n) => n,
+                Err(_) => return f64::INFINITY,
+            };
+            let coords = [
+                [mesh.points[nodes[0]][0], mesh.points[nodes[0]][1]],
+                [mesh.points[nodes[1]][0], mesh.points[nodes[1]][1]],
+                [mesh.points[nodes[2]][0], mesh.points[nodes[2]][1]],
+                [mesh.points[nodes[3]][0], mesh.points[nodes[3]][1]],
+            ];
+            if !convex_ccw(&coords) {
+                return f64::INFINITY;
+            }
+        }
+        for angle in quality::corner_angles(&mesh.cells[c], &mesh.points) {
+            let sine = angle.to_radians().sin().max(0.02);
+            f += (1.0 - sine) * (1.0 - sine) + 0.05 * (-sine.ln());
+        }
     }
-    let t = (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / length2).clamp(margin, 1.0 - margin);
-    [a[0] + t * ab[0], a[1] + t * ab[1]]
+    f
 }
 
+/// True when `p` keeps every edge of the incident cells at a usable length.
+fn spacing_ok(incident: &[usize], mesh: &Mesh, p: [f64; 2], v: usize, size: f64) -> bool {
+    for &c in incident {
+        for (i, &u) in mesh.cells[c].nodes.iter().enumerate() {
+            let next = mesh.cells[c].nodes[(i + 1) % mesh.cells[c].nodes.len()];
+            if u != v && next != v {
+                continue;
+            }
+            let a = if u == v {
+                p
+            } else {
+                [mesh.points[u][0], mesh.points[u][1]]
+            };
+            let b = if next == v {
+                p
+            } else {
+                [mesh.points[next][0], mesh.points[next][1]]
+            };
+            let length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+            if length < 0.15 * size {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Closest point to `p` on segment `a..b`/// Closest point to `p` on segment `a..b`, kept at least `margin` (as a share of
+/// the segment) from either end so a node never lands on its neighbour.
 /// Smallest corner angle and smallest scaled Jacobian among the quads around a
 /// node.
-fn local_quality(incident: &[usize], mesh: &Mesh) -> (f64, f64) {
-    let mut angle = f64::INFINITY;
-    let mut sj = f64::INFINITY;
-    for &c in incident {
-        if mesh.cells[c].kind != Kind::Quad4 {
-            continue;
-        }
-        for value in quality::quad_angles(&mesh.cells[c], &mesh.points) {
-            if value.is_finite() {
-                angle = angle.min(value);
-            }
-        }
-        for value in quality::scaled_jacobian(&mesh.cells[c], &mesh.points) {
-            if value.is_finite() {
-                sj = sj.min(value);
-            }
-        }
-    }
-    (angle, sj)
-}
-
 /// Boundary loops with each segment split so none is longer than the target.
 fn sample_loops(domain: &Domain, sizing: &Sizing) -> Vec<Vec<[f64; 2]>> {
     let mut out = Vec::new();
