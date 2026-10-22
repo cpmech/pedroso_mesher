@@ -105,6 +105,8 @@ pub struct CellMesh {
     /// Unconverted triangles still alive; kept as a counter so the runaway guard
     /// is O(1) rather than a scan of the cell list.
     live_tris: usize,
+    /// Edges incident to each node, for side-edge definition by angle.
+    node_edges: HashMap<usize, Vec<(usize, usize)>>,
 }
 
 impl CellMesh {
@@ -117,6 +119,7 @@ impl CellMesh {
             bucket: if size > 1e-9 { size } else { 1.0 },
             front: HashSet::new(),
             live_tris: tris.len(),
+            node_edges: HashMap::new(),
         };
         for id in 0..mesh.cells.len() {
             mesh.index_cell(id);
@@ -142,6 +145,8 @@ impl CellMesh {
                 self.edge_buckets.entry((i, j)).or_default().push(edge);
             }
         }
+        self.node_edges.entry(edge.0).or_default().push(edge);
+        self.node_edges.entry(edge.1).or_default().push(edge);
     }
 
     fn remove_edge_bucket(&mut self, edge: (usize, usize)) {
@@ -157,6 +162,14 @@ impl CellMesh {
                     if list.is_empty() {
                         self.edge_buckets.remove(&(i, j));
                     }
+                }
+            }
+        }
+        for v in [edge.0, edge.1] {
+            if let Some(list) = self.node_edges.get_mut(&v) {
+                list.retain(|&e| e != edge);
+                if list.is_empty() {
+                    self.node_edges.remove(&v);
                 }
             }
         }
@@ -265,6 +278,87 @@ impl CellMesh {
 
     fn has_edge(&self, u: usize, v: usize) -> bool {
         self.edges.contains_key(&(u.min(v), u.max(v)))
+    }
+
+    /// Side nodes from **existing edges** at `p`, chosen by angle to the ideal
+    /// side vector of Owen (1999) §3.3.1.
+    ///
+    /// The ideal vector is the bisector of the current front edge and the other
+    /// front edge at `p`; on a straight boundary the two are opposite and the
+    /// bisector degenerates, so the inward perpendicular is used. An existing
+    /// edge within 30° of the ideal is a side edge; otherwise the caller falls
+    /// back to the reachable-node search.
+    fn edge_side_candidates(&self, p: usize, other: usize, target: f64) -> Vec<usize> {
+        let po = self.points[p];
+        let u = [self.points[other][0] - po[0], self.points[other][1] - po[1]];
+        let un = (u[0] * u[0] + u[1] * u[1]).sqrt();
+        if un <= 1e-12 {
+            return Vec::new();
+        }
+        let u = [u[0] / un, u[1] / un];
+        let mut ideals = Vec::new();
+        if let Some(edges) = self.node_edges.get(&p) {
+            for &edge in edges {
+                if !self.front.contains(&edge) {
+                    continue;
+                }
+                let q = if edge.0 == p { edge.1 } else { edge.0 };
+                if q == other {
+                    continue;
+                }
+                let v = [self.points[q][0] - po[0], self.points[q][1] - po[1]];
+                let vn = (v[0] * v[0] + v[1] * v[1]).sqrt();
+                if vn <= 1e-12 {
+                    continue;
+                }
+                let v = [v[0] / vn, v[1] / vn];
+                let b = [u[0] + v[0], u[1] + v[1]];
+                let bn = (b[0] * b[0] + b[1] * b[1]).sqrt();
+                if bn > 0.2 {
+                    ideals.push([b[0] / bn, b[1] / bn]);
+                }
+            }
+        }
+        if ideals.is_empty() {
+            ideals.push([-u[1], u[0]]);
+        }
+        let Some(edges) = self.node_edges.get(&p) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &edge in edges {
+            let q = if edge.0 == p { edge.1 } else { edge.0 };
+            if q == other || q == p {
+                continue;
+            }
+            // The side edge has to touch the unconverted region; an edge
+            // between two quads is already behind the front.
+            let touches_live = self.edge_cells(edge).iter().any(|&id| {
+                self.cells
+                    .get(id)
+                    .and_then(|cell| cell.as_ref())
+                    .is_some_and(Cell::is_tri)
+            });
+            if !touches_live {
+                continue;
+            }
+            let qp = self.points[q];
+            let d = [qp[0] - po[0], qp[1] - po[1]];
+            let dn = (d[0] * d[0] + d[1] * d[1]).sqrt();
+            if dn < 0.4 * target || dn > 2.5 * target {
+                continue;
+            }
+            let d = [d[0] / dn, d[1] / dn];
+            if ideals
+                .iter()
+                .any(|ideal| d[0] * ideal[0] + d[1] * ideal[1] >= 0.866)
+            {
+                out.push(q);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// The front edges grouped into boundary loops.
@@ -918,7 +1012,10 @@ fn try_quad(
     let n = [-tangent[1] / tlen, tangent[0] / tlen];
 
     // Rule 1: side nodes from the reachable unconverted region.
-    let mut ca = mesh.side_candidates(a, b, seed, n, target);
+    let mut ca = mesh.edge_side_candidates(a, b, target);
+    ca.extend(mesh.side_candidates(a, b, seed, n, target));
+    ca.sort_unstable();
+    ca.dedup();
     if ca.is_empty() {
         // Rule 2: insertion is a response to a size mismatch on the *front
         // edge*, never a rescue for a failed placement.
@@ -931,7 +1028,10 @@ fn try_quad(
         ca.push(c);
         refusals.mismatch_insertions += 1;
     }
-    let mut cb = mesh.side_candidates(b, a, seed, n, target);
+    let mut cb = mesh.edge_side_candidates(b, a, target);
+    cb.extend(mesh.side_candidates(b, a, seed, n, target));
+    cb.sort_unstable();
+    cb.dedup();
     if cb.is_empty() {
         if !size_mismatch(span, target) {
             return Err(Refusal::Placement);
