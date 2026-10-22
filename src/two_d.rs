@@ -345,50 +345,7 @@ pub fn mesh_2d(domain: &Domain, sizing: &Sizing) -> Result<TwoDResult, TwoDError
             "the domain has no area (outer loop clockwise, or a hole larger than it)",
         ));
     }
-    // Sample every boundary segment down to the size field before constraining
-    // it. A plate edge 100 mm long with a 1 mm size would otherwise be a single
-    // constrained edge, and every triangle touching it would be a sliver.
-    let loops = sample_loops(domain, sizing);
-    let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
-    for loop_points in &loops {
-        for &[x, y] in loop_points {
-            cdt.insert(Point2::new(x, y))
-                .map_err(|_| TwoDError::Triangulation("a boundary point could not be inserted"))?;
-        }
-        for i in 0..loop_points.len() {
-            let a = loop_points[i];
-            let b = loop_points[(i + 1) % loop_points.len()];
-            cdt.add_constraint_edge(Point2::new(a[0], a[1]), Point2::new(b[0], b[1]))
-                .map_err(|_| {
-                    TwoDError::Triangulation("a boundary edge could not be constrained")
-                })?;
-        }
-    }
-
-    refine(&mut cdt, domain, sizing);
-
-    // Triangles of the domain, keyed by spade's stable vertex indices.
-    let triangles = collect_triangles(&cdt, domain);
-    if triangles.is_empty() {
-        return Err(TwoDError::BadRequest("the domain triangulated to nothing"));
-    }
-
-    let mut points: Vec<Node> = Vec::new();
-    let mut index_of: std::collections::HashMap<(u64, u64), usize> =
-        std::collections::HashMap::new();
-    let mut tris: Vec<[usize; 3]> = Vec::with_capacity(triangles.len());
-    for tri in &triangles {
-        let mut ids = [0usize; 3];
-        for (slot, p) in tri.iter().enumerate() {
-            let key = (p[0].to_bits(), p[1].to_bits());
-            let id = *index_of.entry(key).or_insert_with(|| {
-                points.push([p[0], p[1], 0.0]);
-                points.len() - 1
-            });
-            ids[slot] = id;
-        }
-        tris.push(ids);
-    }
+    let (points, tris) = triangulate(domain, sizing)?;
 
     let (quads, unpaired) = pair_triangles(&tris, &points);
     let base_quads = quads.len();
@@ -725,6 +682,58 @@ fn spacing_ok(incident: &[usize], mesh: &Mesh, p: [f64; 2], v: usize, size: f64)
 /// the segment) from either end so a node never lands on its neighbour.
 /// Smallest corner angle and smallest scaled Jacobian among the quads around a
 /// node.
+/// Triangulate the domain and refine it to the size field.
+pub fn triangulate(
+    domain: &Domain,
+    sizing: &Sizing,
+) -> Result<(Vec<Node>, Vec<[usize; 3]>), TwoDError> {
+    // Sample every boundary segment down to the size field before constraining
+    // it. A plate edge 100 mm long with a 1 mm size would otherwise be a single
+    // constrained edge, and every triangle touching it would be a sliver.
+    let loops = sample_loops(domain, sizing);
+    let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
+    for loop_points in &loops {
+        for &[x, y] in loop_points {
+            cdt.insert(Point2::new(x, y))
+                .map_err(|_| TwoDError::Triangulation("a boundary point could not be inserted"))?;
+        }
+        for i in 0..loop_points.len() {
+            let a = loop_points[i];
+            let b = loop_points[(i + 1) % loop_points.len()];
+            cdt.add_constraint_edge(Point2::new(a[0], a[1]), Point2::new(b[0], b[1]))
+                .map_err(|_| {
+                    TwoDError::Triangulation("a boundary edge could not be constrained")
+                })?;
+        }
+    }
+
+    refine(&mut cdt, domain, sizing);
+
+    // Triangles of the domain, keyed by spade's stable vertex indices.
+    let triangles = collect_triangles(&cdt, domain);
+    if triangles.is_empty() {
+        return Err(TwoDError::BadRequest("the domain triangulated to nothing"));
+    }
+
+    let mut points: Vec<Node> = Vec::new();
+    let mut index_of: std::collections::HashMap<(u64, u64), usize> =
+        std::collections::HashMap::new();
+    let mut tris: Vec<[usize; 3]> = Vec::with_capacity(triangles.len());
+    for tri in &triangles {
+        let mut ids = [0usize; 3];
+        for (slot, p) in tri.iter().enumerate() {
+            let key = (p[0].to_bits(), p[1].to_bits());
+            let id = *index_of.entry(key).or_insert_with(|| {
+                points.push([p[0], p[1], 0.0]);
+                points.len() - 1
+            });
+            ids[slot] = id;
+        }
+        tris.push(ids);
+    }
+    Ok((points, tris))
+}
+
 /// Boundary loops with each segment split so none is longer than the target.
 fn sample_loops(domain: &Domain, sizing: &Sizing) -> Vec<Vec<[f64; 2]>> {
     let mut out = Vec::new();
