@@ -404,6 +404,10 @@ fn build_mesh(points: &[Node], quads: &[[usize; 4]], leftover: &[[usize; 3]]) ->
 /// only when it raises the smallest angle of every incident quad *and* does not
 /// lower the smallest scaled Jacobian — the lesson from the first smoothing
 /// attempt, which traded 0.37 of Jacobian for one degree of angle.
+pub fn smooth_mesh(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
+    smooth(mesh, domain, iterations, size);
+}
+
 fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
     let n = mesh.points.len();
     let mut incident: Vec<Vec<usize>> = vec![Vec::new(); n];
