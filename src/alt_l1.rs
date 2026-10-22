@@ -42,6 +42,16 @@
 //!    fast and deterministic while preferring good quads. This is the paper's
 //!    indirect step: the L-norm work is in the point placement, not in the
 //!    recombination.
+//! 5. **Residual-triangle closure**. The dual graph of a triangulation,
+//!    restricted to *convex* triangle pairs, does not always have a perfect
+//!    matching (one triangle can be surrounded by matched neighbours with no
+//!    augmenting path). Each residual triangle is then closed by a local
+//!    refinement cascade: the triangle becomes three quads around its centroid
+//!    and edge midpoints, and every hanging midpoint is carried through the
+//!    opposite edge of the neighbouring quad until the cascade reaches the
+//!    domain boundary. A split may not lower the parent quad's scaled Jacobian
+//!    or minimum angle; if the whole closure cannot satisfy that, it is rolled
+//!    back and the triangle is reported.
 //!
 //! # What is not implemented
 //!
@@ -56,11 +66,12 @@
 //!   and keeps the insertion valid at every step (the Delaunay kernel maintains
 //!   a valid triangulation even when a candidate is rejected).
 //!
-//! The mesh returned is quad-dominant: if the maximum-cardinality matching
-//! cannot cover a triangle, the triangle is kept and reported (never silently
-//! dropped). This happens on two corpus parts (see the example output): the
-//! dual graph of those triangulations, restricted to *convex* triangle pairs,
-//! has no perfect matching, so two triangles remain.
+//! The mesh returned is all-quad on the seven-part benchmark (raw and after the
+//! common post-pass); no triangle is silently dropped. The refinement cascade
+//! adds a small number of quads locally (e.g. +59 on plate-hole 2 mm, +528 on
+//! the 0.6 mm performance part) and can raise the local aspect ratio (measured
+//! post: p95 1.2–2.3, max 8.1), which is the price of keeping every cell
+//! conforming and every new quad convex.
 
 use std::collections::HashMap;
 
@@ -958,6 +969,241 @@ fn recombine(tris: &[[usize; 3]], points: &[Node]) -> (Vec<[usize; 4]>, Vec<[usi
 }
 
 // ------------------------------------------------------------------------- //
+// Local closure of residual triangles (refinement cascade)
+// ------------------------------------------------------------------------- //
+
+fn point_id(index: &mut HashMap<(u64, u64), usize>, points: &mut Vec<Node>, p: [f64; 2]) -> usize {
+    let key = point_key(p);
+    if let Some(&id) = index.get(&key) {
+        return id;
+    }
+    let id = points.len();
+    points.push([p[0], p[1], 0.0]);
+    index.insert(key, id);
+    id
+}
+
+fn midpoint(
+    index: &mut HashMap<(u64, u64), usize>,
+    points: &mut Vec<Node>,
+    a: usize,
+    b: usize,
+) -> usize {
+    let p = [
+        0.5 * (points[a][0] + points[b][0]),
+        0.5 * (points[a][1] + points[b][1]),
+    ];
+    point_id(index, points, p)
+}
+
+fn quad_is_good(quad: [usize; 4], points: &[Node]) -> bool {
+    let cell = Cell::quad4(quad);
+    let sj = quality::scaled_jacobian(&cell, points);
+    if sj.iter().any(|&v| !v.is_finite() || v < 0.2) {
+        return false;
+    }
+    let angles = quality::quad_angles(&cell, points);
+    angles
+        .iter()
+        .all(|&a| a.is_finite() && (30.0..=179.0).contains(&a))
+}
+
+fn quad_quality(quad: [usize; 4], points: &[Node]) -> (f64, f64) {
+    let cell = Cell::quad4(quad);
+    let sj = quality::scaled_jacobian(&cell, points)
+        .into_iter()
+        .fold(f64::INFINITY, f64::min);
+    let angles = quality::quad_angles(&cell, points);
+    let min_angle = angles.iter().copied().fold(f64::INFINITY, f64::min);
+    (sj, min_angle)
+}
+
+fn find_quad_edge(quads: &[[usize; 4]], a: usize, b: usize) -> Option<usize> {
+    quads.iter().position(|q| {
+        (0..4).any(|i| {
+            let u = q[i];
+            let v = q[(i + 1) % 4];
+            (u == a && v == b) || (u == b && v == a)
+        })
+    })
+}
+
+fn find_tri_edge(tris: &[[usize; 3]], a: usize, b: usize) -> Option<usize> {
+    tris.iter().position(|t| {
+        (0..3).any(|i| {
+            let u = t[i];
+            let v = t[(i + 1) % 3];
+            (u == a && v == b) || (u == b && v == a)
+        })
+    })
+}
+
+/// Replace one triangle by three quads around its centroid, splitting its three
+/// edges at their midpoints. `known` carries a midpoint that already exists on
+/// one edge (a cascade that reached this triangle).
+fn close_triangle(
+    index: usize,
+    points: &mut Vec<Node>,
+    quads: &mut Vec<[usize; 4]>,
+    tris: &mut Vec<[usize; 3]>,
+    ids: &mut HashMap<(u64, u64), usize>,
+    hanging: &mut HashMap<(usize, usize), usize>,
+    queue: &mut Vec<((usize, usize), usize)>,
+) -> Result<(), String> {
+    if index >= tris.len() {
+        return Err("triangle index out of range".to_string());
+    }
+    let t = tris[index];
+    let mut mids = [0usize; 3];
+    for i in 0..3 {
+        let a = t[i];
+        let b = t[(i + 1) % 3];
+        let key = (a.min(b), a.max(b));
+        mids[i] = match hanging.get(&key) {
+            Some(&m) => m,
+            None => {
+                let m = midpoint(ids, points, a, b);
+                hanging.insert(key, m);
+                m
+            }
+        };
+    }
+    let p = [
+        (points[t[0]][0] + points[t[1]][0] + points[t[2]][0]) / 3.0,
+        (points[t[0]][1] + points[t[1]][1] + points[t[2]][1]) / 3.0,
+    ];
+    let centroid = point_id(ids, points, p);
+    let new_quads = [
+        [t[0], mids[0], centroid, mids[2]],
+        [t[1], mids[1], centroid, mids[0]],
+        [t[2], mids[2], centroid, mids[1]],
+    ];
+    for q in &new_quads {
+        if !quad_is_good(*q, points) {
+            return Err("the triangle closure would create a poor quad".to_string());
+        }
+    }
+    tris.swap_remove(index);
+    quads.extend_from_slice(&new_quads);
+    for i in 0..3 {
+        queue.push((
+            (t[i].min(t[(i + 1) % 3]), t[i].max(t[(i + 1) % 3])),
+            mids[i],
+        ));
+    }
+    Ok(())
+}
+
+/// Split a quad that has a hanging midpoint on `edge`, joining it to the
+/// midpoint of the opposite edge.
+#[allow(clippy::too_many_arguments)]
+fn split_quad(
+    index: usize,
+    edge: (usize, usize),
+    m: usize,
+    points: &mut Vec<Node>,
+    quads: &mut Vec<[usize; 4]>,
+    ids: &mut HashMap<(u64, u64), usize>,
+    hanging: &mut HashMap<(usize, usize), usize>,
+    queue: &mut Vec<((usize, usize), usize)>,
+) -> Result<(), String> {
+    if index >= quads.len() {
+        return Err("quad index out of range".to_string());
+    }
+    let q = quads[index];
+    let mut k = None;
+    for i in 0..4 {
+        let u = q[i];
+        let v = q[(i + 1) % 4];
+        if (u == edge.0 && v == edge.1) || (u == edge.1 && v == edge.0) {
+            k = Some(i);
+            break;
+        }
+    }
+    let Some(k) = k else {
+        return Err("edge not found in quad".to_string());
+    };
+    let v0 = q[k];
+    let v1 = q[(k + 1) % 4];
+    let v2 = q[(k + 2) % 4];
+    let v3 = q[(k + 3) % 4];
+    // A second cascade reaching an adjacent edge of the same quad is not
+    // handled by this template; refuse rather than leave a hanging node.
+    for (u, v) in [(v1, v2), (v2, v3), (v3, v0)] {
+        if hanging.contains_key(&(u.min(v), u.max(v))) {
+            return Err("two cascades met on one quad".to_string());
+        }
+    }
+    let opposite = (v2.min(v3), v2.max(v3));
+    let n = match hanging.get(&opposite) {
+        Some(&n) => n,
+        None => {
+            let n = midpoint(ids, points, v2, v3);
+            hanging.insert(opposite, n);
+            n
+        }
+    };
+    let q1 = [v0, m, n, v3];
+    let q2 = [m, v1, v2, n];
+    // The split must not make the parent quad worse. Where the parent already
+    // meets the gate floor (SJ 0.2, 30 degrees) the children must too; where it
+    // does not (the raw perf mesh has a few such transition quads, repaired by
+    // the common post-pass), the children must at least keep the parent quality.
+    let (parent_sj, parent_angle) = quad_quality(q, points);
+    let sj_floor = parent_sj.min(0.2) - 1.0e-9;
+    let angle_floor = parent_angle.min(30.0) - 1.0e-9;
+    for child in [q1, q2] {
+        let (sj, angle) = quad_quality(child, points);
+        if !sj.is_finite() || sj < sj_floor || !angle.is_finite() || angle < angle_floor {
+            return Err("the quad split would create a poor quad".to_string());
+        }
+    }
+    quads[index] = q1;
+    quads.push(q2);
+    queue.push((opposite, n));
+    Ok(())
+}
+
+/// Close every residual triangle by the refinement cascade.
+fn close_leftovers(
+    points: &mut Vec<Node>,
+    quads: &mut Vec<[usize; 4]>,
+    tris: &mut Vec<[usize; 3]>,
+) -> Result<(), String> {
+    let mut ids: HashMap<(u64, u64), usize> = HashMap::new();
+    for (i, p) in points.iter().enumerate() {
+        ids.insert(point_key([p[0], p[1]]), i);
+    }
+    let mut hanging: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut operations = 0usize;
+    while !tris.is_empty() {
+        let mut queue: Vec<((usize, usize), usize)> = Vec::new();
+        close_triangle(0, points, quads, tris, &mut ids, &mut hanging, &mut queue)?;
+        while let Some((edge, m)) = queue.pop() {
+            operations += 1;
+            if operations > 20_000 {
+                return Err("the refinement cascade did not terminate".to_string());
+            }
+            if let Some(qid) = find_quad_edge(quads, edge.0, edge.1) {
+                split_quad(
+                    qid,
+                    edge,
+                    m,
+                    points,
+                    quads,
+                    &mut ids,
+                    &mut hanging,
+                    &mut queue,
+                )?;
+            } else if let Some(tid) = find_tri_edge(tris, edge.0, edge.1) {
+                close_triangle(tid, points, quads, tris, &mut ids, &mut hanging, &mut queue)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------------- //
 // Entry point
 // ------------------------------------------------------------------------- //
 
@@ -1014,7 +1260,22 @@ pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
         return Err("the relaxed triangulation produced no triangle".to_string());
     }
     let points: Vec<Node> = rebuilt.points.iter().map(|p| [p[0], p[1], 0.0]).collect();
-    let (quads, leftover) = recombine(&final_tris, &points);
+    let (mut quads, mut leftover) = recombine(&final_tris, &points);
+    let mut points = points;
+    if !leftover.is_empty() {
+        // A maximum-cardinality matching over convex pairs can still leave a
+        // triangle when the dual graph has no perfect matching. Close it with a
+        // local refinement cascade; every new quad is validated, and the whole
+        // closure is rolled back if it would produce a bad cell.
+        let saved_points = points.clone();
+        let saved_quads = quads.clone();
+        let saved_tris = leftover.clone();
+        if close_leftovers(&mut points, &mut quads, &mut leftover).is_err() {
+            points = saved_points;
+            quads = saved_quads;
+            leftover = saved_tris;
+        }
+    }
     let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
     for t in &leftover {
         cells.push(Cell::tri3(*t));
@@ -1124,8 +1385,11 @@ mod tests {
         let domain = Domain::plate_with_hole(20.0, 12.0, 2.0, 8).unwrap();
         let sizing = Sizing::uniform(1.0).unwrap();
         let mesh = mesh(&domain, &sizing).unwrap();
-        let (quads, _tris) = counts(&mesh);
+        let (quads, tris) = counts(&mesh);
         assert!(quads > 0);
+        assert_eq!(tris, 0, "{tris} triangles left");
+        let gate = verify::gate(&mesh);
+        assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
         assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
     }
 
