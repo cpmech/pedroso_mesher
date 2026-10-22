@@ -454,7 +454,10 @@ pub fn generate_quad(
         total: out.seconds,
     };
     let refusals = crate::qmorph::Refusals::default();
-    if !gate.passes() {
+    // The metric gate and the geometry guards are separate: a mesh can pass the
+    // gate with a boundary node moved inward or a corner slid along an edge.
+    // `mesh_quads` checks both, so this entry point must too.
+    if !gate.passes() || !out.statistics.conforming {
         // Carry the mesh, exactly as `mesh_quads` does: the caller may draw or
         // inspect the failure, but must not ship it as an accepted result.
         // `raw_gate` is the same measurement here because this adapter has no

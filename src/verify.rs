@@ -101,7 +101,9 @@ impl Gate {
     /// `stats::Stats::margin` treats the gate as the floor and why the stats
     /// carry distributions alongside it.
     pub fn passes(&self) -> bool {
-        self.triangles == 0
+        // A mesh with no 2D cells is not a quad mesh (see `gate`).
+        self.quads + self.triangles > 0
+            && self.triangles == 0
             && self.inverted == 0
             && self.overlapping == 0
             && self.cracks == 0
@@ -258,6 +260,10 @@ pub fn corner_offset(domain: &crate::two_d::Domain, mesh: &Mesh) -> f64 {
 /// the cell types and inversions are counted here. The result is a snapshot of
 /// this mesh only; the gate is not cumulative and compares nothing across runs.
 pub fn gate(mesh: &Mesh) -> Gate {
+    // The gate is a 2D contract: an empty mesh, or one with no quad/triangle
+    // cells (e.g. a pure hex mesh), cannot pass it. `quality::report` returns
+    // INFINITY minima for an empty mesh, and every one-sided comparison in
+    // `passes` would then hold, so this early return is load-bearing.
     let report = quality::report(mesh);
     let topo = mesh.topology();
     let quads = mesh.cells.iter().filter(|c| c.kind == Kind::Quad4).count();
@@ -383,6 +389,14 @@ mod tests {
         assert_eq!(g.inverted, 1);
         assert!(!g.passes());
         assert!(g.reason().unwrap_or_default().contains("inverted"));
+    }
+
+    #[test]
+    fn an_empty_mesh_does_not_pass_the_gate() {
+        // `quality::report` refuses the empty mesh, but the gate copies only the
+        // minima (INFINITY) and every one-sided comparison would hold.
+        let empty = Mesh::new(Vec::new(), Vec::new());
+        assert!(!gate(&empty).passes());
     }
 
     #[test]

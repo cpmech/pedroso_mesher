@@ -250,9 +250,22 @@ pub fn smooth(domain: &Domain, mesh: &Mesh, size: f64, options: &SmoothOptions) 
 /// remove a triangle or a crack, so the gate verdict can stay FAIL.
 pub fn better(before: &MeshStatistics, after: &MeshStatistics) -> bool {
     if !before.passes && after.passes {
-        return true;
+        // A pass is always an improvement, but the topology must not regress.
+        return after.cracks == 0 && after.overlapping == 0 && after.inverted == 0;
     }
     if before.passes && !after.passes {
+        return false;
+    }
+    // Between two failing meshes, a smoother that gains a crack, an overlap or
+    // an inverted cell is not an improvement even if its angle/SJ margin rose.
+    if after.cracks > before.cracks
+        || after.overlapping > before.overlapping
+        || after.inverted > before.inverted
+    {
+        return false;
+    }
+    // Nor is one that blows the aspect tail past the configured cap.
+    if after.aspect_ratio.max > before.aspect_ratio.max.max(ASPECT_CAP) + 1.0e-9 {
         return false;
     }
     after.margin() >= before.margin() - 1.0e-9
@@ -540,6 +553,30 @@ mod tests {
                 assert!((out.smoothed.points[v][1] - m.points[v][1]).abs() < 1.0e-12);
             }
         }
+    }
+
+    #[test]
+    fn a_topology_regression_is_not_better() {
+        let (d, m) = grid_with_center([1.0, 1.0]);
+        let mut before = MeshStatistics::of(&d, &m);
+        before.passes = false; // pretend both fail for a reason other than topology
+        let mut after = before.clone();
+        after.passes = false;
+        after.cracks += 1;
+        assert!(!better(&before, &after));
+        let mut after = before.clone();
+        after.passes = false;
+        after.overlapping += 1;
+        assert!(!better(&before, &after));
+        let mut after = before.clone();
+        after.passes = false;
+        after.inverted += 1;
+        assert!(!better(&before, &after));
+        // A pure quality gain is still accepted.
+        let mut after = before.clone();
+        after.passes = false;
+        after.min_corner_angle_deg += 5.0;
+        assert!(better(&before, &after));
     }
 
     #[test]

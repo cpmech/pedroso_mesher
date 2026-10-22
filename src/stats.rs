@@ -247,8 +247,14 @@ impl MeshStatistics {
         }
         // Valence is the number of incident cells, not edges; for a quad that
         // is the same count, for a triangle it is one per triangle.
+        // Valence is the number of incident **quads**, not of cells: a node
+        // shared by three quads and one triangle is a valence-4 node in the
+        // quad mesh, and counting the triangle would misreport it.
         let mut valence = vec![0usize; mesh.points.len()];
         for cell in &mesh.cells {
+            if cell.kind != Kind::Quad4 {
+                continue;
+            }
             for &v in &cell.nodes {
                 if v < valence.len() {
                     valence[v] += 1;
@@ -277,11 +283,20 @@ impl MeshStatistics {
         // is a box-extent scale, not the geometric diagonal; see the module
         // note. The offsets are floating-point ~1e-15 on a truly conforming
         // mesh, so the tolerance only has to absorb round-off.
-        let diagonal = mesh
-            .points
-            .iter()
-            .fold(1.0_f64, |acc, p| acc.max(p[0].abs()).max(p[1].abs()));
-        let tolerance = 1.0e-6 * diagonal;
+        // Tolerance relative to the mesh's own extent, not to its distance from
+        // the origin: a domain at (1e6, 1e6) with size 1 must not get a
+        // tolerance of 1 (which would hide a boundary node a whole element off
+        // the geometry).
+        let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+        let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for p in &mesh.points {
+            x0 = x0.min(p[0]);
+            y0 = y0.min(p[1]);
+            x1 = x1.max(p[0]);
+            y1 = y1.max(p[1]);
+        }
+        let diagonal = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+        let tolerance = 1.0e-6 * diagonal.max(1.0e-12);
         Self {
             quads: gate.quads,
             triangles: gate.triangles,
@@ -395,6 +410,45 @@ mod tests {
         assert_eq!(d.max, 5.0);
         assert_eq!(d.median, 3.0);
         assert!((d.mean - 3.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn conformity_is_relative_to_the_mesh_extent() {
+        // A unit square translated to (1e6, 1e6): the old tolerance used
+        // max|coordinate| = 1e6 -> 1.0, which would hide a 0.1 offset. The
+        // extent-based tolerance (1e-6 x 1.41) must catch it.
+        use crate::mesh::Cell;
+        let domain = Domain::new(
+            vec![
+                [1.0e6, 1.0e6],
+                [1.0e6 + 1.0, 1.0e6],
+                [1.0e6 + 1.0, 1.0e6 + 1.0],
+                [1.0e6, 1.0e6 + 1.0],
+            ],
+            vec![],
+        )
+        .unwrap();
+        let mesh = Mesh::new(
+            vec![
+                [1.0e6, 1.0e6, 0.0],
+                [1.0e6 + 1.0, 1.0e6, 0.0],
+                [1.0e6 + 1.0, 1.0e6 + 1.0, 0.0],
+                [1.0e6, 1.0e6 + 0.9, 0.0], // 0.1 inside the left edge
+            ],
+            vec![Cell::quad4([0, 1, 2, 3])],
+        );
+        let s = MeshStatistics::of(&domain, &mesh);
+        // The node slid *along* the left edge (x = 1e6), so the boundary
+        // offset is 0; the corner is cut, which `corner_offset` measures.
+        assert!(s.boundary_offset < 1.0e-9, "{}", s.boundary_offset);
+        assert!(
+            (s.corner_offset - 0.1).abs() < 1.0e-6,
+            "{}",
+            s.corner_offset
+        );
+        // The old max|coordinate| tolerance (1e6 * 1e-6 = 1.0) would have
+        // called this conforming.
+        assert!(!s.conforming);
     }
 
     #[test]

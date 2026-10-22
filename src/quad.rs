@@ -381,13 +381,16 @@ pub fn mesh_quads_with_route(
     // number while the mesh no longer sits on the domain. Check it explicitly.
     // The tolerance is 1e-6 of the largest absolute coordinate (at least 1
     // unit), i.e. round-off scale rather than a geometric allowance.
-    let diagonal = mesh
-        .points
-        .iter()
-        .fold((f64::NEG_INFINITY, f64::NEG_INFINITY), |acc, p| {
-            (acc.0.max(p[0].abs()), acc.1.max(p[1].abs()))
-        });
-    let tolerance = 1.0e-6 * diagonal.0.max(diagonal.1).max(1.0);
+    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for p in &mesh.points {
+        x0 = x0.min(p[0]);
+        y0 = y0.min(p[1]);
+        x1 = x1.max(p[0]);
+        y1 = y1.max(p[1]);
+    }
+    let diagonal = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0e-12);
+    let tolerance = 1.0e-6 * diagonal;
     let offset = verify::boundary_offset(domain, &mesh);
     if offset > tolerance {
         return Err(QuadError::Unsupported(Box::new(Unsupported {
