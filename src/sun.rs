@@ -1,9 +1,10 @@
 //! Complete triangle-to-quad conversion: Sun's residual-triangle walk.
 //!
-//! Q-Morph (Owen et al. 1999) stops with an even number of residual triangles
-//! per domain. Sun, Yeh, Lin & Zhao (2015, *Eng. Comput.* 31:675-692; 2016,
-//! *Terr. Atmos. Ocean. Sci.* 27:139-152) close them without subdividing a
-//! triangle and without touching a quad that is not on the path:
+//! Q-Morph (Owen et al. 1999, corpus `owen-1999`) stops with an even number of
+//! residual triangles per domain. Sun, Yeh, Lin & Zhao (2015, *Eng. Comput.*
+//! 31:675-692; corpus `sun-2015`; 2016, *Terr. Atmos. Ocean. Sci.* 27:139-152;
+//! corpus `sun-2016`) close them without subdividing a triangle and without
+//! touching a quad that is not on the path:
 //!
 //! 1. **Move the residual, not the target.** For a residual triangle `abh` and
 //!    the centre `Pm` of the nearest other residual triangle, form the three
@@ -35,10 +36,10 @@
 //! node on one line and the outer template quad is degenerate. Two Sun 2015 §5
 //! operations are implemented for it:
 //!
-//! - **M2/M3 edge swap** ([`WalkMesh::repair_quad`]): after the template, swap
+//! - **M2/M3 edge swap** (`WalkMesh::repair_quad`): after the template, swap
 //!   the degenerate quad's shared edge with an adjacent quad; if the pair of
 //!   new quads is positive, the degeneracy is gone.
-//! - **M6-style absorption** ([`WalkMesh::absorb_sliver`]): when `e-b-c-f` are
+//! - **M6-style absorption** (`WalkMesh::absorb_sliver`): when `e-b-c-f` are
 //!   collinear on the boundary, remove the sliver plus its two quads and
 //!   replace them by two quads, deleting one boundary node. The boundary
 //!   geometry is unchanged because the four nodes are collinear.
@@ -56,15 +57,39 @@
 //!
 //! **Clean room.** Implemented from the papers above; no source code was read
 //! or ported.
+//!
+//! **Public API.** [`close_residuals`] is the whole pipeline used by
+//! [`crate::qmorph::convert_with_stats`]; [`close_by_cavity`] is the local
+//! cavity fallback for residuals the walk could not move; and
+//! [`repair_low_quads`], [`improve_quality`], [`repair_degenerate_quads`] and
+//! [`perturb_low_quads`] are post-processing passes on a finished quad mesh.
+//! All of them take `(points, quads, tris)` slices and return new vectors plus a
+//! count; none mutates its input or drops a cell. The indices in `quads`/`tris`
+//! must be valid for `points`; that is a precondition of the whole module, not
+//! something the functions re-validate.
+//!
+//! **Approximated or missing.** The boundary template inserts the midpoint of a
+//! straight boundary edge, not a point projected onto a curved boundary; the
+//! cavity quadrangulation (`close_by_cavity`) is an extension of this mesher,
+//! not a Sun template; and a residual that cannot reach a boundary and whose
+//! cavity is not simple is carried out in `CloseStats::remaining` rather than
+//! forced.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::mesh::Node;
 
 /// A cell of the closing mesh.
+///
+/// The walk keeps the residual triangles and the quads in one mesh so that a
+/// merge/recombination can delete both kinds and insert both kinds in one
+/// adjacency update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cell {
+    /// An unconverted residual triangle.
     Tri([usize; 3]),
+
+    /// A quad, either from Q-Morph, a merge or a template.
     Quad([usize; 4]),
 }
 
@@ -94,40 +119,73 @@ impl Cell {
 }
 
 /// What the residual walk did on one conversion.
+///
+/// The counters describe attempts, not a partition: a residual can be attempted
+/// by the walk, then by the boundary template, then by the cavity, and still be
+/// counted in `remaining`. `merged_pairs + remaining` is not the input count
+/// either, because a merge removes two triangles and adds one quad (and the
+/// cavity adds several).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CloseStats {
     /// Triangles in the Q-Morph output.
     pub start_triangles: usize,
+
     /// Pairs merged into a quad.
     pub merged_pairs: usize,
+
     /// Pentagon recombinations performed while moving.
     pub moves: usize,
+
     /// Residual triangle finished with the Sun 2016 boundary template.
     pub boundary_templates: usize,
+
     /// Sun 2015 §5.2.1 M2/M3 edge swaps that made a template quad valid.
     pub boundary_repairs: usize,
+
     /// Sun 2015 §5.2.1 M6-style absorptions: a boundary sliver plus its two
     /// quads become two quads, removing the collinear boundary node.
     pub boundary_absorptions: usize,
+
     /// Residuals closed by a local cavity quadrangulation.
     pub cavity_closures: usize,
+
+    /// Cavity regions tried (a region can fail and be retried larger).
     pub cavity_attempts: usize,
+
+    /// Cavity attempts rejected because the region boundary was not a single
+    /// simple loop (a hole, several loops, or a vertex of degree not two).
     pub cavity_boundary_fail: usize,
+
+    /// Cavity attempts rejected because the boundary had odd length and no
+    /// domain-boundary edge was available to split.
     pub cavity_odd_fail: usize,
+
+    /// Cavity attempts where the dynamic-programming quadrangulation found no
+    /// valid tiling.
     pub cavity_dp_fail: usize,
+
+    /// Cavity attempts rejected after quadrangulation by the area/Jacobian/
+    /// manifold validation.
     pub cavity_valid_fail: usize,
+
     /// Boundary residuals whose template was tried.
     pub template_attempts: usize,
+
     /// Template attempts rejected before adding cells (not simple).
     pub template_raw_failures: usize,
+
     /// Templates whose degenerate quads M2/M3 could not repair.
     pub template_repair_failures: usize,
+
     /// Triangles that could not be moved or merged.
     pub stuck: usize,
+
     /// Candidate quads refused because of the Jacobian guard.
     pub quality_rejections: usize,
+
     /// Adjacent residual pairs whose union was not a convex quad.
     pub merge_failures: usize,
+
     /// Triangles left in the returned mesh.
     pub remaining: usize,
 }
@@ -142,33 +200,95 @@ const MIN_TRI_AREA2: f64 = 1e-14;
 /// A cavity quad must leave usable quality; otherwise the cavity is rejected.
 const CAVITY_MIN_SJ: f64 = 0.0;
 
+/// The mutable mesh on which the residual walk operates.
+///
+/// It is a stripped-down [`crate::qmorph::CellMesh`]: no front and no buckets,
+/// because the walk only needs edge adjacency, the set of live triangles and the
+/// current domain-boundary edges. Removed cells are `None` so ids stay stable
+/// (the move/recombination logic compares ids). Every cell is stored
+/// counter-clockwise and canonically rotated; all coordinates are in the XY
+/// plane.
 #[derive(Clone)]
 struct WalkMesh {
+    /// Nodes in the plane; the boundary template and the cavity fallback append
+    /// to this, so ids in the input slices remain valid.
     points: Vec<Node>,
+
+    /// Cells by id; `None` is a removed cell.
     cells: Vec<Option<Cell>>,
+
+    /// Edge key -> owning cell ids; the source of truth for adjacency.
     edges: HashMap<(usize, usize), Vec<usize>>,
+
+    /// Ids of the live triangles. Kept as a set (not a counter) because the walk
+    /// iterates the triangles by id.
     tris: HashSet<usize>,
+
+    /// Domain-boundary edges (exactly one owner), sorted. Rebuilt by
+    /// `recompute_boundary` after an operation that can change it.
     boundary: Vec<(usize, usize)>,
+
+    /// Pentagons recombined while moving a residual.
     moves: usize,
+
+    /// Residual pairs merged into a quad.
     merged: usize,
+
+    /// Candidate quads rejected by `move_min_sj`.
     quality_rejections: usize,
+
+    /// Residual pairs whose union was not a valid quad.
     merge_failures: usize,
+
+    /// M2/M3 edge swaps applied while repairing a template quad.
     repairs: usize,
+
+    /// Fig. 6 boundary templates applied.
     templates: usize,
+
+    /// Cavity quadrangulations applied.
     cavities: usize,
+
+    /// Cavity regions attempted.
     cavity_attempts: usize,
+
+    /// Cavity attempts rejected by `region_boundary`.
     cavity_boundary_fail: usize,
+
+    /// Cavity attempts rejected because the loop was odd and no boundary edge
+    /// could be split.
     cavity_odd_fail: usize,
+
+    /// Cavity attempts rejected by the DP quadrangulation.
     cavity_dp_fail: usize,
+
+    /// Cavity attempts rejected by the area/Jacobian/manifold validation.
     cavity_valid_fail: usize,
+
+    /// Current Jacobian floor for a recombination step: `0.2`, then `0.1`,
+    /// then `0.0` in the staged pass of [`close_residuals`].
     move_min_sj: f64,
+
+    /// Boundary-template attempts.
     template_attempts: usize,
+
+    /// Template attempts rejected before any cell was added.
     template_raw_failures: usize,
+
+    /// Template attempts that could not be repaired to a positive mesh.
     template_repair_failures: usize,
+
+    /// M6-style boundary absorptions applied.
     absorptions: usize,
 }
 
 impl WalkMesh {
+    /// Build the closing mesh from a Q-Morph output.
+    ///
+    /// Quads are indexed first, then the residual triangles, both after
+    /// normalisation (counter-clockwise and canonically rotated). The initial
+    /// boundary is every edge with exactly one owner, sorted so the boundary
+    /// scan is deterministic.
     fn new(points: &[Node], quads: &[[usize; 4]], tris: &[[usize; 3]]) -> Self {
         let mut mesh = WalkMesh {
             points: points.to_vec(),
@@ -217,11 +337,13 @@ impl WalkMesh {
         mesh
     }
 
+    /// Append a cell without indexing; the caller must call [`WalkMesh::index`].
     fn push_raw(&mut self, cell: Cell) -> usize {
         self.cells.push(Some(cell));
         self.cells.len() - 1
     }
 
+    /// Register a cell's edges and, for a triangle, its id in `tris`.
     fn index(&mut self, id: usize) {
         let Some(Some(cell)) = self.cells.get(id).copied() else {
             return;
@@ -234,12 +356,14 @@ impl WalkMesh {
         }
     }
 
+    /// Append and index a cell; returns its new id.
     fn add(&mut self, cell: Cell) -> usize {
         let id = self.push_raw(cell);
         self.index(id);
         id
     }
 
+    /// Remove cell `id` from the mesh and return it, or `None` if already gone.
     fn remove(&mut self, id: usize) -> Option<Cell> {
         let cell = self.cells.get_mut(id)?.take()?;
         for i in 0..cell.n_nodes() {
@@ -257,32 +381,39 @@ impl WalkMesh {
         Some(cell)
     }
 
+    /// The live cell with id `id`, or `None` if removed/out of range.
     fn cell(&self, id: usize) -> Option<Cell> {
         self.cells.get(id).copied().flatten()
     }
 
+    /// True when `id` is a live triangle.
     fn is_tri(&self, id: usize) -> bool {
         self.cell(id).is_some_and(Cell::is_tri)
     }
 
+    /// Live triangle ids in ascending order (deterministic walk order).
     fn tri_ids(&self) -> Vec<usize> {
         let mut ids: Vec<usize> = self.tris.iter().copied().collect();
         ids.sort_unstable();
         ids
     }
 
+    /// Number of live residual triangles.
     fn tri_count(&self) -> usize {
         self.tris.len()
     }
 
+    /// Owners of `edge`, or an empty slice if absent.
     fn edge_cells(&self, edge: (usize, usize)) -> &[usize] {
         self.edges.get(&edge).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// True when `edge` has exactly one owner (a domain-boundary edge).
     fn is_boundary_edge(&self, edge: (usize, usize)) -> bool {
         self.edge_cells(edge).len() == 1
     }
 
+    /// The triangle nodes of `id`, or `None` if it is not a live triangle.
     fn tri(&self, id: usize) -> Option<[usize; 3]> {
         match self.cell(id) {
             Some(Cell::Tri(t)) => Some(t),
@@ -290,6 +421,7 @@ impl WalkMesh {
         }
     }
 
+    /// The quad nodes of `id`, or `None` if it is not a live quad.
     fn quad(&self, id: usize) -> Option<[usize; 4]> {
         match self.cell(id) {
             Some(Cell::Quad(q)) => Some(q),
@@ -297,15 +429,19 @@ impl WalkMesh {
         }
     }
 
+    /// XY coordinates of node `i`.
     fn p(&self, i: usize) -> [f64; 2] {
         [self.points[i][0], self.points[i][1]]
     }
 
+    /// Centroid of a live cell, or `None` if the id is gone.
     fn center(&self, id: usize) -> Option<[f64; 2]> {
         let cell = self.cell(id)?;
         self.center_of(cell)
     }
 
+    /// Arithmetic mean of a cell's nodes; used as the distance reference for
+    /// the nearest-residual search.
     fn center_of(&self, cell: Cell) -> Option<[f64; 2]> {
         let n = cell.n_nodes();
         let mut c = [0.0, 0.0];
@@ -317,6 +453,10 @@ impl WalkMesh {
         Some([c[0] / n as f64, c[1] / n as f64])
     }
 
+    /// True when the two live triangles share an edge.
+    ///
+    /// Edge keys are sorted, so the test is orientation-independent. Used by
+    /// [`WalkMesh::walk_to`] to stop as soon as a merge is possible.
     fn shares_edge(&self, t1: usize, t2: usize) -> bool {
         let (Some(a), Some(b)) = (self.tri(t1), self.tri(t2)) else {
             return false;
@@ -332,6 +472,8 @@ impl WalkMesh {
         false
     }
 
+    /// All other residual triangles, nearest first by centroid distance, with
+    /// the triangle id as the tie-break so the order is deterministic.
     fn nearest_tris(&self, id: usize) -> Vec<usize> {
         let Some(c) = self.center(id) else {
             return Vec::new();
@@ -357,6 +499,13 @@ impl WalkMesh {
     }
 
     /// Merge two residual triangles sharing an edge into one quad.
+    ///
+    /// Tries every edge of `t1` and looks for the reverse traversal in `t2`, so
+    /// the quad is built in each triangle's own winding (the `quad_from_pair`
+    /// rule). The merge is accepted only if the quad is simple, has a positive
+    /// Jacobian and passes [`WalkMesh::valid_new_cell`]; otherwise the mesh is
+    /// untouched and `merge_failures` is incremented. Returns whether a merge
+    /// happened.
     fn merge(&mut self, t1: usize, t2: usize) -> bool {
         let (Some(a), Some(b)) = (self.tri(t1), self.tri(t2)) else {
             return false;
@@ -391,6 +540,12 @@ impl WalkMesh {
     }
 
     /// One pentagon recombination towards `pm`.
+    ///
+    /// Sun 2015 Eqs. (2)-(3): rank the residual's three edges by the scaled
+    /// Jacobian of the triangle `pm`-edge, smallest first (negative means `pm`
+    /// lies across that edge), then take the first edge not in `skip` whose
+    /// other side is a quad and whose recombination is valid. `skip` lets a
+    /// caller reject one edge after a failed merge and try the next.
     fn move_toward(&mut self, id: usize, pm: [f64; 2], skip: Option<(usize, usize)>) -> Move {
         let Some(t) = self.tri(id) else {
             return Move::Stuck;
@@ -558,6 +713,7 @@ impl WalkMesh {
         Err(id)
     }
 
+    /// True when the triangle has at least one domain-boundary edge.
     fn tri_has_boundary(&self, id: usize) -> bool {
         let Some(t) = self.tri(id) else {
             return false;
@@ -565,6 +721,8 @@ impl WalkMesh {
         (0..3).any(|i| self.is_boundary_edge(Cell::Tri(t).edge(i)))
     }
 
+    /// A domain-boundary edge of a quad that is adjacent to the residual, i.e.
+    /// a boundary edge the residual could be moved onto in one recombination.
     fn adjacent_boundary_edge(&self, id: usize) -> Option<(usize, usize)> {
         let t = self.tri(id)?;
         for i in 0..3 {
@@ -586,6 +744,10 @@ impl WalkMesh {
         None
     }
 
+    /// The domain-boundary edge whose midpoint is nearest to `p`.
+    ///
+    /// Ties are broken by the smaller edge key. `None` only when the mesh has no
+    /// boundary (which cannot happen for a triangulated domain, but is guarded).
     fn nearest_boundary_edge(&self, p: [f64; 2]) -> Option<(usize, usize)> {
         let mut best: Option<(f64, (usize, usize))> = None;
         for &edge in &self.boundary {
@@ -805,7 +967,12 @@ impl WalkMesh {
         }
     }
 
-    /// region is not simply connected (a hole or several loops).
+    /// The boundary loop of a region, counter-clockwise.
+    ///
+    /// Returns `None` when the region is not simply connected (a hole or several
+    /// loops), when an edge is used more than twice, or when the walk cannot
+    /// close. The loop is the sequence of boundary vertices, not edges, and the
+    /// closing edge is implicit.
     fn region_boundary(&self, region: &HashSet<usize>) -> Option<Vec<usize>> {
         let mut counts: HashMap<(usize, usize), usize> = HashMap::new();
         for &id in region {
@@ -870,6 +1037,10 @@ impl WalkMesh {
     }
 
     /// A quad adjacent to the region, for one growth step.
+    ///
+    /// The smallest id is returned so the growth order is deterministic; only
+    /// quads (not residuals) are returned, because the region must stay a
+    /// quad patch around the residual.
     fn frontier_quad(&self, region: &HashSet<usize>) -> Option<usize> {
         let mut candidates = Vec::new();
         for &id in region {
@@ -892,6 +1063,8 @@ impl WalkMesh {
     /// residuals are used as seeds when available, so the cavity boundary has
     /// even parity; a lone residual grows until the cavity touches a domain
     /// boundary edge, which is split with one point (the non-local Fig. 6).
+    /// Try to close one residual by a cavity: the first live triangle whose
+    /// cavity succeeds, in ascending id order. Returns whether one closed.
     fn cavity_one(&mut self, size: f64) -> bool {
         let ids = self.tri_ids();
         for id in ids {
@@ -902,6 +1075,15 @@ impl WalkMesh {
         false
     }
 
+    /// Close the residual `seed` with the first cavity strategy that works.
+    ///
+    /// Strategies, in order: a compact disk around the seed; a corridor to the
+    /// nearest other residual; a compact region around both; a corridor to the
+    /// boundary; and finally one-quad-at-a-time growth. Each strategy retries
+    /// with growing radii/regions before the next; `size` is the element size in
+    /// millimetres and scales the compact radii (zero disables the compact
+    /// strategies). A failed strategy leaves the mesh unchanged (the cavity
+    /// validation restores the points it inserted).
     fn cavity_close(&mut self, seed: usize, size: f64) -> bool {
         // 0. Compact region grown by Euclidean radius. A one-cell corridor is
         // often too thin to quadrangulate; a disk around the residual is not.
@@ -977,6 +1159,11 @@ impl WalkMesh {
     }
 
     /// Connected quads within `radius` of the seed's centre, plus the seed.
+    /// Connected quads within `radius` of the seed's centre, plus the seed.
+    ///
+    /// Growth is by edge adjacency and stops when no new quad's centroid lies
+    /// inside the radius; the result is a disk-like patch, not a shortest path.
+    /// Returns just `{seed}` when the seed has no centre (removed cell).
     fn compact_region(&self, seed: usize, radius: f64) -> HashSet<usize> {
         let Some(center) = self.center(seed) else {
             return HashSet::from([seed]);
@@ -1057,6 +1244,13 @@ impl WalkMesh {
 
     /// Shortest path from `start` to `target` through quad cells (the end
     /// points may be triangles). Returns the cells on the path.
+    /// Shortest path from `start` to `target` through quad cells (the end
+    /// points may be triangles). Returns the cells on the path.
+    ///
+    /// BFS through quad-only adjacency; a triangle other than `target` is not
+    /// traversed. `max_cells` caps both the BFS frontier and the final path;
+    /// hitting it returns `None` rather than a truncated path, because a hole in
+    /// the region would make the boundary non-simple.
     fn path_region(&self, start: usize, target: usize, max_cells: usize) -> Option<HashSet<usize>> {
         let mut previous: HashMap<usize, usize> = HashMap::new();
         let mut queue = VecDeque::new();
@@ -1109,6 +1303,10 @@ impl WalkMesh {
     }
 
     /// Add all quads adjacent to the region, up to `limit` cells.
+    ///
+    /// Returns whether at least one cell was added; when the limit is reached
+    /// the remaining candidates are dropped (the caller tries the region again
+    /// before expanding further).
     fn expand_region(&self, region: &mut HashSet<usize>, limit: usize) -> bool {
         let mut added = false;
         let mut candidates = Vec::new();
@@ -1139,6 +1337,9 @@ impl WalkMesh {
     }
 
     /// The quad owning the domain boundary edge nearest to the seed.
+    ///
+    /// Boundary edges owned by a residual are skipped; the return is a quad id,
+    /// because the corridor strategy needs a quad to grow through.
     fn nearest_boundary_cell(&self, seed: usize) -> Option<usize> {
         let center = self.center(seed)?;
         let mut best: Option<(f64, usize)> = None;
@@ -1158,6 +1359,15 @@ impl WalkMesh {
         best.map(|(_, owner)| owner)
     }
 
+    /// Quadrangulate `region` and, if the result is valid, replace it.
+    ///
+    /// Steps: extract the region boundary loop (`None` => not simple), drop
+    /// collinear boundary vertices, split one domain-boundary edge when the loop
+    /// is odd (inserting a point, removed again on failure), run the DP
+    /// quadrangulation, then validate area, Jacobian and manifoldness. The
+    /// replacement is atomic: either every region cell is removed and every new
+    /// quad is added, or nothing changes and one of the `cavity_*_fail` counters
+    /// is incremented.
     fn try_cavity_region(&mut self, region: &HashSet<usize>) -> bool {
         self.cavity_attempts += 1;
         let mut loopv = match self.region_boundary(region) {
@@ -1242,6 +1452,10 @@ impl WalkMesh {
     }
 
     /// Quads whose bilinear Jacobian is not strictly positive.
+    ///
+    /// `1e-9` rather than `0`: a quad that is positive only at the noise level
+    /// is treated as degenerate, because M2/M3 has to make it clearly positive,
+    /// not barely so.
     fn bad_quad_ids(&self) -> Vec<usize> {
         let mut out = Vec::new();
         for id in 0..self.cells.len() {
@@ -1314,7 +1528,6 @@ impl WalkMesh {
         best
     }
 
-    /// Apply the best swap with one neighbour of `id`.
     /// The smallest Jacobian over all quads (1.0 when there are none).
     fn min_quad_sj(&self) -> f64 {
         let mut min = f64::INFINITY;
@@ -1331,6 +1544,11 @@ impl WalkMesh {
         }
     }
 
+    /// Apply the M2/M3 swap that best improves quad `id` with one neighbour.
+    ///
+    /// Chooses the highest-score valid swap among the quad's four neighbours;
+    /// returns `false` when no swap is valid. The caller (`try_template_repair`)
+    /// loops this over all bad quads.
     fn repair_quad(&mut self, id: usize) -> bool {
         let Some(q1) = self.quad(id) else {
             return false;
@@ -1402,6 +1620,10 @@ impl WalkMesh {
     }
 
     /// Template one boundary residual, if any is ready.
+    ///
+    /// Tries M6 absorption first (the straight-staircase case), then the Fig. 6
+    /// template with its M2/M3 repair, in ascending residual id order. Returns
+    /// whether one residual was closed.
     fn template_one_boundary(&mut self) -> bool {
         let ids = self.tri_ids();
         for id in ids {
@@ -1422,6 +1644,13 @@ impl WalkMesh {
 
     /// The Sun 2016, Fig. 6 template: one residual triangle with its boundary
     /// edge and its two adjacent quads become three quads.
+    ///
+    /// The midpoint of the boundary edge is inserted and the three cells are
+    /// replaced by three quads around it (`[P,d,e,b]`, `[P,g,a,d]`, `[P,c,f,g]`
+    /// for the local labels). The operation is accepted only if all three are
+    /// simple and manifold with respect to the rest of the mesh; the midpoint is
+    /// popped again on rejection. Returns whether the template was applied; the
+    /// caller then repairs any non-positive quad with M2/M3 or restores a backup.
     fn apply_template_raw(&mut self, id: usize) -> bool {
         let Some(t) = self.tri(id) else {
             return false;
@@ -1502,6 +1731,10 @@ impl WalkMesh {
         false
     }
 
+    /// The quad across edge `a`-`b` of the residual, excluding `exclude`.
+    ///
+    /// A residual has a triangle on one side of the edge and (for this call) the
+    /// quad to be consumed on the other; the function returns that quad.
     fn quad_neighbor(&self, a: usize, b: usize, exclude: usize) -> Option<usize> {
         let edge = (a.min(b), a.max(b));
         self.edge_cells(edge)
@@ -1533,6 +1766,11 @@ impl WalkMesh {
         per_cell.values().all(|&count| count <= 1)
     }
 
+    /// Try to finish the last residual: absorb/template it if it is on the
+    /// boundary, otherwise walk it to the boundary and use the template there.
+    ///
+    /// `cap` bounds the walk (cells + 64); a failed walk leaves the residual
+    /// where it got to (valid mesh, still a triangle) and returns `false`.
     fn finish_last(&mut self, mut id: usize) -> bool {
         let cap = self.cells.len() + 64;
         for _ in 0..cap {
@@ -1572,6 +1810,10 @@ impl WalkMesh {
         false
     }
 
+    /// The live cells as `(quads, triangles)`, in id order.
+    ///
+    /// This is the canonical output order: ids never decrease, so a run with the
+    /// same operations produces the same vectors.
     fn collect(&self) -> (Vec<[usize; 4]>, Vec<[usize; 3]>) {
         let mut quads = Vec::new();
         let mut tris = Vec::new();
@@ -1585,13 +1827,39 @@ impl WalkMesh {
     }
 }
 
+/// The outcome of one [`WalkMesh::move_toward`] step.
 enum Move {
+    /// The residual moved; the payload is its new cell id.
     Moved(usize),
+
+    /// The residual reached another residual; `id` is that neighbour and `edge`
+    /// is the shared edge (the caller may need to try a different edge if the
+    /// merge fails).
     Adjacent { id: usize, edge: (usize, usize) },
+
+    /// No usable edge: the walk cannot move this residual.
     Stuck,
 }
 
 /// Close the residual triangles of a Q-Morph conversion.
+///
+/// Implements the Sun et al. walk of the module documentation: repeatedly pair
+/// residuals (moving one towards the other with pentagon recombinations), then
+/// finish a boundary residual with the M6 absorption or the Fig. 6 template, and
+/// finally try the last one with `WalkMesh::finish_last`. The walk is staged
+/// at Jacobian floors `0.2`, `0.1`, `0.0`: a residual that cannot move at a
+/// strict floor is retried with a looser one, which is how the last slivers get
+/// closed without accepting a bad mesh (the gate is checked afterwards).
+///
+/// # Postconditions
+///
+/// The returned `(points, quads, triangles)` tile the input: every input quad
+/// and triangle is either still present or was replaced by cells covering the
+/// same area. `points` may be longer than the input (the boundary template
+/// inserts a midpoint). Every returned triangle is a residual the walk could not
+/// move; `CloseStats::remaining` gives its count. The input indices must be valid
+/// for `points`; downstream code assumes that, so malformed input is outside the
+/// contract.
 pub fn close_residuals(
     points: &[Node],
     quads: &[[usize; 4]],
@@ -1724,6 +1992,15 @@ pub fn close_residuals(
 
 /// Quadrangulate a simple polygon by dynamic programming over non-crossing
 /// diagonals. Returns the quads with the largest possible minimum Jacobian.
+///
+/// `loopv` is the boundary loop in order (counter-clockwise for a positive
+/// area); it must have even length, otherwise the polygon cannot be tiled by
+/// quads and the result is `None`. The DP state `(i, j)` is the sub-polygon
+/// `i..=j`; a state is a quad `(i,k,l,j)` plus three independently solved
+/// sub-polygons `(i,k)`, `(k,l)`, `(l,j)`. The objective is the minimum Jacobian
+/// over the whole tiling, so a tiling is only as good as its worst quad. The
+/// reconstructed area is checked against the polygon area (a crossed or
+/// inconsistent tiling is rejected).
 fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
     let n = loopv.len();
     if n < 4 || n % 2 == 1 {
@@ -1835,6 +2112,14 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
 
 /// Repair quads below `threshold` with the M2/M3 edge swap, repeatedly, until
 /// none can be improved. Returns the mesh and the number of swaps.
+///
+/// A quad is a candidate when its `quad_min_sj` is below `threshold`; the swap
+/// is the best M2/M3 pair with one of its neighbours (see
+/// `WalkMesh::best_swap_between`). Unlike the template repair, a standalone
+/// quality repair may **not** leave an inverted quad: if a swap would make the
+/// mesh minimum non-positive, the whole pass is rolled back and the input copy
+/// is returned with zero swaps. `rounds` bounds the number of accepted swaps,
+/// not the number of candidates examined.
 pub fn repair_low_quads(
     points: &[Node],
     quads: &[[usize; 4]],
@@ -1875,6 +2160,12 @@ pub fn repair_low_quads(
 /// Greedy quality pass: swap the shared edge of two quads when the minimum
 /// corner angle of the pair improves and both new quads keep SJ >= 0.2. This is
 /// the topological half the node smoother cannot do; it runs on the final mesh.
+///
+/// This is an angle-driven improvement, not the degenerate-Jack repair of
+/// [`repair_degenerate_quads`]: it only considers swaps that increase
+/// `min(corner angle)` and requires a clearly positive Jacobian, so it never
+/// makes a good mesh worse and never chases a collinear (180 degree) corner.
+/// `rounds` bounds the accepted swaps; `tris` is carried through untouched.
 pub fn improve_quality(
     points: &[Node],
     quads: &[[usize; 4]],
@@ -1941,6 +2232,12 @@ pub fn improve_quality(
     (mesh.points, quads, tris, swaps)
 }
 
+/// Smallest interior corner angle of a quad, in degrees.
+///
+/// Returns `0.0` for a degenerate corner (zero-length edge) or a non-finite
+/// result, so the caller's comparison always has a real number. The angle is
+/// computed from the two edge vectors at each node and clamped to `[-1, 1]`
+/// before `acos`, so a nearly collinear corner is 180 degrees, not NaN.
 fn quad_min_angle(points: &[Node], quad: &[usize; 4]) -> f64 {
     let p = |i: usize| [points[i][0], points[i][1]];
     let c = [p(quad[0]), p(quad[1]), p(quad[2]), p(quad[3])];
@@ -1978,6 +2275,19 @@ fn quad_min_angle(points: &[Node], quad: &[usize; 4]) -> f64 {
 /// length, where sliding a node rebalances it. The step is a small fraction of
 /// the local size, and a move is kept only when it raises the worst incident
 /// margin, so a good area of the mesh does not move.
+///
+/// `size` is the local element size in millimetres and sets the search radii
+/// (`0.02`, `0.05`, `0.1` of it). `domain` is required to keep boundary nodes on
+/// the geometry: with `None`, a node that lies on a mesh boundary edge is left
+/// alone; with `Some`, it may slide along its nearest domain segment. Domain
+/// sharp corners are never moved. `rounds` bounds the number of accepted moves.
+///
+/// # Postconditions
+///
+/// Only points move; the connectivity and the cell lists are unchanged. A move
+/// is accepted only if it strictly raises the minimum gate margin over the
+/// incident quads (a negative margin is a real score, so a move that lifts a
+/// degenerate quad can win). The return count is the number of moves.
 pub fn perturb_low_quads(
     points: &[Node],
     quads: &[[usize; 4]],
@@ -2112,6 +2422,11 @@ pub fn perturb_low_quads(
 /// (the collinear corner is 180°), and an angle-driven swap never picks it. The
 /// swap only touches pairs with a bad member, and both new quads must clear the
 /// floor, so an all-good mesh is left untouched.
+///
+/// "Degenerate" here means `quad_min_sj <= floor`, not necessarily inverted: the
+/// pass only considers a pair when at least one member is at or below `floor`,
+/// and requires the new minimum to be strictly above both `floor` and the old
+/// value. `rounds` bounds the accepted swaps; `tris` is carried through.
 pub fn repair_degenerate_quads(
     points: &[Node],
     quads: &[[usize; 4]],
@@ -2181,6 +2496,11 @@ pub fn repair_degenerate_quads(
 /// after the ordinary pairing/absorption/template pipeline has stalled; the
 /// cavity is deliberately not part of that pipeline because it changes the
 /// ordering the front needs.
+///
+/// Runs at most 64 successful cavities; `size` is the element size in
+/// millimetres and scales the compact regions (zero disables them). Returns the
+/// new mesh and the number of cells closed. Residuals that no cavity can close
+/// are returned unchanged; the function never forces a tiling.
 pub fn close_by_cavity(
     points: &[Node],
     quads: &[[usize; 4]],
@@ -2199,10 +2519,12 @@ pub fn close_by_cavity(
     (mesh.points, quads, tris, closed)
 }
 
+/// Midpoint of two points, in the XY plane.
 fn midpoint(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5]
 }
 
+/// Twice the signed area of triangle `a-b-c` (positive when counter-clockwise).
 fn area2(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 }
@@ -2227,10 +2549,18 @@ fn point_edge_sj(pm: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     }
 }
 
+/// True when the cell's boundary contains the undirected edge.
 fn cell_has_edge(cell: Cell, edge: (usize, usize)) -> bool {
     (0..cell.n_nodes()).any(|i| cell.edge(i) == edge)
 }
 
+/// Put a triangle in counter-clockwise order and rotate it to start at the
+/// smallest node id.
+///
+/// The rotation is what makes the walk deterministic: tie-breaks follow the
+/// stored node order, so `(1, 2, 0)` and `(0, 1, 2)` must compare equal before
+/// any state is stored. This is the fix recorded in the `the_closure_does_not_
+/// depend_on_triangle_rotation` test.
 fn normalize_tri(points: &[Node], t: [usize; 3]) -> [usize; 3] {
     let t = if tri_area2(points, t) < 0.0 {
         [t[0], t[2], t[1]]
@@ -2252,6 +2582,11 @@ fn normalize_tri(points: &[Node], t: [usize; 3]) -> [usize; 3] {
     [t[i], t[(i + 1) % 3], t[(i + 2) % 3]]
 }
 
+/// Put a quad in counter-clockwise order and rotate it to start at the smallest
+/// node id, for the same determinism reason as [`normalize_tri`].
+///
+/// Reversing a clockwise quad must preserve its cyclic neighbour order:
+/// `[q0, q3, q2, q1]` is the reversal of the cycle, not a swap of two corners.
 fn normalize_quad(points: &[Node], q: [usize; 4]) -> [usize; 4] {
     let p = |i: usize| [points[i][0], points[i][1]];
     let twice: f64 = (0..4)
@@ -2276,9 +2611,11 @@ fn normalize_quad(points: &[Node], q: [usize; 4]) -> [usize; 4] {
     [q[i], q[(i + 1) % 4], q[(i + 2) % 4], q[(i + 3) % 4]]
 }
 
-/// The bilinear scaled Jacobian minima used by the quality contract. It may be
-/// negative when a corner is inverted; [`quad_sj`] is the positive-only view.
 /// Closest point to `p` on the segment `a`-`b`.
+///
+/// The projection parameter is clamped, so the result is always on the closed
+/// segment (a boundary node cannot slide off its segment). A degenerate segment
+/// returns `a`.
 fn project_on_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     let d = [b[0] - a[0], b[1] - a[1]];
     let len2 = d[0] * d[0] + d[1] * d[1];
@@ -2289,6 +2626,13 @@ fn project_on_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     [a[0] + t * d[0], a[1] + t * d[1]]
 }
 
+/// The bilinear scaled Jacobian minima used by the quality contract.
+///
+/// It may be negative when a corner is inverted; [`quad_sj`] is the positive-only
+/// view. The value is the minimum over the four reference corners of
+/// `det J / (|J_col0| |J_col1|)`, exactly the gate's metric; `-1.0` is returned
+/// when the map is degenerate, so callers can compare without special-casing
+/// NaN.
 fn quad_min_sj(points: &[Node], quad: &[usize; 4]) -> f64 {
     const XI: [[f64; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
     let p = [
@@ -2321,7 +2665,12 @@ fn quad_min_sj(points: &[Node], quad: &[usize; 4]) -> f64 {
     }
 }
 
-/// The absolute area of a simple quad.
+/// Twice the absolute area of a simple quad.
+///
+/// The doubling is deliberate and consistent across this module: the triangle
+/// helper [`tri_area2`] also returns twice the area, and all area comparisons
+/// (`absorb_sliver`, `try_cavity_region`, `quadrangulate`) are made in these
+/// doubled units. Do not mix it with `two_d::quad_area`, which halves.
 fn quad_area(points: &[Node], quad: &[usize; 4]) -> f64 {
     let p = |i: usize| [points[i][0], points[i][1]];
     let a = p(quad[0]);
@@ -2364,6 +2713,8 @@ fn collinear(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> bool {
     cross <= 1.0e-9 * scale * scale
 }
 
+/// True when the open segments `p`-`q` and `r`-`s` cross; touching or collinear
+/// segments return `false`.
 fn segments_cross(p: [f64; 2], q: [f64; 2], r: [f64; 2], s: [f64; 2]) -> bool {
     let d1 = area2(p, q, r);
     let d2 = area2(p, q, s);
