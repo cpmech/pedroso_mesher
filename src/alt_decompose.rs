@@ -1,8 +1,13 @@
 //! Domain decomposition + templates: an all-quadrilateral route.
 //!
-//! The method follows Yang et al. (2024), *Boundary constrained quad mesh
-//! generation based on domain decomposition and templates*, and Miranda &
-//! Martha (2017), *Hierarchical template-based quadrilateral mesh generation*:
+//! Corpus papers **`yang-2024`** (Yang et al., *Boundary constrained quad mesh
+//! generation based on domain decomposition and templates*), **`miranda-2017`**
+//! (Miranda & Martha, *Hierarchical template-based quadrilateral mesh
+//! generation*) and **`ma-2017`** (*Sub-domain decomposition and quadrilateral
+//! meshing with line constraints*).  Implemented: Yang et al. §3.2/§3.3 (chord
+//! decomposition, reflex-vertex rays and candidate scoring), Miranda's
+//! transfinite T0/T1/T2 templates, and the one-hole eight-block O-grid.  The
+//! steps are:
 //!
 //! 1. the boundary loops are discretised once, at the requested size, and the
 //!    discretisation is shared by every patch (this is what makes the result
@@ -20,9 +25,11 @@
 //!    so all interior nodes are computed by the mapping and all boundary nodes
 //!    are the shared ones;
 //! 4. patch parity is fixed on the chords: an even number of boundary segments
-//!    per patch is a necessary condition for a pure quad mesh.  The chord
-//!    parities solve a GF(2) system on the patch-adjacency tree, and the loop
-//!    totals are made even before the boundary is generated;
+//!    per patch is a necessary condition for a pure quad mesh.  Each patch
+//!    contributes a parity residual (its boundary segments XOR its chord
+//!    counts); the chord parities solve the GF(2) system "one flip per chord"
+//!    on a spanning forest of the patch-adjacency graph, processed bottom-up,
+//!    and the outer loop total is made even before the boundary is generated;
 //! 5. a domain with one hole is meshed as an O-grid of eight patches, one per
 //!    half outer side, with the hole split radially to those eight points;
 //! 6. the assembled mesh is relaxed by forty interior Laplacian sweeps and a
@@ -33,17 +40,24 @@
 //! Implemented: boundary discretisation, recursive domain decomposition,
 //! transfinite mapping, T0/T1/T2 templates, one-hole O-grid, parity fixing.
 //! Not implemented: triangular/pentagonal template families (a triangular
-//! *domain* is refused), several holes, and curved (non-planar) patches.  A
-//! subregion whose four corners are not convex is passed to the templates and
-//! may fold; such a mesh is returned, and the gate is the judge.
+//! *domain* or subregion is refused), several holes, curved (non-planar)
+//! patches, and user-prescribed line constraints from ma-2017 — the
+//! decomposition proposes free straight chords (reflex rays, corner diagonals,
+//! side midpoints) instead of honouring a fixed constraint set.  A subregion
+//! whose four corners are not convex is passed to the templates and may fold;
+//! such a mesh is returned, and the gate is the judge.
 //!
-//! Measured limit: the eight-block O-grid of a rectangle with a coarse
-//! polygonal hole still has its worst cells in the first ring outside the
-//! hole at the two extreme side points, where a radial chord meets a short
-//! hole arc.  The mesh is all-quad, watertight and conforming with a high
-//! share of valence-4 nodes and a small aspect ratio; the 4 mm and 2 mm plate
-//! rows clear the gate, while the 1 mm and performance rows stay at about
-//! 28-30° there.
+//! Measured result (`examples/alt_decompose.rs`, default [`Options`]): all
+//! seven corpus parts are all-quad, watertight and **7/7 PASS raw**; the raw
+//! corner is 30.1 degrees on the 0.6 mm performance part (SJ 0.375) and 30.4
+//! degrees on the 1 mm plate (SJ 0.405).  After the common external post-pass
+//! (smoothing, quality swaps, perturbation) five of seven still pass: the 1 mm
+//! plate (9.8 degrees, SJ 0.170) and the 0.6 mm part (6.6 degrees, SJ 0.115)
+//! fail on the first ring outside the hole.  That ring is the measured limit:
+//! at 2 mm the post-pass worst corner is **30.1 degrees** (SJ 0.267), only 0.1
+//! degree above the 30-degree gate, at the two extreme side points where a
+//! radial O-grid chord meets a short hole arc.  The internal `relax` (40
+//! sweeps) and `polish` are already included in the "raw" rows.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -53,12 +67,29 @@ use crate::mesh::{Cell, Kind, Mesh, Node};
 use crate::two_d::{Domain, Sizing};
 
 /// A vertex is a corner when its boundary turns by more than this angle.
+///
+/// Degrees, signed turn (left positive).  Yang et al. use the boundary turn to
+/// decide where a corner (and hence a possible chord start) is; 30 degrees is
+/// also the gate angle, so a corner below it is not worth a template.  Tuning
+/// choice; values are not range-checked (a negative value makes every vertex a
+/// corner, a NaN makes none and the loop goes to [`pseudo_corners`]).
 const CORNER_DEG: f64 = 30.0;
 /// Safety limit on the recursion depth of the templates.
+///
+/// This is the value of [`Options::max_depth`] by default; [`mesh_patch`] and
+/// [`mesh_t2`] compare their `depth` argument against that option to stop a
+/// pathological T2 recursion (a normal patch needs only a few levels).
 const MAX_DEPTH: usize = 64;
 /// Safety limit on the number of patches.
+///
+/// The decomposition is a bisection tree, so the patch count can double per
+/// accepted chord; this bound (checked in `mesh_simply_connected`) and the
+/// `MAX_PATCHES * 8` iteration guard keep a bad domain from running forever.
 const MAX_PATCHES: usize = 4096;
 /// Safety limit on any discretisation count.
+///
+/// Caps [`count_for`] and every chord/loop count, so a tiny request size on a
+/// large model cannot allocate an unbounded node array.
 const MAX_COUNT: usize = 2_000_000;
 
 /// Options for the decomposition + templates route.
@@ -66,12 +97,27 @@ const MAX_COUNT: usize = 2_000_000;
 pub struct Options {
     /// A vertex is a corner when its boundary turns by more than this angle
     /// (degrees).
+    ///
+    /// Invariant: a decomposition subregion needs exactly four corners; the
+    /// outer loop gets four [`pseudo_corners`] when fewer than three are
+    /// detected.
+    /// Lowering the value detects more corners (more patches and chords);
+    /// raising it ignores shallow real corners, which can leave a subregion
+    /// with fewer than four corners (refused) or make a four-corner patch fold.
+    /// Not range-checked; NaN disables real corners.
     pub corner_deg: f64,
+
     /// Safety limit on the recursion depth of the templates.
+    ///
+    /// Only T2 recurses (into T0/T1/T2); the default 64 is far above what a
+    /// patch needs.  `0` refuses even a T2 that needs one level, returning an
+    /// error rather than panicking.
     pub max_depth: usize,
 }
 
+/// The measured defaults: [`CORNER_DEG`] and [`MAX_DEPTH`].
 impl Default for Options {
+    /// `corner_deg = 30`, `max_depth = 64`.
     fn default() -> Self {
         Self {
             corner_deg: CORNER_DEG,
@@ -81,12 +127,26 @@ impl Default for Options {
 }
 
 /// Mesh a planar domain with the decomposition + templates route.
+///
+/// Uses [`Options::default`].  This is `Route::Decompose` in [`crate::config`].
+/// Never panics: a triangular domain, more than one hole, a bad sizing or a
+/// stalled decomposition is an `Err`.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
     mesh_with_options(domain, sizing, &Options::default())
 }
 
 /// Mesh a planar domain with the decomposition + templates route, using
 /// `options` for the tunable constants.
+///
+/// The hole count dispatches the topology: zero holes goes through the
+/// recursive chord decomposition ([`mesh_simply_connected`]), one hole through
+/// the eight-block O-grid ([`mesh_one_hole`]); two or more holes are refused
+/// with "not supported yet".  The assembled mesh is then relaxed by forty
+/// interior Laplacian sweeps ([`relax`]) and polished locally ([`polish`]).
+///
+/// Validation: positive finite size, an outer loop of at least three points.
+/// Everything downstream is a `Result`, so a decomposition or template failure
+/// is returned as `Err` rather than a panic.
 pub fn mesh_with_options(
     domain: &Domain,
     sizing: &Sizing,
@@ -126,6 +186,11 @@ pub fn mesh_with_options(
 /// below the gate margin; passing `None` for the domain keeps every boundary
 /// node fixed, so the geometry is untouched.  On the perfect tensor blocks the
 /// margin is already above one and no node moves.
+///
+/// `size` is the requested element size, passed as the length scale of the
+/// perturbation; the 200-iteration cap is the same as the ship post-pass.  The
+/// mesh is rebuilt from the returned points/cells, so node ids are preserved
+/// (the call does not add or remove nodes).
 fn polish(mesh: Mesh, size: f64) -> Mesh {
     let mut quads: Vec<[usize; 4]> = Vec::new();
     let mut tris: Vec<[usize; 3]> = Vec::new();
@@ -155,6 +220,13 @@ fn polish(mesh: Mesh, size: f64) -> Mesh {
 /// the plain four-point Laplacian on the **interior** nodes remove it; boundary
 /// nodes are never moved, so the mesh stays on the geometry (the boundary
 /// offset is unchanged).
+///
+/// A node is a boundary node when one of its edges is used by exactly one cell.
+/// The ring is the set of distinct nodes of the incident cells (not just the
+/// edge neighbours); a valence-3 node therefore has three distinct neighbours
+/// and is skipped by the `ring.len() < 3` guard.
+/// Each sweep uses the previous sweep's coordinates (`old`), so the update is
+/// Jacobi, not Gauss–Seidel; `sweeps = 40` at the call site.
 fn relax(mut mesh: Mesh, sweeps: usize) -> Mesh {
     use std::collections::HashMap;
     let n = mesh.points.len();
@@ -212,6 +284,11 @@ fn relax(mut mesh: Mesh, sweeps: usize) -> Mesh {
 // small geometry helpers
 // ---------------------------------------------------------------------------
 
+/// Signed shoelace area of a closed polygon, positive when counter-clockwise.
+///
+/// The polygon is implicitly closed (`points[n-1] -> points[0]`); the loop is
+/// safe for fewer than three points (it just sums zero-ish terms), which the
+/// callers avoid by construction.
 fn signed_area(points: &[[f64; 2]]) -> f64 {
     let mut sum = 0.0;
     for i in 0..points.len() {
@@ -232,22 +309,28 @@ fn normalize_loop(points: &[[f64; 2]], counter_clockwise: bool) -> Vec<[f64; 2]>
     p
 }
 
+/// Scalar cross product `a.x * b.y - a.y * b.x`; positive means `b` is to the
+/// left of `a`.
 fn cross(a: [f64; 2], b: [f64; 2]) -> f64 {
     a[0] * b[1] - a[1] * b[0]
 }
 
+/// Vector `a - b` (used as a direction).
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     [a[0] - b[0], a[1] - b[1]]
 }
 
+/// Euclidean length of `a`.
 fn norm(a: [f64; 2]) -> f64 {
     (a[0] * a[0] + a[1] * a[1]).sqrt()
 }
 
+/// Euclidean distance between two points, in model units.
 fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
     norm(sub(a, b))
 }
 
+/// Linear interpolation `a + t * (b - a)`; `t` is not clamped.
 fn lerp(a: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
 }
@@ -348,6 +431,12 @@ fn chain_points(points: &[[f64; 2]], start: usize, end: usize) -> Vec<[f64; 2]> 
     out
 }
 
+/// Number of equal segments for a chord/patch side of `length` at `size`.
+///
+/// `round(length / size)`, clamped to `[1, MAX_COUNT]`; a non-finite ratio
+/// gives 1.  This is the discrete transfinite parameterisation count, so both
+/// sides of a patch must agree before a template is chosen — [`mesh_patch`]
+/// checks that.
 fn count_for(length: f64, size: f64) -> usize {
     let raw = length / size;
     if !raw.is_finite() {
@@ -394,6 +483,12 @@ fn distribute(poly: &[[f64; 2]], count: usize) -> Result<Vec<[f64; 2]>, String> 
     Ok(out)
 }
 
+/// 1 nm coordinate key used to deduplicate boundary nodes.
+///
+/// The value is `round(coord * 1e9)`; the `as i64` saturates only for absurd
+/// coordinates (Rust's float-to-int cast saturates since 1.45), so the key is
+/// total.  Two input points closer than a nanometre share a node, which is what
+/// keeps the loop and the O-grid chords conforming.
 fn point_key(p: [f64; 2]) -> (i64, i64) {
     ((p[0] * 1.0e9).round() as i64, (p[1] * 1.0e9).round() as i64)
 }
@@ -402,10 +497,26 @@ fn point_key(p: [f64; 2]) -> (i64, i64) {
 // the discrete boundary and the region decomposition
 // ---------------------------------------------------------------------------
 
+/// A decomposition chord: a straight edge between two boundary nodes.
+///
+/// Chords are the internal patch boundaries.  They are stored once and shared
+/// by the two adjacent patches; each side inserts `count - 1` evenly spaced
+/// nodes, so both patches see the same discretisation (the builder's 1 nm
+/// deduplication makes the nodes identical).
 #[derive(Clone, Copy)]
 struct Chord {
+    /// First endpoint: a node id into [`Decomp::bpts`].
     a: usize,
+
+    /// Second endpoint: a node id into [`Decomp::bpts`]; `a != b`.
     b: usize,
+
+    /// Number of segments along the chord (so `count - 1` interior nodes).
+    ///
+    /// [`register_chord`] starts a chord at 2 (one midpoint) and [`finalize`]
+    /// replaces it with [`count_for`]'s value; the O-grid registers its radial
+    /// chords with their count directly.  The two endpoints are boundary nodes
+    /// and are not counted.
     count: usize,
 }
 
@@ -414,15 +525,35 @@ struct Chord {
 /// later refinement of the chord never changes the topology of the
 /// decomposition.
 struct Decomp {
+    /// Coordinates of every boundary node, indexed by node id, in model units.
     bpts: Vec<[f64; 2]>,
+
+    /// 1 nm coordinate key to node id, so a shared corner is one node.
     bmap: HashMap<(i64, i64), usize>,
+
+    /// Boundary adjacency `node -> next node` for the loops currently owned
+    /// by the decomposition.  [`Decomp::set_cycle`] installs the initial loop
+    /// and [`Decomp::insert_boundary`] splices a new node into it when a chord
+    /// lands on an edge; [`Decomp::is_boundary_edge`] consults it.
     bnext: HashMap<usize, usize>,
+
+    /// All decomposition chords, indexed by chord id.
     chords: Vec<Chord>,
+
+    /// Undirected endpoint pair `(min(a, b), max(a, b))` to chord id.
     chord_of: HashMap<(usize, usize), usize>,
+
+    /// Characteristic model length (largest absolute coordinate, at least 1),
+    /// used by [`Decomp::eps`] to scale the geometric tolerances.
     scale: f64,
 }
 
+/// Boundary-node, adjacency and chord bookkeeping for a region cycle.
 impl Decomp {
+    /// Create an empty decomposition with the given characteristic length.
+    ///
+    /// `scale` is floored at 1 so [`Decomp::eps`] never becomes sub-round-off
+    /// on a tiny model.
     fn new(scale: f64) -> Self {
         Decomp {
             bpts: Vec::new(),
@@ -434,6 +565,11 @@ impl Decomp {
         }
     }
 
+    /// Add a boundary node (deduplicated by [`point_key`]) and return its id.
+    ///
+    /// The coordinates are stored exactly; deduplication is only for identity.
+    /// Every boundary node, chord endpoint and O-grid split point goes through
+    /// this function.
     fn add_bpt(&mut self, p: [f64; 2]) -> usize {
         let key = point_key(p);
         if let Some(&id) = self.bmap.get(&key) {
@@ -445,18 +581,33 @@ impl Decomp {
         id
     }
 
+    /// Coordinates of boundary node `id`.
+    ///
+    /// The index is trusted: every caller uses an id returned by
+    /// [`Decomp::add_bpt`] (or an index of this same list), so `bpts[id]` is
+    /// in range by construction.
     fn p(&self, id: usize) -> [f64; 2] {
         self.bpts[id]
     }
 
+    /// Geometric tolerance for this model: `1e-10 * scale`, in model units.
+    ///
+    /// Used by the ray cast and the chord visibility tests.  It is independent
+    /// of the 1 nm node key: `eps` decides geometric coincidence, the key
+    /// decides node identity.
     fn eps(&self) -> f64 {
         1.0e-10 * self.scale
     }
 
+    /// Is `u -> v` (or `v -> u`) an edge of the current boundary cycle?
+    ///
+    /// Used to decide whether a ray hit on that edge may insert a new boundary
+    /// node (yes) or must attach to an existing chord endpoint (no).
     fn is_boundary_edge(&self, u: usize, v: usize) -> bool {
         self.bnext.get(&u) == Some(&v) || self.bnext.get(&v) == Some(&u)
     }
 
+    /// Set the boundary successor of `u` to `w`.
     fn link(&mut self, u: usize, w: usize) {
         self.bnext.insert(u, w);
     }
@@ -480,6 +631,11 @@ impl Decomp {
         id
     }
 
+    /// Register `cycle` as the current boundary adjacency.
+    ///
+    /// Overwrites the successors of the cycle nodes; a node that is not in the
+    /// cycle keeps a stale entry, so callers only query the active cycle.  The
+    /// cycle is closed (`last -> first`).
     fn set_cycle(&mut self, cycle: &[usize]) {
         let n = cycle.len();
         for i in 0..n {
@@ -502,6 +658,12 @@ impl Decomp {
         out
     }
 
+    /// Positions of the vertices of `cycle` whose absolute turn exceeds
+    /// `options.corner_deg`, with the signed turn in degrees.
+    ///
+    /// The positions are indices into `cycle`, in cycle order; this is the
+    /// only place the corner threshold is applied.  A loop with fewer than
+    /// three such vertices is rejected or given pseudo-corners by the caller.
     fn corners(&self, cycle: &[usize], options: &Options) -> Vec<(usize, f64)> {
         self.turns(cycle)
             .into_iter()
@@ -511,6 +673,12 @@ impl Decomp {
     }
 
     /// First boundary edge hit by the ray `p + t*dir`, `t > 0`.
+    ///
+    /// Only edges not incident to `start` are tested, so the reflex corner
+    /// itself cannot stop its own ray.  Returns `(edge, s)` with `s` the
+    /// clamped parameter on that edge; the parallel test is scaled by
+    /// `|dir| * |edge|`.  A ray that hits exactly an endpoint is accepted by
+    /// the inclusive `s` tolerance; the caller classifies that hit as a node.
     fn cast_ray(&self, cycle: &[usize], start: usize, dir: [f64; 2]) -> Option<(usize, f64)> {
         let n = cycle.len();
         let p = self.p(cycle[start]);
@@ -543,10 +711,15 @@ impl Decomp {
     }
 }
 
+/// Polygon coordinates of a region cycle, in cycle order.
 fn cycle_points(d: &Decomp, cycle: &[usize]) -> Vec<[f64; 2]> {
     cycle.iter().map(|&id| d.p(id)).collect()
 }
 
+/// Even-odd interior test; a point exactly on the boundary is ambiguous.
+///
+/// Only used with a chord midpoint (a point strictly inside for a visible
+/// chord), so the ambiguity never decides a valid chord.
 fn point_in_polygon(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
     let mut inside = false;
     let n = poly.len();
@@ -563,10 +736,17 @@ fn point_in_polygon(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
     inside
 }
 
+/// Twice the signed area of the triangle `a, b, c`; positive for a left turn.
 fn orientation(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
     cross(sub(b, a), sub(c, a))
 }
 
+/// Do the open segments `a..b` and `c..d` cross **properly**?
+///
+/// The strict opposite-sign test ignores touching and collinear overlap (the
+/// separate [`point_on_segment_interior`] checks cover those), so a chord that
+/// shares a boundary vertex with an edge is not a crossing.  `eps` is the
+/// model-scaled tolerance.
 fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2], eps: f64) -> bool {
     let o1 = orientation(a, b, c);
     let o2 = orientation(a, b, d);
@@ -576,6 +756,12 @@ fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2], eps: f64) 
         && ((o3 > eps && o4 < -eps) || (o3 < -eps && o4 > eps))
 }
 
+/// Is `p` on the open segment `a..b`, at least `1e-9` of its length from the
+/// ends?
+///
+/// The cross product is compared with `eps * length` (a distance tolerance,
+/// not an area one); the parameter test excludes the endpoints.  Used to
+/// reject a chord endpoint that lands inside another boundary edge.
 fn point_on_segment_interior(p: [f64; 2], a: [f64; 2], b: [f64; 2], eps: f64) -> bool {
     let ab = sub(b, a);
     let len = norm(ab);
@@ -630,6 +816,10 @@ fn chord_inside(d: &Decomp, cycle: &[usize], ip: usize, iq: usize) -> bool {
     point_in_polygon(mid, &poly)
 }
 
+/// Absolute area of a region cycle, in model units squared.
+///
+/// Used by [`evaluate`] to reject a zero-area child and to balance the two
+/// children of a chord.
 fn polygon_area(d: &Decomp, cycle: &[usize]) -> f64 {
     let poly = cycle_points(d, cycle);
     signed_area(&poly).abs()
@@ -639,13 +829,30 @@ fn polygon_area(d: &Decomp, cycle: &[usize]) -> f64 {
 // templates
 // ---------------------------------------------------------------------------
 
+/// Accumulates the nodes and cells of the template pass.
+///
+/// The boundary nodes are inserted first (from [`Decomp::bpts`]); every
+/// interior node created by a transfinite map goes through [`Builder::add`],
+/// which deduplicates by [`point_key`].  That is why two patches that share a
+/// chord agree on every node without an explicit shared index.
 struct Builder {
+    /// All nodes, boundary nodes first, in model units.
     points: Vec<Node>,
+
+    /// 1 nm coordinate key to node id.
     map: HashMap<(i64, i64), usize>,
+
+    /// Finished quad cells (this route produces no triangles).
     cells: Vec<Cell>,
 }
 
+/// Node and cell accumulation for the transfinite templates.
 impl Builder {
+    /// Create a builder pre-loaded with the boundary nodes, preserving their
+    /// ids (patch walks refer to [`Decomp`] ids directly).
+    ///
+    /// `or_insert` keeps the first id for a duplicated coordinate, which is the
+    /// same identity rule as [`Decomp::add_bpt`].
     fn with_boundary(bpts: &[[f64; 2]]) -> Self {
         let mut b = Builder {
             points: Vec::with_capacity(bpts.len()),
@@ -660,6 +867,7 @@ impl Builder {
         b
     }
 
+    /// Add an interior point (deduplicated at 1 nm) and return its node id.
     fn add(&mut self, p: [f64; 2]) -> usize {
         let key = point_key(p);
         if let Some(&id) = self.map.get(&key) {
@@ -671,10 +879,15 @@ impl Builder {
         id
     }
 
+    /// Coordinates of node `id` as a 2-vector.
     fn coord(&self, id: usize) -> [f64; 2] {
         [self.points[id][0], self.points[id][1]]
     }
 
+    /// Push a quad, silently dropping a collapsed one (two consecutive equal
+    /// ids).  The templates never intend to create such a cell; the guard keeps
+    /// a degenerate patch from producing an invalid `Cell` (which the mesh
+    /// validation would reject later anyway).
     fn quad(&mut self, q: [usize; 4]) {
         if q[0] != q[1] && q[1] != q[2] && q[2] != q[3] && q[3] != q[0] {
             self.cells.push(Cell::quad4(q));
@@ -682,10 +895,18 @@ impl Builder {
     }
 }
 
+/// Reversed copy of a side node list (used when a side is walked backwards in
+/// the next template).
 fn rev(v: &[usize]) -> Vec<usize> {
     v.iter().rev().copied().collect()
 }
 
+/// Point at parameter `t` on the polyline through `nodes`, parameterised by
+/// **segment index**, not arc length.
+///
+/// `t` is clamped to `[0, 1]`; the integer part selects the segment and the
+/// fractional part interpolates it.  This is the discrete transfinite
+/// parameterisation: a side with `n` segments maps `t = k/n` to node `k`.
 fn poly_at(b: &Builder, nodes: &[usize], t: f64) -> [f64; 2] {
     let n = nodes.len().saturating_sub(1);
     if n == 0 {
@@ -705,7 +926,15 @@ fn poly_at(b: &Builder, nodes: &[usize], t: f64) -> [f64; 2] {
 /// Discrete transfinite (Coons) map of a four-sided patch.
 ///
 /// The sides are in counter-clockwise order `S0: P0->P1`, `S1: P1->P2`,
-/// `S2: P2->P3`, `S3: P3->P0`.
+/// `S2: P2->P3`, `S3: P3->P0`.  The formula is the bilinear Coons patch
+/// (Coons 1967, also Yang et al. §3.4 / Miranda §3):
+///
+/// `P(u,v) = (1-v) S0(u) + v S2(1-u) + (1-u) S3(1-v) + u S1(v) - B(u,v)`,
+///
+/// where `B` is the bilinear interpolation of the four corners.  Evaluating
+/// the boundary sides directly (not a fitted curve) is what makes the patch
+/// exactly match its neighbours along every side.  `u` and `v` are in `[0, 1]`;
+/// values outside are clamped by [`poly_at`].
 fn coons(b: &Builder, sides: &[Vec<usize>; 4], u: f64, v: f64) -> [f64; 2] {
     let s0 = poly_at(b, &sides[0], u);
     let s1 = poly_at(b, &sides[1], v);
@@ -728,10 +957,30 @@ fn coons(b: &Builder, sides: &[Vec<usize>; 4], u: f64, v: f64) -> [f64; 2] {
     [x, y]
 }
 
+/// Insert a polyline of already-computed points and return the node ids.
+///
+/// The points are usually samples of [`coons`]; duplicates are merged by the
+/// builder, so a sample that lands on an existing boundary node reuses it.
 fn add_line(b: &mut Builder, pts: impl Iterator<Item = [f64; 2]>) -> Vec<usize> {
     pts.map(|p| b.add(p)).collect()
 }
 
+/// Mesh one four-sided patch by selecting the transfinite template.
+///
+/// `sides` are the four side node lists in counter-clockwise order, each from
+/// one corner to the next, and must share their end nodes.  The side segment
+/// counts `n0..n3` decide:
+///
+/// - `n0 == n2 && n1 == n3`: T0 (plain tensor grid, [`mesh_t0`]);
+/// - `n1 == n3` (or, after a quarter turn, `n0 == n2`): T1
+///   ([`mesh_t1`]), after rotating so that the bottom is the longer pair;
+/// - otherwise T2 ([`mesh_t2`]), after rotating so that the bottom and right
+///   sides are the longer ones.
+///
+/// A patch needs an even total segment count (the necessary parity condition
+/// for a pure quad patch); an odd total, a zero-length side, or recursion
+/// beyond `options.max_depth` is an `Err`.  The rotation is a relabelling of
+/// the four sides, never a geometric rotation.
 fn mesh_patch(
     b: &mut Builder,
     sides: [Vec<usize>; 4],
@@ -794,6 +1043,8 @@ fn mesh_patch(
     mesh_t2(b, s, depth + 1, options)
 }
 
+/// Rotate the four side lists by `k` quarter turns (`out[i] = sides[(i+k)%4]`),
+/// keeping the counter-clockwise order.
 fn rotate(sides: &[Vec<usize>; 4], k: usize) -> [Vec<usize>; 4] {
     let mut out: [Vec<usize>; 4] = Default::default();
     for i in 0..4 {
@@ -802,7 +1053,12 @@ fn rotate(sides: &[Vec<usize>; 4], k: usize) -> [Vec<usize>; 4] {
     out
 }
 
-/// Plain tensor grid; requires equal opposite counts.
+/// Plain tensor grid (Miranda's T0); requires equal opposite counts.
+///
+/// The four sides are copied onto the boundary of an `n0 x n1` index grid and
+/// every interior node is the Coons image of its parameter pair.  This is exact
+/// for a rectangle and the base case of T1/T2.  `Err` when the opposite counts
+/// differ or the four sides do not meet end-to-end.
 fn mesh_t0(b: &mut Builder, sides: [Vec<usize>; 4]) -> Result<(), String> {
     let n0 = sides[0].len() - 1;
     let n1 = sides[1].len() - 1;
@@ -851,6 +1107,14 @@ fn mesh_t0(b: &mut Builder, sides: [Vec<usize>; 4]) -> Result<(), String> {
 }
 
 /// Miranda's T1: `right == left`, `bottom > top` and the difference is even.
+///
+/// The patch is cut into four tensor sub-patches (r1..r4) by one horizontal
+/// line and two slanted lines, all sampled from the patch's own Coons map, so
+/// the sub-patches share nodes exactly.  `band = (n0 - n2) / 2` is the number
+/// of extra segments of the bottom side on each side of the top; the horizontal
+/// line sits at `v = n1 / (n1 + band)` (clamped to `[0.02, 0.98]` so it never
+/// coincides with a side).  Each sub-patch must be a valid T0.  `Err` on a
+/// mismatched or odd count, or if a sub-patch fails.
 fn mesh_t1(b: &mut Builder, sides: [Vec<usize>; 4]) -> Result<(), String> {
     let n0 = sides[0].len() - 1;
     let n1 = sides[1].len() - 1;
@@ -928,6 +1192,13 @@ fn mesh_t1(b: &mut Builder, sides: [Vec<usize>; 4]) -> Result<(), String> {
 
 /// Miranda's T2: both pairs of opposite sides differ.  Three subregions, one
 /// of which (R3) recurses into T0 or T1.
+///
+/// Requires `bottom > top` and `right > left`; `band = min(n0 - n2, n1 - n3)`
+/// is the transition width.  A horizontal line at `v = (n1 - band) / n1`, a
+/// vertical line at `u = band / n0` and one slant line split the patch into
+/// R1/R2 (both T0) and R3, which still has unequal opposite sides unless the
+/// counts happen to match, so [`mesh_patch`] is called on it recursively.
+/// `Err` on the wrong orientation, a zero band, or a sub-template failure.
 fn mesh_t2(
     b: &mut Builder,
     sides: [Vec<usize>; 4],
@@ -1020,10 +1291,24 @@ fn walk(cycle: &[usize], start: usize, end: usize) -> Vec<usize> {
 }
 
 /// A patch ready to be meshed: four walks of boundary/chord edges.
+///
+/// The walks are counter-clockwise from one corner to the next and include the
+/// chord edges as single node pairs; [`expand_side`] later inserts the chord's
+/// interior nodes uniformly.
 struct PatchSides {
+    /// The four side walks, in counter-clockwise order starting at an
+    /// arbitrary corner.  Each walk starts and ends with a corner node; the
+    /// last node of one walk equals the first node of the next.
     walks: [Vec<usize>; 4],
 }
 
+/// Build the four side walks of a four-corner region cycle.
+///
+/// The corners are the vertices with a turn above `options.corner_deg`; the
+/// patch is only accepted when there are exactly four.  The walks are
+/// `walk(cycle, corner[i], corner[i+1])`, so the region orientation is
+/// preserved; this path is used for simply connected domains only (the O-grid
+/// builds its patch walks explicitly in [`mesh_one_hole`]).
 fn patch_sides(d: &Decomp, cycle: &[usize], options: &Options) -> Result<PatchSides, String> {
     let corners = d.corners(cycle, options);
     if corners.len() != 4 {
@@ -1040,6 +1325,12 @@ fn patch_sides(d: &Decomp, cycle: &[usize], options: &Options) -> Result<PatchSi
     Ok(PatchSides { walks })
 }
 
+/// Walk one side and classify its edges: push the chord ids into `out` and
+/// return the number of plain boundary segments (edges not in `chord_of`).
+///
+/// The return value is the patch's parity contribution from this side; each
+/// chord is also pushed once per adjacent patch for the GF(2) solve in
+/// [`finalize`].
 fn side_chords(d: &Decomp, w: &[usize], out: &mut Vec<usize>) -> usize {
     let mut boundary = 0usize;
     for pair in w.windows(2) {
@@ -1079,6 +1370,16 @@ fn expand_side(b: &mut Builder, d: &Decomp, w: &[usize]) -> Vec<usize> {
 
 /// Generate the boundary nodes of one loop from its `corners` (input-vertex
 /// indices, in loop order) and return the node cycle and the corner node ids.
+///
+/// Each corner-to-corner chain is discretised by [`count_for`] according to its
+/// polyline length and split by [`distribute`]; the chain ends share nodes
+/// through [`Decomp::add_bpt`]'s 1 nm key, so the loop is closed without a
+/// duplicate.  When `fixed_counts` is `None`, the total number of segments is
+/// forced even by adding one segment to the longest chain (the necessary parity
+/// of a pure quad loop); with `fixed_counts` the caller (the O-grid) has
+/// already solved the parity and the counts are used as given.  `Err` for an
+/// empty corner list, a count out of `[1, MAX_COUNT]`, a zero-length chain or a
+/// loop with fewer than three nodes.
 fn build_loop(
     d: &mut Decomp,
     loop_pts: &[[f64; 2]],
@@ -1148,6 +1449,24 @@ fn build_loop(
 // simply connected domain
 // ---------------------------------------------------------------------------
 
+/// Mesh a simply connected domain: boundary loops, recursive chord bisection
+/// until every region has four corners, then templates.
+///
+/// The recursion is an explicit stack of region cycles (no recursion in Rust
+/// frames, so a deep decomposition cannot overflow the stack).  A four-corner
+/// cycle becomes a [`PatchSides`]; a cycle with fewer than four corners is
+/// refused with "not supported yet" (the three-sided template is missing), and
+/// a whole outer loop with exactly three corners is refused earlier with the
+/// same reason, because the triangular/pentagonal template families are not
+/// implemented.  For a cycle
+/// with more than four corners every candidate chord from [`candidates`] is
+/// scored by [`evaluate`] and the lowest score (best area balance, most corner
+/// reduction, reflex ray preferred) is taken; its two children are pushed.
+/// The `MAX_PATCHES * 8` iteration guard terminates a pathological search.
+///
+/// A smooth boundary with fewer than three detected corners is given four
+/// [`pseudo_corners`] at quarter perimeter, so a circle-like loop can still be
+/// parameterised as a four-sided patch.  `Err` on a stalled decomposition.
 fn mesh_simply_connected(outer: &[[f64; 2]], size: f64, options: &Options) -> Result<Mesh, String> {
     let scale = outer
         .iter()
@@ -1232,6 +1551,11 @@ fn mesh_simply_connected(outer: &[[f64; 2]], size: f64, options: &Options) -> Re
     finalize(&d, &patches, size, options)
 }
 
+/// Record the chord between boundary nodes `u` and `v`, once.
+///
+/// The key is the ordered endpoint pair, so the two patches adjacent to the
+/// chord share one entry.  The initial count is 2 (one interior midpoint); the
+/// parity pass replaces it with [`count_for`]'s value.
 fn register_chord(d: &mut Decomp, u: usize, v: usize) {
     let key = (u.min(v), u.max(v));
     if d.chord_of.contains_key(&key) {
@@ -1246,29 +1570,66 @@ fn register_chord(d: &mut Decomp, u: usize, v: usize) {
     d.chord_of.insert(key, index);
 }
 
+/// Where a candidate chord ends.
 #[derive(Clone, Copy)]
 enum Target {
     /// Position of an existing cycle vertex.
     Node(usize),
+
     /// A point on the edge from cycle[edge] to cycle[edge+1].
+    ///
+    /// `edge` is a position in the cycle and `p` the intersection point in
+    /// model units.  Materialising it inserts a new boundary node.
     EdgePoint { edge: usize, p: [f64; 2] },
 }
 
+/// A proposed chord before visibility and progress checks.
 #[derive(Clone, Copy)]
 struct Candidate {
+    /// Position in the region cycle of the chord's start vertex.
     a_pos: usize,
+
+    /// The other end: an existing vertex or a point on a boundary edge.
     target: Target,
+
+    /// True when the chord came from a reflex-vertex ray; [`evaluate`] gives
+    /// it a `-0.6` score bonus so the paper's medial-axis chord wins ties.
     from_reflex: bool,
 }
 
+/// A scored chord candidate.
+///
+/// Produced by [`evaluate`] for one accepted [`Candidate`]; the best (lowest
+/// `score`) is applied by [`mesh_simply_connected`].
 struct Eval {
+    /// The region cycle with the target point inserted (the augmented cycle);
+    /// positions `ip` and `iq` index this vector, not the original cycle.
     aug: Vec<usize>,
+
+    /// Position of the chord's first endpoint in `aug`.
     ip: usize,
+
+    /// Position of the chord's second endpoint in `aug`; `ip != iq`.
     iq: usize,
+
+    /// Lower is better: `0.08 * (k1 + k2) + imbalance + 0.05 * size_pen`
+    /// plus `-0.6` for a reflex ray (see [`evaluate`]).
     score: f64,
+
+    /// The target to materialise in the boundary adjacency when this chord is
+    /// applied (an edge point needs a real loop insertion).
     target: Target,
 }
 
+/// Materialise a candidate in the cycle: insert the edge point (if any) and
+/// return `(augmented cycle, position of a, position of the target)`.
+///
+/// For [`Target::Node`] the cycle is returned unchanged.  For
+/// [`Target::EdgePoint`] the point is added to [`Decomp::bpts`] (so it becomes
+/// a real boundary node) and inserted after `cycle[edge]`; the index of the
+/// start node is shifted when it lies after the insertion.  The insertion into
+/// `bnext` itself is done by the caller only for the winning candidate, so
+/// rejected candidates leave orphan `bpts` entries (removed by [`prune`]).
 fn augment(
     d: &mut Decomp,
     cycle: &[usize],
@@ -1303,6 +1664,24 @@ fn augment(
     }
 }
 
+/// The chord candidates of one region cycle (Yang et al. §3.2/§3.3).
+///
+/// Three families, in this order:
+///
+/// 1. **reflex rays**: from every reflex corner (turn below
+///    `-options.corner_deg`), cast along the extension of each incident edge;
+///    the first hit becomes the chord target.  A hit on a boundary edge may
+///    insert a new boundary node, a hit near a node reuses it, and a hit on a
+///    chord attaches to its nearer endpoint.  These are the medial-axis-style
+///    chords of the paper;
+/// 2. **corner diagonals**: every pair of corners;
+/// 3. **side midpoints**: only for a region with five or more corners, where
+///    every corner-corner diagonal would cut off a triangle.  The midpoint of
+///    each corner-to-corner side is joined to every other corner.
+///
+/// The list is not filtered here; [`evaluate`] rejects invisible or
+/// non-progressing chords.  Duplicate candidates are harmless (the best score
+/// wins).
 fn candidates(
     d: &Decomp,
     cycle: &[usize],
@@ -1389,6 +1768,23 @@ fn candidates(
     out
 }
 
+/// Score one candidate chord, or reject it.
+///
+/// Rejection: the chord would cut off fewer than two positions, it is not
+/// inside the closed region ([`chord_inside`]), either child has fewer than
+/// four corners or does not reduce the parent's corner count (no progress), or
+/// a child has non-positive/non-finite area.
+///
+/// Score (lower is better):
+///
+/// `0.08 * (k1 + k2) + |a1 - a2| / (a1 + a2) + 0.05 * chord / (4 * scale) - 0.6`
+///
+/// where `k1`, `k2` are the child corner counts, `a1`, `a2` their areas, and
+/// the last term applies only to a reflex ray.  The corner-count term favours
+/// patches close to four corners, the imbalance term favours equal halves, the
+/// length term avoids a needlessly long chord, and the reflex bonus makes the
+/// paper's reflex-ray chord win ties over a diagonal.  The weights are tuning
+/// choices, not paper constants.
 fn evaluate(
     d: &mut Decomp,
     cycle: &[usize],
@@ -1438,10 +1834,37 @@ fn evaluate(
 // final parity and meshing
 // ---------------------------------------------------------------------------
 
+/// Euclidean length of chord `ci`, in model units.
 fn chord_length(d: &Decomp, ci: usize) -> f64 {
     dist(d.bpts[d.chords[ci].a], d.bpts[d.chords[ci].b])
 }
 
+/// Fix the chord parities, expand the patches and mesh them.
+///
+/// **Parity model.**  A pure quad patch needs an even number of segments around
+/// its boundary.  For patch `p` with `B_p` plain boundary segments and chords
+/// `c` with counts `n_c`,
+///
+/// `B_p + sum_c n_c ≡ 0 (mod 2)`.
+///
+/// The residual `r_p = B_p + sum_c n_c (mod 2)` is computed first.  Only chords
+/// shared by exactly two patches can be re-parity-fixed by changing `n_c` by
+/// ±1 (which flips `n_c mod 2`); they form the edges of a patch-adjacency
+/// graph.  A spanning forest of that graph is built by BFS, the **non-tree**
+/// chords keep their nominal parity, and the tree chords are solved bottom-up
+/// in GF(2):
+///
+/// `acc_p = r_p XOR (XOR over child tree chords of flip_c)`,  `flip_c = acc_p`.
+///
+/// A root must have `acc = 0`, otherwise the system is inconsistent and the
+/// function returns "the patch parity system has no solution".  A chord shared
+/// by more than two patches is refused; a chord used by one patch cannot be
+/// flipped and shows up as a remaining odd patch total (also an error).
+///
+/// **Meshing.**  The solved counts are put in a copy of [`Decomp`]; every patch
+/// side is expanded by [`expand_side`] (uniform chord nodes), the template pass
+/// runs, and unused candidate nodes are pruned.  `Mesh::validate` is the final
+/// check.
 fn finalize(
     d: &Decomp,
     patches: &[PatchSides],
@@ -1612,6 +2035,15 @@ fn prune(mesh: Mesh) -> Mesh {
 /// Insert the arc-length midpoint of each of the four outer sides as a real
 /// vertex, and return the new loop together with the structural indices
 /// `[C0, M0, C1, M1, C2, M2, C3, M3]` in loop order.
+///
+/// The midpoint is found by cumulative arc length along the **input** outer
+/// loop, between consecutive detected corners; it is inserted into the right
+/// segment by linear interpolation, or reuses an existing vertex when the
+/// midpoint parameter is within `1e-9` of a segment end.  `Err` when the outer
+/// loop is degenerate or when a side is so short that the midpoint coincides
+/// with a corner (the O-grid would collapse).  The structural indices are what
+/// the eight patches are built on, so they are returned in the new loop's
+/// numbering.
 fn insert_side_midpoints(
     outer: &[[f64; 2]],
     corners: &[usize],
@@ -1686,6 +2118,10 @@ fn insert_side_midpoints(
     Ok((new_points, structure))
 }
 
+/// Absolute difference of two angles, in radians, in `[0, pi]`.
+///
+/// Normalises the difference into `(-pi, pi]` after the modulo, so `a - b` near
+/// a full turn is small.  Used to match a hole node to a radial direction.
 fn angle_diff(a: f64, b: f64) -> f64 {
     let mut d = (a - b) % std::f64::consts::TAU;
     if d > std::f64::consts::PI {
@@ -1706,6 +2142,23 @@ fn angle_diff(a: f64, b: f64) -> f64 {
 /// or a single hole arc, so the transfinite maps have no kink, and the corner
 /// chords are no longer tangent to the hole (the failure mode of the
 /// corner-to-hole four-block O-grid).
+///
+/// The hole nodes are chosen as the unused hole node nearest each radial
+/// direction from the hole centroid; their cyclic order must be the reverse of
+/// the structural order (so a corner chord enters the hole inside the corner's
+/// visible cone).  When the nearest-node assignment does not partition the
+/// hole into eight non-empty arcs, a deterministic fallback enumerates the
+/// eight nearly-even starts and keeps the order with the smallest total angle
+/// mismatch.
+///
+/// **Parity without a GF(2) solve.**  Each block's side total is
+/// `outer_s + chord_s + chord_{s+1} + arc_s`; if it is odd, one extra segment
+/// is added to the private outer half-side `outer_s`.  Every block owns one
+/// such half-side, so the parity of each block is fixed locally without
+/// changing a shared chord count; the counts are then passed to
+/// [`build_loop`] as `fixed_counts` and to
+/// [`finalize_ogrid`].  `Err` for a non-four-corner outer loop, a hole
+/// discretisation below eight nodes, or a hole that cannot be split.
 fn mesh_one_hole(
     outer: &[[f64; 2]],
     hole: &[[f64; 2]],
@@ -1886,6 +2339,15 @@ fn mesh_one_hole(
     finalize_ogrid(&d, &patches, options)
 }
 
+/// Mesh the eight O-grid patches with their pre-solved chord counts.
+///
+/// Unlike [`finalize`], no parity solve runs here: [`mesh_one_hole`] already
+/// made every block even by adjusting only its private outer side, and the eight
+/// blocks share chords in a cycle, so a global flip could not improve the
+/// result, so a global flip is unnecessary.  Each patch total is re-checked (a
+/// defensive invariant) and the sides
+/// are expanded and meshed by [`mesh_patch`].  The mesh is pruned and
+/// `Mesh::validate`d.  `Err` on an odd patch total or a template failure.
 fn finalize_ogrid(d: &Decomp, patches: &[PatchSides], options: &Options) -> Result<Mesh, String> {
     // The O-grid chords already carry their counts; check the parity of each
     // patch and build the mesh.
@@ -1917,6 +2379,10 @@ fn finalize_ogrid(d: &Decomp, patches: &[PatchSides], options: &Options) -> Resu
     Ok(mesh)
 }
 
+/// Position of `node` in `cycle`, or an `Err` naming the missing corner.
+///
+/// The O-grid builds its patch walks from structural corner ids, so a missing
+/// id would mean an inconsistent loop; it is reported rather than indexed.
 fn position_of(cycle: &[usize], node: usize) -> Result<usize, String> {
     cycle
         .iter()
@@ -1930,10 +2396,21 @@ fn position_of(cycle: &[usize], node: usize) -> Result<usize, String> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+/// Unit tests for the decomposition + templates route.
+///
+/// The cases are the exact tensor-grid shapes (square, rectangle), the
+/// decomposition shapes (L-bracket into two patches, stepped part), the
+/// transition template (quarter annulus / ring), the one-hole O-grid, and the
+/// refusal/option paths.  Every accepted mesh is asserted all-quad, crack-free,
+/// boundary-exact and gate-passing at a small size.
 mod tests {
     use super::*;
     use crate::verify;
 
+    /// Mesh `domain` and assert the route invariants shared by the tests:
+    /// all cells quads, non-empty, boundary offset below 1e-9, no cracks, no
+    /// triangles and no inverted cells.  Returns the mesh for the caller's
+    /// area/count assertions.
     fn check_all_quads(domain: &Domain, size: f64) -> Mesh {
         let sizing = Sizing::uniform(size).unwrap();
         let mesh = mesh(domain, &sizing).unwrap();
@@ -1952,6 +2429,8 @@ mod tests {
         mesh
     }
 
+    /// A 10 x 10 square at size 1 is exactly one T0 patch: 100 quads, gate
+    /// passing.
     #[test]
     fn square_is_a_tensor_grid() {
         let domain = Domain::rectangle(10.0, 10.0).unwrap();
@@ -1961,6 +2440,9 @@ mod tests {
         assert!(gate.passes(), "{:?}", gate.reason());
     }
 
+    /// A 20 x 10 rectangle is still one T0 tensor grid (200 quads), which
+    /// checks that unequal side counts do not force a transition template when
+    /// the opposite sides match.
     #[test]
     fn rectangle_is_a_tensor_grid() {
         let domain = Domain::rectangle(20.0, 10.0).unwrap();
@@ -1970,6 +2452,8 @@ mod tests {
         assert!(gate.passes(), "{:?}", gate.reason());
     }
 
+    /// The L-bracket has six corners; the decomposition must cut it into two
+    /// four-corner patches (600 quads at size 2) with a gate-passing mesh.
     #[test]
     fn l_bracket_decomposes_into_two_patches() {
         let domain = Domain::new(
@@ -1990,6 +2474,8 @@ mod tests {
         assert_eq!(mesh.cells.len(), 600);
     }
 
+    /// The stepped part has two reflex corners; the reflex-ray candidates
+    /// must find a decomposition that keeps it all-quad and gate-passing.
     #[test]
     fn stepped_part_is_all_quads() {
         let domain = Domain::new(
@@ -2011,6 +2497,9 @@ mod tests {
         assert!(gate.passes(), "{:?}", gate.reason());
     }
 
+    /// A quarter annulus (a ring with a seam) has smoothly varying side
+    /// counts; its four-corner patch must fall through T1/T2 to a tensor grid
+    /// without a fold or a crack.
     #[test]
     fn quarter_annulus_uses_the_transition_template() {
         let arc = |r: f64, a0: f64, a1: f64, n: usize| -> Vec<[f64; 2]> {
@@ -2030,6 +2519,9 @@ mod tests {
         assert!(gate.passes(), "{:?}", gate.reason());
     }
 
+    /// The one-hole path: a 16-segment polygonal hole at size 4 must produce a
+    /// conforming O-grid (cracks, triangles, inverted and overlapping cells all
+    /// zero) that passes the gate.
     #[test]
     fn plate_with_hole_is_a_conforming_o_grid() {
         let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
@@ -2042,6 +2534,9 @@ mod tests {
         assert!(gate.passes(), "{:?}", gate.reason());
     }
 
+    /// A three-corner domain is refused with an error mentioning
+    /// "triangular" (the three-sided template is not implemented); it must not
+    /// fall back to a quad mesh.
     #[test]
     fn triangle_domain_is_refused_not_meshed() {
         let domain = Domain::new(vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], vec![]).unwrap();
@@ -2049,6 +2544,7 @@ mod tests {
         assert!(err.contains("triangular"), "{err}");
     }
 
+    /// A zero element size is an `Err`, not a division by zero or a panic.
     #[test]
     fn bad_size_is_refused() {
         let domain = Domain::rectangle(1.0, 1.0).unwrap();
@@ -2059,6 +2555,9 @@ mod tests {
         assert!(mesh(&domain, &sizing).is_err());
     }
 
+    /// `corner_deg = 45`, `max_depth = 8` still builds a valid L-bracket: the
+    /// options reach the corner detection and the template recursion, and a
+    /// shallow depth is enough for this patch count.
     #[test]
     fn non_default_options_produce_a_valid_mesh() {
         let domain = Domain::new(
