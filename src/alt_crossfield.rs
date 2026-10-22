@@ -60,6 +60,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
 use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
 use crate::mesh::{Cell, Mesh, Node};
@@ -76,6 +77,26 @@ const MAX_FIELD_NODES: usize = 250_000;
 /// A grid node inside the domain and this close (in grid spacings) to the
 /// boundary is a Dirichlet node of the cross field.
 const FIELD_BAND: f64 = 1.5;
+
+/// Options for the cross-field-aligned route.
+///
+/// The defaults are the constants this route was tuned with, so
+/// `Options::default()` reproduces the measured behaviour exactly.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Options {
+    /// Number of Gauss-Seidel sweeps for the two Laplace equations of the
+    /// cross field. More sweeps let the boundary-aligned field propagate
+    /// farther into the domain.
+    pub field_sweeps: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            field_sweeps: FIELD_SWEEPS,
+        }
+    }
+}
 
 /// The cross field is `theta` modulo 90°, represented univocally as
 /// `(cos 4 theta, sin 4 theta)`. It lives on a regular grid that covers the
@@ -95,8 +116,18 @@ pub struct CrossField {
 }
 
 impl CrossField {
-    /// Build the boundary-aligned cross field of a planar domain.
+    /// Build the boundary-aligned cross field of a planar domain with the
+    /// default options.
     pub fn new(domain: &Domain, sizing: &Sizing) -> Result<Self, String> {
+        Self::new_with_options(domain, sizing, &Options::default())
+    }
+
+    /// Build the boundary-aligned cross field of a planar domain.
+    pub fn new_with_options(
+        domain: &Domain,
+        sizing: &Sizing,
+        options: &Options,
+    ) -> Result<Self, String> {
         let size = sizing.size;
         if !size.is_finite() || size <= 0.0 {
             return Err("the element size must be positive and finite".to_string());
@@ -135,7 +166,7 @@ impl CrossField {
         }
 
         // Gauss-Seidel for the two Laplace equations, Dirichlet band fixed.
-        for _ in 0..FIELD_SWEEPS {
+        for _ in 0..options.field_sweeps {
             let mut worst = 0.0f64;
             for j in 0..ny {
                 for i in 0..nx {
@@ -303,8 +334,18 @@ impl CrossField {
 /// front on the ring and the L-bracket.
 const PAVING_DEPTHS: [usize; 4] = [1, 3, 7, usize::MAX];
 
-/// Mesh a planar domain with the cross-field-aligned route.
+/// Mesh a planar domain with the cross-field-aligned route and the default
+/// options.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
+    mesh_with_options(domain, sizing, &Options::default())
+}
+
+/// Mesh a planar domain with the cross-field-aligned route.
+pub fn mesh_with_options(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<Mesh, String> {
     if !sizing.size.is_finite() || sizing.size <= 0.0 {
         return Err("the element size must be positive and finite".to_string());
     }
@@ -314,7 +355,7 @@ pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
     if domain.outer.len() < 3 {
         return Err("the outer loop has fewer than three points".into());
     }
-    let field = CrossField::new(domain, sizing)?;
+    let field = CrossField::new_with_options(domain, sizing, options)?;
     let mut best: Option<(f64, usize, Mesh)> = None;
     for &depth in &PAVING_DEPTHS {
         let mesh = generate(domain, sizing, &field, depth)?;
@@ -1545,6 +1586,24 @@ mod tests {
         assert_eq!(gate.cracks, 0, "{gate:?}");
         assert_eq!(gate.overlapping, 0, "{gate:?}");
         assert_eq!(gate.inverted, 0, "{gate:?}");
+        assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
+    }
+
+    #[test]
+    fn mesh_with_non_default_options_is_a_valid_mesh() {
+        let domain = Domain::rectangle(20.0, 20.0).unwrap();
+        let sizing = Sizing::uniform(2.0).unwrap();
+        let options = Options { field_sweeps: 40 };
+        let mesh = mesh_with_options(&domain, &sizing, &options).unwrap();
+        assert!(mesh
+            .cells
+            .iter()
+            .all(|c| matches!(c.kind, crate::mesh::Kind::Quad4 | crate::mesh::Kind::Tri3)));
+        let gate = verify::gate(&mesh);
+        assert!(gate.quads > 0, "{gate:?}");
+        assert_eq!(gate.cracks, 0, "{gate:?}");
+        assert_eq!(gate.inverted, 0, "{gate:?}");
+        assert_eq!(gate.overlapping, 0, "{gate:?}");
         assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
     }
 
