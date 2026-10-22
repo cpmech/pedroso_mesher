@@ -51,3 +51,7 @@ pub mod alt_untangle;
 pub mod alt_quadtree;
 
 pub mod alt_bipartite;
+
+pub mod alt_l1;
+
+pub mod alt_decompose;
