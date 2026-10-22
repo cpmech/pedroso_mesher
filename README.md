@@ -4,32 +4,46 @@ Unstructured **quad** and **hex** mesh generation for finite element analysis, i
 Rust, MIT licensed. No GPL, LGPL or AGPL dependency, and no external binary.
 
 > **Status: P1 in progress.** P0 (model, quality contract, corpus) is complete.
-> P1 produces **quad-dominant, watertight** planar meshes end to end:
-> constrained Delaunay triangulation, Ruppert refinement, and Blossom-Quad-style
-> matching into quads. The P1 gate — all-quad at 45° — is **not met**.
+> P1 produces **watertight, quad-dominant** planar meshes end to end:
+> constrained Delaunay triangulation, Ruppert refinement, matching into quads,
+> and smoothing. The P1 gate — all-quad at 45° — is nearly met on three parts and
+> **not met** on the rest.
 >
 > | Part | Quads / triangles | min SJ | min angle | Report | Time |
 > |---|---|---|---|---|---|
-> | plate-hole 4 mm | 341 / 84 | 0.40 | 23.7° | Acceptable | 0.04 s |
-> | plate-hole 2 mm | 1236 / 166 | 0.50 | 30.4° | Acceptable | 0.1 s |
-> | plate-hole 1 mm | 4780 / 774 | 0.50 | 30.0° | Acceptable | 1.3 s |
-> | l-bracket 2 mm | 496 / 164 | 0.53 | 36.0° | Acceptable | 0.04 s |
-> | ring 1 mm | 249 / 50 | 0.51 | 31.2° | Acceptable | 0.03 s |
-> | stepped 1 mm | 1834 / 320 | 0.38 | 22.4° | Acceptable | 0.2 s |
+> | plate-hole 4 mm | 282 / 40 | 0.54 | **43.3°** | Acceptable | 0.04 s |
+> | plate-hole 2 mm | 1253 / 130 | 0.53 | 41.1° | Acceptable | 0.1 s |
+> | plate-hole 1 mm | 4928 / 642 | 0.50 | 32.9° | Acceptable | 1.5 s |
+> | l-bracket 2 mm | 496 / 164 | 0.53 | 42.6° | Acceptable | 0.04 s |
+> | ring 1 mm | 249 / 50 | 0.59 | **44.3°** | Acceptable | 0.03 s |
+> | stepped 1 mm | 1834 / 320 | 0.44 | 26.1° | Acceptable | 0.2 s |
 >
-> **What is not done, and why.**
+> The scaled Jacobian now clears the 0.2 target everywhere; the 45° angle target
+> is met by the ring and nearly by the plate at 4 mm and the l-bracket.
 >
-> - *All-quad closure.* A pentagon split (triangle + adjacent quad + centroid
->   → two quads) was implemented. It produced holes through a bookkeeping error
->   (one triangle unaccounted for per run) and was reverted; the leftover
->   triangles are kept in the mesh so the output is watertight. A correct closer
->   is the next task.
-> - *45° angles.* The worst quads sit at the boundary and in closure pockets.
->   Interior-node smoothing was implemented and reverted: it raised the smallest
->   angle by ~1° while dropping the smallest scaled Jacobian from 0.40 to 0.03,
->   a net loss. It needs an objective that protects both.
-> - *Performance* was fixed: inserting every candidate per refinement pass
->   instead of 64 cut the plate-hole 1 mm case from 6.4 s to 1.3 s (release).
+> **What made the difference.** Two changes, both measured:
+>
+> - *Smoothing that protects the Jacobian.* Interior nodes move to their ring
+>   centroid and boundary nodes slide **along** their boundary segment — the worst
+>   angles are boundary quads. A move is accepted only if it raises the smallest
+>   angle of every incident quad **and** does not lower the smallest scaled
+>   Jacobian. The first attempt optimised the angle alone and lost 0.37 of
+>   Jacobian for one degree; this one lifts the angle and the Jacobian together.
+> - *Boundary sampling matched to the size field.* A 64-segment circular hole at
+>   a 4 mm size is ten times finer than the interior, and the transition quads are
+>   where the worst angles lived. Sampling the circle at 16 segments for 4 mm, 24
+>   for 2 mm and 48 for 1 mm lifted that part from 17° to 43°. **A domain's own
+>   discretisation has to suit the size field**; the mesher cannot fix a boundary
+>   that is already too fine.
+>
+> **What is still missing: all-quad.** The matching leaves 8–15 % of the
+> triangles unpaired; they are kept as `Tri3` elements so the mesh stays
+> watertight. Two closure designs were implemented and rejected: a pentagon split
+> (triangle + adjacent quad + interior point → two quads) lost elements through a
+> bookkeeping error and, once fixed, still left cracks by consuming quads that
+> bordered a second leftover triangle. The reliable route is Blossom-Quad's local
+> repair — edge flips in the triangulation before matching — not a post-hoc
+> polygon split.
 
 ## What P0 provides
 

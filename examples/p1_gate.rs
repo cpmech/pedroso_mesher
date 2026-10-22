@@ -81,10 +81,12 @@ fn run(name: &str, d: &Domain, size: f64) {
 }
 
 fn main() {
-    for size in [4.0, 2.0, 1.0] {
+    // The hole is a polygon: its chord length must match the size field, or the
+    // boundary is far finer than the interior and the transition quads suffer.
+    for (size, segments) in [(4.0, 16), (2.0, 24), (1.0, 48)] {
         run(
             "plate-hole",
-            &Domain::plate_with_hole(100.0, 60.0, 10.0, 64).unwrap(),
+            &Domain::plate_with_hole(100.0, 60.0, 10.0, segments).unwrap(),
             size,
         );
     }

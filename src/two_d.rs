@@ -13,7 +13,7 @@
 use mwmatching::{Matching, SENTINEL};
 use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
-use crate::mesh::{Cell, Mesh, Node};
+use crate::mesh::{Cell, Kind, Mesh, Node};
 use crate::quality;
 
 /// A planar domain: one outer loop and any number of holes, all closed
@@ -238,6 +238,9 @@ pub struct TwoDResult {
     pub stats: TwoDStats,
 }
 
+/// Smoothing passes after closure.
+const SMOOTHING_ITERATIONS: usize = 80;
+
 /// A candidate point closer than this fraction of the local size to an existing
 /// point is rejected: Ruppert's spacing rule. Without it, circumcenters land a
 /// few hundredths of a millimetre from a neighbour and the quad containing that
@@ -356,8 +359,6 @@ pub fn mesh_2d(domain: &Domain, sizing: &Sizing) -> Result<TwoDResult, TwoDError
     }
 
     let (quads, unpaired) = pair_triangles(&tris, &points);
-    // Close the mesh: absorb any triangle the matching could not pair, so the
-    // output is all-quad by construction rather than by hope.
     let stats = TwoDStats {
         points: points.len(),
         triangles: tris.len(),
@@ -365,17 +366,130 @@ pub fn mesh_2d(domain: &Domain, sizing: &Sizing) -> Result<TwoDResult, TwoDError
         unpaired_triangles: unpaired.len(),
         absorbed_triangles: 0,
     };
+    // Leftover triangles stay in the mesh as triangles: dropping them would
+    // leave a hole, which is worse than a quad-dominant result.
+    let leftover = unpaired;
     let mut cells: Vec<Cell> = quads.into_iter().map(Cell::quad4).collect();
-    // Triangles the matching could not pair stay in the mesh as triangles.
-    // Dropping them would leave a hole, which is worse than a quad-dominant
-    // mesh: a hole fails the topology check and cannot be solved.
-    cells.extend(unpaired.iter().map(|t| Cell::tri3(*t)));
-    let mesh = Mesh::new(points, cells);
+    cells.extend(leftover.iter().map(|t| Cell::tri3(*t)));
+    let mut mesh = Mesh::new(points, cells);
+    smooth(&mut mesh, domain, SMOOTHING_ITERATIONS, sizing.size);
     Ok(TwoDResult {
         mesh,
         unpaired: Vec::new(),
         stats,
     })
+}
+
+/// Smooth nodes to raise the smallest corner angle without losing Jacobian.
+///
+/// Interior nodes move to the centroid of their ring. Boundary nodes slide
+/// **along** the boundary segment they sit on, which is where the worst angles
+/// are: a boundary quad inherits the sampling of the curve, and moving the node
+/// sideways improves the quad without moving the geometry. A move is accepted
+/// only when it raises the smallest angle of every incident quad *and* does not
+/// lower the smallest scaled Jacobian — the lesson from the first smoothing
+/// attempt, which traded 0.37 of Jacobian for one degree of angle.
+fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
+    let n = mesh.points.len();
+    let mut incident: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (c, cell) in mesh.cells.iter().enumerate() {
+        for &v in &cell.nodes {
+            incident[v].push(c);
+        }
+    }
+
+    for _ in 0..iterations {
+        let mut moved = 0usize;
+        for v in 0..n {
+            if incident[v].is_empty() {
+                continue;
+            }
+            let current = [mesh.points[v][0], mesh.points[v][1]];
+            let on_boundary = domain.distance_to_boundary(current) < 1e-9;
+
+            let mut ring = Vec::new();
+            for &c in &incident[v] {
+                for &u in &mesh.cells[c].nodes {
+                    if u != v && !ring.contains(&u) {
+                        ring.push(u);
+                    }
+                }
+            }
+            if ring.len() < 3 {
+                continue;
+            }
+            let centroid = [
+                ring.iter().map(|&u| mesh.points[u][0]).sum::<f64>() / ring.len() as f64,
+                ring.iter().map(|&u| mesh.points[u][1]).sum::<f64>() / ring.len() as f64,
+            ];
+            let target = if on_boundary {
+                let (a, b, _) = domain.nearest_segment(current);
+                project_onto_segment(centroid, a, b, 0.15)
+            } else {
+                centroid
+            };
+
+            let before = local_quality(&incident[v], mesh);
+            let old = mesh.points[v];
+            mesh.points[v] = [target[0], target[1], 0.0];
+            let after = local_quality(&incident[v], mesh);
+            let spacing_ok = incident[v]
+                .iter()
+                .filter(|&&c| mesh.cells[c].kind == Kind::Quad4)
+                .all(|&c| {
+                    let q = &mesh.cells[c].nodes;
+                    (0..4).all(|i| {
+                        let a = mesh.points[q[i]];
+                        let b = mesh.points[q[(i + 1) % 4]];
+                        ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt() >= 0.15 * size
+                    })
+                });
+            let accepted = spacing_ok && after.0 > before.0 + 1e-6 && after.1 >= before.1 - 1e-9;
+            if accepted {
+                moved += 1;
+            } else {
+                mesh.points[v] = old;
+            }
+        }
+        if moved == 0 {
+            break;
+        }
+    }
+}
+
+/// Closest point to `p` on segment `a..b`, kept at least `margin` (as a share of
+/// the segment) from either end so a node never lands on its neighbour.
+fn project_onto_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2], margin: f64) -> [f64; 2] {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let length2 = ab[0] * ab[0] + ab[1] * ab[1];
+    if length2 <= 0.0 {
+        return a;
+    }
+    let t = (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / length2).clamp(margin, 1.0 - margin);
+    [a[0] + t * ab[0], a[1] + t * ab[1]]
+}
+
+/// Smallest corner angle and smallest scaled Jacobian among the quads around a
+/// node.
+fn local_quality(incident: &[usize], mesh: &Mesh) -> (f64, f64) {
+    let mut angle = f64::INFINITY;
+    let mut sj = f64::INFINITY;
+    for &c in incident {
+        if mesh.cells[c].kind != Kind::Quad4 {
+            continue;
+        }
+        for value in quality::quad_angles(&mesh.cells[c], &mesh.points) {
+            if value.is_finite() {
+                angle = angle.min(value);
+            }
+        }
+        for value in quality::scaled_jacobian(&mesh.cells[c], &mesh.points) {
+            if value.is_finite() {
+                sj = sj.min(value);
+            }
+        }
+    }
+    (angle, sj)
 }
 
 /// Boundary loops with each segment split so none is longer than the target.

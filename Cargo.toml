@@ -19,6 +19,10 @@ spade = "2.15"
 unsafe_code = "forbid"
 
 [lints.clippy]
+# Both are deliberate here: the closure is clearer with a tuple return than with
+# a struct, and several loops index two parallel arrays.
+type_complexity = "allow"
+needless_range_loop = "allow"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
