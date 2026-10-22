@@ -18,11 +18,23 @@
 //! ```
 
 pub mod bench;
+pub mod grid;
 pub mod io;
 pub mod mesh;
+pub mod msh;
+pub mod parity;
+pub mod qmorph;
+pub mod quadify;
 pub mod quality;
+pub mod recovery;
+pub mod sun;
+pub mod two_d;
+pub mod twostage;
+pub mod verify;
 
 pub use bench::{Part, PARTS};
 pub use io::read_mesh_json;
 pub use mesh::{Cell, Kind, Mesh, MeshError, Node, Topology};
+pub use msh::{to_msh, write_msh};
 pub use quality::{report, report_with, Report, Thresholds, Verdict};
+pub use two_d::{mesh_2d, Domain, Sizing, TwoDResult, TwoDStats};

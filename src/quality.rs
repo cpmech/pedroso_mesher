@@ -85,6 +85,10 @@ pub struct Report {
     pub min_dihedral_deg: f64,
     pub max_dihedral_deg: f64,
     pub max_aspect_ratio: f64,
+    /// Smallest and largest corner angle over planar elements (quads and
+    /// triangles); NaN when the mesh is purely 3D.
+    pub min_corner_angle_deg: f64,
+    pub max_corner_angle_deg: f64,
     pub verdict: Verdict,
     pub reasons: Vec<String>,
 }
@@ -197,6 +201,7 @@ pub fn scaled_jacobian(cell: &Cell, points: &[Node]) -> Vec<f64> {
                 }
             })
             .collect(),
+        Kind::Tri3 => vec![1.0; 3],
         Kind::Quad4 => QUAD_XI
             .iter()
             .map(|&xi| {
@@ -233,6 +238,14 @@ pub fn volume(cell: &Cell, points: &[Node]) -> f64 {
             }
             sum
         }
+        Kind::Tri3 => {
+            let a = points[cell.nodes[0]];
+            let b = points[cell.nodes[1]];
+            let c = points[cell.nodes[2]];
+            let u = sub(b, a);
+            let v = sub(c, a);
+            (u[0] * v[1] - u[1] * v[0]) / 2.0
+        }
         Kind::Quad4 => {
             let mut sum = 0.0;
             for &a in &[-g, g] {
@@ -264,6 +277,32 @@ pub fn aspect_ratio(cell: &Cell, points: &[Node]) -> f64 {
 
 /// Corner angles of a quad, in degrees, in node order.
 pub fn quad_angles(cell: &Cell, points: &[Node]) -> Vec<f64> {
+    let n = cell.nodes.len();
+    (0..n)
+        .map(|i| {
+            let prev = sub(points[cell.nodes[(i + n - 1) % n]], points[cell.nodes[i]]);
+            let next = sub(points[cell.nodes[(i + 1) % n]], points[cell.nodes[i]]);
+            let denom = norm(prev) * norm(next);
+            if denom > 0.0 {
+                (dot(prev, next) / denom)
+                    .clamp(-1.0, 1.0)
+                    .acos()
+                    .to_degrees()
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
+}
+
+/// Corner angles of a planar element (quad or triangle), in degrees.
+pub fn corner_angles(cell: &Cell, points: &[Node]) -> Vec<f64> {
+    if cell.kind == Kind::Quad4 {
+        return quad_angles(cell, points);
+    }
+    if cell.kind != Kind::Tri3 {
+        return Vec::new();
+    }
     let n = cell.nodes.len();
     (0..n)
         .map(|i| {
@@ -351,6 +390,8 @@ pub fn report_with(mesh: &Mesh, thresholds: &Thresholds) -> Report {
         min_dihedral_deg: f64::INFINITY,
         max_dihedral_deg: f64::NEG_INFINITY,
         max_aspect_ratio: 0.0,
+        min_corner_angle_deg: f64::INFINITY,
+        max_corner_angle_deg: f64::NEG_INFINITY,
         verdict: Verdict::Acceptable,
         reasons: Vec::new(),
     };
@@ -386,6 +427,14 @@ pub fn report_with(mesh: &Mesh, thresholds: &Thresholds) -> Report {
         let aspect = aspect_ratio(cell, &mesh.points);
         report.max_aspect_ratio = report.max_aspect_ratio.max(aspect);
 
+        if cell.kind.dim() == 2 {
+            for value in corner_angles(cell, &mesh.points) {
+                if value.is_finite() {
+                    report.min_corner_angle_deg = report.min_corner_angle_deg.min(value);
+                    report.max_corner_angle_deg = report.max_corner_angle_deg.max(value);
+                }
+            }
+        }
         if cell.kind == Kind::Hex8 {
             for value in dihedral_angles(cell, &mesh.points) {
                 if value.is_finite() {
@@ -401,6 +450,10 @@ pub fn report_with(mesh: &Mesh, thresholds: &Thresholds) -> Report {
         f64::NAN
     };
 
+    if !report.min_corner_angle_deg.is_finite() {
+        report.min_corner_angle_deg = f64::NAN;
+        report.max_corner_angle_deg = f64::NAN;
+    }
     if !report.min_dihedral_deg.is_finite() {
         // no hexahedra: dihedral angles do not apply
         report.min_dihedral_deg = f64::NAN;
