@@ -713,6 +713,14 @@ pub fn triangulate(
     domain: &Domain,
     sizing: &Sizing,
 ) -> Result<(Vec<Node>, Vec<[usize; 3]>), TwoDError> {
+    // The struct is public, so `size` can be zero or negative even though
+    // `Sizing::uniform` rejects it. Refinement with a zero size would subdivide
+    // for ever (measured: the test process is OOM-killed), so refuse it here.
+    if !sizing.size.is_finite() || sizing.size <= 0.0 {
+        return Err(TwoDError::BadRequest(
+            "the size must be positive and finite",
+        ));
+    }
     // Sample every boundary segment down to the size field before constraining
     // it. A plate edge 100 mm long with a 1 mm size would otherwise be a single
     // constrained edge, and every triangle touching it would be a sliver.
