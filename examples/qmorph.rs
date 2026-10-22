@@ -299,10 +299,11 @@ fn run(name: &str, d: &Domain, size: f64, mode: Mode) {
     let quad_report = quality::report(&quad_mesh);
 
     println!(
-        "{name:12} {size:4}  W3 raw  quads {:5}  tri {:4}  inv {:3}  SJ {:.3}  ang {:5.1}  cracks {:3}  {:4}  {:.2}s/{:.2}s",
+        "{name:12} {size:4}  W3 raw  quads {:5}  tri {:4}  inv {:3}  ovl {:2}  SJ {:.3}  ang {:5.1}  cracks {:3}  {:4}  {:.2}s/{:.2}s",
         gate_raw.quads,
         gate_raw.triangles,
         gate_raw.inverted,
+        gate_raw.overlapping,
         gate_raw.min_scaled_jacobian,
         gate_raw.min_corner_angle_deg,
         gate_raw.cracks,
@@ -314,12 +315,13 @@ fn run(name: &str, d: &Domain, size: f64, mode: Mode) {
         println!("      reason: {reason}");
     }
     println!(
-        "{:12} {:>4}  +W2 sm  quads {:5}  tri {:4}  inv {:3}  SJ {:.3}  ang {:5.1}  cracks {:3}  {:4}  | quads-only SJ {:.3} ang {:5.1} | rounds {rounds} {:.2}s",
+        "{:12} {:>4}  +W2 sm  quads {:5}  tri {:4}  inv {:3}  ovl {:2}  SJ {:.3}  ang {:5.1}  cracks {:3}  {:4}  | quads-only SJ {:.3} ang {:5.1} | rounds {rounds} {:.2}s",
         "",
         "",
         gate.quads,
         gate.triangles,
         gate.inverted,
+        gate.overlapping,
         gate.min_scaled_jacobian,
         gate.min_corner_angle_deg,
         gate.cracks,
