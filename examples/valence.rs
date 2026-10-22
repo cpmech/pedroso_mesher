@@ -50,7 +50,30 @@ fn report(name: &str, d: &Domain, size: f64) {
 }
 
 fn main() {
-    report("plate-hole", &Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap(), 4.0);
-    report("plate-hole", &Domain::plate_with_hole(100.0, 60.0, 10.0, 24).unwrap(), 2.0);
-    report("l-bracket", &Domain::new(vec![[0.0,0.0],[80.0,0.0],[80.0,20.0],[20.0,20.0],[20.0,60.0],[0.0,60.0]], vec![]).unwrap(), 2.0);
+    report(
+        "plate-hole",
+        &Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap(),
+        4.0,
+    );
+    report(
+        "plate-hole",
+        &Domain::plate_with_hole(100.0, 60.0, 10.0, 24).unwrap(),
+        2.0,
+    );
+    report(
+        "l-bracket",
+        &Domain::new(
+            vec![
+                [0.0, 0.0],
+                [80.0, 0.0],
+                [80.0, 20.0],
+                [20.0, 20.0],
+                [20.0, 60.0],
+                [0.0, 60.0],
+            ],
+            vec![],
+        )
+        .unwrap(),
+        2.0,
+    );
 }
