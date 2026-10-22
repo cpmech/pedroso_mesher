@@ -60,9 +60,39 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use crate::mesh::{Cell, Mesh, Node};
 use crate::quality;
 use crate::two_d::{pair_triangles_with, triangulate, Domain, PairGuard, Sizing};
+
+/// Options for the hybrid route.
+///
+/// The defaults are the constants the route was tuned with; passing
+/// [`Options::default`] reproduces the published measurements exactly.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Options {
+    /// A triangle belongs to the boundary band when all of its vertices are at
+    /// most this many edge hops from the domain boundary.
+    pub band_layers: u8,
+    /// Depth limit of the augmenting-path search, in dual-graph hops.
+    pub augment_depth: usize,
+    /// Depth of the backtracking walk, in triangle moves.
+    pub walk_depth: usize,
+    /// Search states tried per residual triangle before giving up on it.
+    pub walk_budget: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            band_layers: BAND_LAYERS,
+            augment_depth: AUGMENT_DEPTH,
+            walk_depth: WALK_DEPTH,
+            walk_budget: WALK_BUDGET,
+        }
+    }
+}
 
 /// A triangle belongs to the boundary band when all of its vertices are at most
 /// this many edge hops from the domain boundary. Two hops give the paper's two
@@ -188,13 +218,31 @@ impl HybridStats {
     }
 }
 
-/// Mesh a planar domain with the hybrid route.
+/// Mesh a planar domain with the hybrid route using the default options.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
-    mesh_with_stats(domain, sizing).map(|(mesh, _)| mesh)
+    mesh_with_options(domain, sizing, &Options::default())
 }
 
-/// Mesh a planar domain and return the stage counters as well.
+/// Mesh a planar domain with the hybrid route and explicit options.
+pub fn mesh_with_options(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<Mesh, String> {
+    mesh_with_options_with_stats(domain, sizing, options).map(|(mesh, _)| mesh)
+}
+
+/// Mesh a planar domain with the default options and return the stage counters.
 pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, HybridStats), String> {
+    mesh_with_options_with_stats(domain, sizing, &Options::default())
+}
+
+/// Mesh a planar domain with explicit options and return the stage counters.
+pub fn mesh_with_options_with_stats(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<(Mesh, HybridStats), String> {
     if domain.area() <= 0.0 {
         return Err(
             "the domain has no area (outer loop clockwise, or a hole larger than it)".into(),
@@ -214,10 +262,10 @@ pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Hybrid
 
     // ---------------------------------------------------------------- band --
     let boundary = boundary_vertices(&tris, points.len());
-    let hop = boundary_hops(&tris, &boundary);
+    let hop = boundary_hops(&tris, &boundary, options);
     let mut in_band = vec![false; tris.len()];
     for (t, tri) in tris.iter().enumerate() {
-        if tri.iter().all(|&v| hop[v] <= BAND_LAYERS) {
+        if tri.iter().all(|&v| hop[v] <= options.band_layers) {
             in_band[t] = true;
         }
     }
@@ -240,7 +288,8 @@ pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Hybrid
 
     // ------------------------------------------------------------ interior --
     let interior_ids: Vec<usize> = (0..tris.len()).filter(|&t| !in_band[t]).collect();
-    let (interior_quads, interior_left) = greedy_merge(&points, &tris, &interior_ids, GREEDY_FLOOR);
+    let (interior_quads, interior_left) =
+        greedy_merge(&points, &tris, &interior_ids, GREEDY_FLOOR, options);
     stats.greedy_quads = interior_quads.len();
     quads.extend(interior_quads);
 
@@ -248,7 +297,8 @@ pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Hybrid
     let mut leftover_ids = band_left_ids;
     leftover_ids.extend(interior_left);
     leftover_ids.sort_unstable();
-    let (leftover_quads, still_left) = greedy_merge(&points, &tris, &leftover_ids, LEFTOVER_FLOOR);
+    let (leftover_quads, still_left) =
+        greedy_merge(&points, &tris, &leftover_ids, LEFTOVER_FLOOR, options);
     stats.leftover_quads = leftover_quads.len();
     quads.extend(leftover_quads);
     stats.leftover_triangles = still_left.len();
@@ -257,7 +307,7 @@ pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Hybrid
     // ------------------------------------------------------------ residuals --
     let mut slot_quads: Vec<Option<[usize; 4]>> = quads.into_iter().map(Some).collect();
     let mut tri_slots: Vec<Option<[usize; 3]>> = leftover_tris.iter().copied().map(Some).collect();
-    stats.walk_merges = merge_residuals(&points, &mut slot_quads, &mut tri_slots);
+    stats.walk_merges = merge_residuals(&points, &mut slot_quads, &mut tri_slots, options);
     let leftover_tris: Vec<[usize; 3]> = tri_slots.iter().flatten().copied().collect();
     stats.leftover_triangles = leftover_tris.len();
 
@@ -351,7 +401,7 @@ fn boundary_vertices_all(quads: &[Option<[usize; 4]>], tris: &[[usize; 3]]) -> V
 }
 
 /// Number of edge hops from the nearest boundary vertex, for every vertex.
-fn boundary_hops(tris: &[[usize; 3]], boundary: &[bool]) -> Vec<u8> {
+fn boundary_hops(tris: &[[usize; 3]], boundary: &[bool], options: &Options) -> Vec<u8> {
     let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); boundary.len()];
     for tri in tris {
         for i in 0..3 {
@@ -375,7 +425,7 @@ fn boundary_hops(tris: &[[usize; 3]], boundary: &[bool]) -> Vec<u8> {
     }
     while let Some(v) = queue.pop_front() {
         let next = hop[v].saturating_add(1);
-        if hop[v] >= BAND_LAYERS {
+        if hop[v] >= options.band_layers {
             continue;
         }
         for &u in &adjacency[v] {
@@ -442,6 +492,7 @@ fn greedy_merge(
     tris: &[[usize; 3]],
     ids: &[usize],
     floor: Floor,
+    options: &Options,
 ) -> (Vec<[usize; 4]>, Vec<usize>) {
     let mut edge_owners: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
     for &t in ids {
@@ -527,6 +578,7 @@ fn greedy_merge(
         mate: &mut mate,
         visited: vec![0u32; tris.len()],
         stamp: 0,
+        depth_limit: options.augment_depth,
     };
     for _ in 0..AUGMENT_ROUNDS {
         let mut improved = false;
@@ -580,6 +632,7 @@ struct Augmenter<'a> {
     mate: &'a mut [usize],
     visited: Vec<u32>,
     stamp: u32,
+    depth_limit: usize,
 }
 
 impl Augmenter<'_> {
@@ -613,7 +666,7 @@ impl Augmenter<'_> {
     /// Depth-first alternating search. `path` receives
     /// `v1, mate(v1), v2, mate(v2), ..., vk` with `vk` unmatched.
     fn find(&mut self, current: usize, start: usize, path: &mut Vec<usize>, depth: usize) -> bool {
-        if depth > AUGMENT_DEPTH {
+        if depth > self.depth_limit {
             return false;
         }
         for k in 0..self.adjacency[current].len() {
@@ -1104,6 +1157,7 @@ fn merge_residuals(
     points: &[Node],
     quads: &mut Vec<Option<[usize; 4]>>,
     tris: &mut [Option<[usize; 3]>],
+    options: &Options,
 ) -> usize {
     let mut merges = 0usize;
     for _ in 0..MAX_WALK_PASSES {
@@ -1123,8 +1177,8 @@ fn merge_residuals(
                 continue;
             };
             let merged = {
-                let mut walk = Walk::new(points, quads, tris, &base, nq);
-                walk.search(tid, current, WALK_DEPTH)
+                let mut walk = Walk::new(points, quads, tris, &base, nq, options.walk_budget);
+                walk.search(tid, current, options.walk_depth)
             };
             if merged {
                 merges += 1;
@@ -1196,6 +1250,7 @@ impl<'a> Walk<'a> {
         tris: &'a mut [Option<[usize; 3]>],
         base: &'a HashMap<(usize, usize), Vec<usize>>,
         nq: usize,
+        walk_budget: usize,
     ) -> Self {
         Walk {
             points,
@@ -1205,7 +1260,7 @@ impl<'a> Walk<'a> {
             nq,
             overrides: HashMap::new(),
             log: Vec::new(),
-            budget: WALK_BUDGET,
+            budget: walk_budget,
             visited: HashSet::new(),
         }
     }
@@ -1558,6 +1613,27 @@ mod tests {
     }
 
     #[test]
+    fn non_default_options_still_produce_a_valid_mesh() {
+        let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
+        let sizing = Sizing::uniform(4.0).unwrap();
+        let options = Options {
+            band_layers: 3,
+            augment_depth: 4,
+            walk_depth: 2,
+            walk_budget: 100,
+        };
+        let mesh = mesh_with_options(&domain, &sizing, &options).unwrap();
+        assert_eq!(mesh.validate(), Ok(()));
+        let gate = verify::gate(&mesh);
+        assert_eq!(gate.cracks, 0, "cracks: {gate:?}");
+        assert_eq!(gate.inverted, 0, "inverted: {gate:?}");
+        assert_eq!(gate.overlapping, 0, "overlapping: {gate:?}");
+        assert!(gate.quads > 0, "{gate:?}");
+        assert!(gate.triangles > 0, "{gate:?}");
+        assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
+    }
+
+    #[test]
     fn a_plate_with_a_hole_is_watertight_and_the_band_is_even() {
         let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
         let (mesh, stats) = mesh_with_stats(&domain, &Sizing::uniform(4.0).unwrap()).unwrap();
@@ -1626,7 +1702,7 @@ mod tests {
         ];
         let mut quads = vec![Some([0usize, 2, 3, 4])];
         let mut tris = vec![Some([0usize, 1, 2]), Some([2usize, 5, 3])];
-        let merges = merge_residuals(&points, &mut quads, &mut tris);
+        let merges = merge_residuals(&points, &mut quads, &mut tris, &Options::default());
         assert_eq!(
             merges, 1,
             "the walk should bring the two triangles together"

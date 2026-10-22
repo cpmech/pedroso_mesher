@@ -47,6 +47,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use crate::mesh::{Cell, Kind, Mesh, Node};
 use crate::two_d::{Domain, Sizing};
 
@@ -59,8 +61,37 @@ const MAX_PATCHES: usize = 4096;
 /// Safety limit on any discretisation count.
 const MAX_COUNT: usize = 2_000_000;
 
+/// Options for the decomposition + templates route.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Options {
+    /// A vertex is a corner when its boundary turns by more than this angle
+    /// (degrees).
+    pub corner_deg: f64,
+    /// Safety limit on the recursion depth of the templates.
+    pub max_depth: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            corner_deg: CORNER_DEG,
+            max_depth: MAX_DEPTH,
+        }
+    }
+}
+
 /// Mesh a planar domain with the decomposition + templates route.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
+    mesh_with_options(domain, sizing, &Options::default())
+}
+
+/// Mesh a planar domain with the decomposition + templates route, using
+/// `options` for the tunable constants.
+pub fn mesh_with_options(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<Mesh, String> {
     if !sizing.size.is_finite() || sizing.size <= 0.0 {
         return Err("the element size must be positive and finite".to_string());
     }
@@ -75,8 +106,8 @@ pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
         .map(|h| normalize_loop(h, false))
         .collect();
     let mesh = match holes.len() {
-        0 => mesh_simply_connected(&outer, size)?,
-        1 => mesh_one_hole(&outer, &holes[0], size)?,
+        0 => mesh_simply_connected(&outer, size, options)?,
+        1 => mesh_one_hole(&outer, &holes[0], size, options)?,
         n => {
             return Err(format!(
                 "not supported yet: {n} holes (the O-grid handles one hole)"
@@ -232,14 +263,14 @@ fn turn_deg(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
 }
 
 /// Indices of the input vertices where the boundary turns sharply.
-fn detect_corners(points: &[[f64; 2]]) -> Vec<usize> {
+fn detect_corners(points: &[[f64; 2]], options: &Options) -> Vec<usize> {
     let n = points.len();
     let mut out = Vec::new();
     for i in 0..n {
         let a = points[(i + n - 1) % n];
         let b = points[i];
         let c = points[(i + 1) % n];
-        if turn_deg(a, b, c).abs() > CORNER_DEG {
+        if turn_deg(a, b, c).abs() > options.corner_deg {
             out.push(i);
         }
     }
@@ -471,11 +502,11 @@ impl Decomp {
         out
     }
 
-    fn corners(&self, cycle: &[usize]) -> Vec<(usize, f64)> {
+    fn corners(&self, cycle: &[usize], options: &Options) -> Vec<(usize, f64)> {
         self.turns(cycle)
             .into_iter()
             .enumerate()
-            .filter(|(_, t)| t.abs() > CORNER_DEG)
+            .filter(|(_, t)| t.abs() > options.corner_deg)
             .collect()
     }
 
@@ -701,8 +732,13 @@ fn add_line(b: &mut Builder, pts: impl Iterator<Item = [f64; 2]>) -> Vec<usize> 
     pts.map(|p| b.add(p)).collect()
 }
 
-fn mesh_patch(b: &mut Builder, sides: [Vec<usize>; 4], depth: usize) -> Result<(), String> {
-    if depth > MAX_DEPTH {
+fn mesh_patch(
+    b: &mut Builder,
+    sides: [Vec<usize>; 4],
+    depth: usize,
+    options: &Options,
+) -> Result<(), String> {
+    if depth > options.max_depth {
         return Err("template recursion is too deep".to_string());
     }
     let counts = [
@@ -755,7 +791,7 @@ fn mesh_patch(b: &mut Builder, sides: [Vec<usize>; 4], depth: usize) -> Result<(
         .find(|&k| c[k] >= c[(k + 2) % 4] && c[(k + 1) % 4] >= c[(k + 3) % 4])
         .ok_or_else(|| "cannot orient a four-sided patch".to_string())?;
     let s = rotate(&sides, k);
-    mesh_t2(b, s, depth + 1)
+    mesh_t2(b, s, depth + 1, options)
 }
 
 fn rotate(sides: &[Vec<usize>; 4], k: usize) -> [Vec<usize>; 4] {
@@ -892,8 +928,13 @@ fn mesh_t1(b: &mut Builder, sides: [Vec<usize>; 4]) -> Result<(), String> {
 
 /// Miranda's T2: both pairs of opposite sides differ.  Three subregions, one
 /// of which (R3) recurses into T0 or T1.
-fn mesh_t2(b: &mut Builder, sides: [Vec<usize>; 4], depth: usize) -> Result<(), String> {
-    if depth > MAX_DEPTH {
+fn mesh_t2(
+    b: &mut Builder,
+    sides: [Vec<usize>; 4],
+    depth: usize,
+    options: &Options,
+) -> Result<(), String> {
+    if depth > options.max_depth {
         return Err("template recursion is too deep".to_string());
     }
     let n0 = sides[0].len() - 1;
@@ -953,7 +994,7 @@ fn mesh_t2(b: &mut Builder, sides: [Vec<usize>; 4], depth: usize) -> Result<(), 
     ];
     mesh_t0(b, r1)?;
     mesh_t0(b, r2)?;
-    mesh_patch(b, r3, depth + 1)
+    mesh_patch(b, r3, depth + 1, options)
 }
 
 // ---------------------------------------------------------------------------
@@ -983,8 +1024,8 @@ struct PatchSides {
     walks: [Vec<usize>; 4],
 }
 
-fn patch_sides(d: &Decomp, cycle: &[usize]) -> Result<PatchSides, String> {
-    let corners = d.corners(cycle);
+fn patch_sides(d: &Decomp, cycle: &[usize], options: &Options) -> Result<PatchSides, String> {
+    let corners = d.corners(cycle, options);
     if corners.len() != 4 {
         return Err(format!(
             "a decomposed patch has {} corners instead of 4",
@@ -1107,13 +1148,13 @@ fn build_loop(
 // simply connected domain
 // ---------------------------------------------------------------------------
 
-fn mesh_simply_connected(outer: &[[f64; 2]], size: f64) -> Result<Mesh, String> {
+fn mesh_simply_connected(outer: &[[f64; 2]], size: f64, options: &Options) -> Result<Mesh, String> {
     let scale = outer
         .iter()
         .map(|p| p[0].abs().max(p[1].abs()))
         .fold(1.0f64, f64::max);
     let mut d = Decomp::new(scale);
-    let mut corners = detect_corners(outer);
+    let mut corners = detect_corners(outer, options);
     if corners.len() < 3 {
         // A smooth loop is given four pseudo-corners so that it can still be
         // parameterised as a four-sided patch.
@@ -1138,10 +1179,10 @@ fn mesh_simply_connected(outer: &[[f64; 2]], size: f64) -> Result<Mesh, String> 
         if guard > MAX_PATCHES * 8 {
             return Err("domain decomposition did not terminate".to_string());
         }
-        let corners = d.corners(&cycle);
+        let corners = d.corners(&cycle, options);
         let k = corners.len();
         if k == 4 {
-            patches.push(patch_sides(&d, &cycle)?);
+            patches.push(patch_sides(&d, &cycle, options)?);
             if patches.len() > MAX_PATCHES {
                 return Err("too many patches".to_string());
             }
@@ -1153,8 +1194,8 @@ fn mesh_simply_connected(outer: &[[f64; 2]], size: f64) -> Result<Mesh, String> 
             ));
         }
         let mut best: Option<Eval> = None;
-        for cand in candidates(&d, &cycle, &corners) {
-            if let Some(ev) = evaluate(&mut d, &cycle, &cand, k) {
+        for cand in candidates(&d, &cycle, &corners, options) {
+            if let Some(ev) = evaluate(&mut d, &cycle, &cand, k, options) {
                 if best.as_ref().is_none_or(|b| ev.score < b.score) {
                     best = Some(ev);
                 }
@@ -1188,7 +1229,7 @@ fn mesh_simply_connected(outer: &[[f64; 2]], size: f64) -> Result<Mesh, String> 
         stack.push(r2);
     }
 
-    finalize(&d, &patches, size)
+    finalize(&d, &patches, size, options)
 }
 
 fn register_chord(d: &mut Decomp, u: usize, v: usize) {
@@ -1262,14 +1303,19 @@ fn augment(
     }
 }
 
-fn candidates(d: &Decomp, cycle: &[usize], corners: &[(usize, f64)]) -> Vec<Candidate> {
+fn candidates(
+    d: &Decomp,
+    cycle: &[usize],
+    corners: &[(usize, f64)],
+    options: &Options,
+) -> Vec<Candidate> {
     let n = cycle.len();
     let mut out = Vec::new();
     let corner_positions: Vec<usize> = corners.iter().map(|&(i, _)| i).collect();
 
     // 1. Ray casts from reflex corners along the extensions of their edges.
     for &(pos, turn) in corners {
-        if turn >= -CORNER_DEG {
+        if turn >= -options.corner_deg {
             continue;
         }
         let prev = cycle[(pos + n - 1) % n];
@@ -1348,6 +1394,7 @@ fn evaluate(
     cycle: &[usize],
     cand: &Candidate,
     parent_corners: usize,
+    options: &Options,
 ) -> Option<Eval> {
     let (aug, ip, iq) = augment(d, cycle, cand)?;
     let n = aug.len();
@@ -1362,8 +1409,8 @@ fn evaluate(
     let r1 = aug[i..=j].to_vec();
     let mut r2 = aug[j..].to_vec();
     r2.extend_from_slice(&aug[..=i]);
-    let k1 = d.corners(&r1).len();
-    let k2 = d.corners(&r2).len();
+    let k1 = d.corners(&r1, options).len();
+    let k2 = d.corners(&r2, options).len();
     // Both children must make progress and must not be triangles.
     if k1 < 4 || k2 < 4 || k1 >= parent_corners || k2 >= parent_corners {
         return None;
@@ -1395,7 +1442,12 @@ fn chord_length(d: &Decomp, ci: usize) -> f64 {
     dist(d.bpts[d.chords[ci].a], d.bpts[d.chords[ci].b])
 }
 
-fn finalize(d: &Decomp, patches: &[PatchSides], size: f64) -> Result<Mesh, String> {
+fn finalize(
+    d: &Decomp,
+    patches: &[PatchSides],
+    size: f64,
+    options: &Options,
+) -> Result<Mesh, String> {
     let mut builder = Builder::with_boundary(&d.bpts);
     let pcount = patches.len();
     let mut patch_chords: Vec<Vec<usize>> = Vec::with_capacity(pcount);
@@ -1518,7 +1570,7 @@ fn finalize(d: &Decomp, patches: &[PatchSides], size: f64) -> Result<Mesh, Strin
         for (k, w) in patch.walks.iter().enumerate() {
             sides[k] = expand_side(&mut builder, &view, w);
         }
-        mesh_patch(&mut builder, sides, 0)?;
+        mesh_patch(&mut builder, sides, 0, options)?;
     }
     let mesh = prune(Mesh::new(builder.points, builder.cells));
     mesh.validate().map_err(|e| e.to_string())?;
@@ -1654,13 +1706,18 @@ fn angle_diff(a: f64, b: f64) -> f64 {
 /// or a single hole arc, so the transfinite maps have no kink, and the corner
 /// chords are no longer tangent to the hole (the failure mode of the
 /// corner-to-hole four-block O-grid).
-fn mesh_one_hole(outer: &[[f64; 2]], hole: &[[f64; 2]], size: f64) -> Result<Mesh, String> {
+fn mesh_one_hole(
+    outer: &[[f64; 2]],
+    hole: &[[f64; 2]],
+    size: f64,
+    options: &Options,
+) -> Result<Mesh, String> {
     let scale = outer
         .iter()
         .map(|p| p[0].abs().max(p[1].abs()))
         .fold(1.0f64, f64::max);
     let mut d = Decomp::new(scale);
-    let outer_corners = detect_corners(outer);
+    let outer_corners = detect_corners(outer, options);
     if outer_corners.len() != 4 {
         return Err(format!(
             "not supported yet: the O-grid needs a four-corner outer loop (found {})",
@@ -1669,7 +1726,7 @@ fn mesh_one_hole(outer: &[[f64; 2]], hole: &[[f64; 2]], size: f64) -> Result<Mes
     }
     let (outer2, structure) = insert_side_midpoints(outer, &outer_corners)?;
 
-    let hole_corners = detect_corners(hole);
+    let hole_corners = detect_corners(hole, options);
     let (hole_cycle, _) = if hole_corners.len() >= 3 {
         build_loop(&mut d, hole, &hole_corners, size, None)?
     } else {
@@ -1826,10 +1883,10 @@ fn mesh_one_hole(outer: &[[f64; 2]], hole: &[[f64; 2]], size: f64) -> Result<Mes
         let walks = [outer_side, vec![s1, h1], hole_arc, vec![h0, s0]];
         patches.push(PatchSides { walks });
     }
-    finalize_ogrid(&d, &patches)
+    finalize_ogrid(&d, &patches, options)
 }
 
-fn finalize_ogrid(d: &Decomp, patches: &[PatchSides]) -> Result<Mesh, String> {
+fn finalize_ogrid(d: &Decomp, patches: &[PatchSides], options: &Options) -> Result<Mesh, String> {
     // The O-grid chords already carry their counts; check the parity of each
     // patch and build the mesh.
     let mut builder = Builder::with_boundary(&d.bpts);
@@ -1853,7 +1910,7 @@ fn finalize_ogrid(d: &Decomp, patches: &[PatchSides]) -> Result<Mesh, String> {
         for (k, w) in patch.walks.iter().enumerate() {
             sides[k] = expand_side(&mut builder, d, w);
         }
-        mesh_patch(&mut builder, sides, 0)?;
+        mesh_patch(&mut builder, sides, 0, options)?;
     }
     let mesh = prune(Mesh::new(builder.points, builder.cells));
     mesh.validate().map_err(|e| e.to_string())?;
@@ -2000,5 +2057,42 @@ mod tests {
             all_quad: false,
         };
         assert!(mesh(&domain, &sizing).is_err());
+    }
+
+    #[test]
+    fn non_default_options_produce_a_valid_mesh() {
+        let domain = Domain::new(
+            vec![
+                [0.0, 0.0],
+                [80.0, 0.0],
+                [80.0, 20.0],
+                [20.0, 20.0],
+                [20.0, 60.0],
+                [0.0, 60.0],
+            ],
+            vec![],
+        )
+        .unwrap();
+        let sizing = Sizing::uniform(2.0).unwrap();
+        let options = Options {
+            corner_deg: 45.0,
+            max_depth: 8,
+        };
+        assert_ne!(options.corner_deg, Options::default().corner_deg);
+        assert_ne!(options.max_depth, Options::default().max_depth);
+        let mesh = mesh_with_options(&domain, &sizing, &options).unwrap();
+        assert!(mesh
+            .cells
+            .iter()
+            .all(|c| c.kind == crate::mesh::Kind::Quad4));
+        assert!(!mesh.cells.is_empty());
+        let offset = verify::boundary_offset(&domain, &mesh);
+        assert!(offset < 1.0e-9, "boundary offset {offset}");
+        let topo = mesh.topology();
+        assert_eq!(topo.cracks, 0, "cracks");
+        let gate = verify::gate(&mesh);
+        assert_eq!(gate.triangles, 0);
+        assert_eq!(gate.inverted, 0);
+        assert!(gate.passes(), "{:?}", gate.reason());
     }
 }
