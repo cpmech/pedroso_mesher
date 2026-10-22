@@ -1,7 +1,7 @@
 //! Generate a mesh with any route from a `MeshConfig`.
 //!
 //! ```text
-//! cargo run --release --offline --example generate -- [route] [part] [--config in.json] [--json out.json] [--no-smooth]
+//! cargo run --release --offline --example generate -- [route] [part] [--config in.json] [--write-config out.json] [--json stats.json] [--no-smooth]
 //! ```
 //!
 //! `route` is one of `qmorph, paving, bipartite, quadtree, decompose, hybrid,
@@ -70,6 +70,7 @@ fn main() {
     let mut config = MeshConfig::default();
     let mut part_name = "plate-hole-2mm".to_string();
     let mut json_out: Option<String> = None;
+    let mut config_out: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -83,6 +84,10 @@ fn main() {
                 json_out = Some(args[i].clone());
             }
             "--no-smooth" => config.smoothing.enabled = false,
+            "--write-config" => {
+                i += 1;
+                config_out = Some(args[i].clone());
+            }
             other => {
                 if let Some(route) = Route::ALL.iter().copied().find(|r| r.name() == other) {
                     config.route = route;
@@ -92,6 +97,10 @@ fn main() {
             }
         }
         i += 1;
+    }
+    if let Some(path) = config_out {
+        std::fs::write(&path, config.to_json()).unwrap();
+        println!("wrote configuration {path}");
     }
     let (domain, size) = part(&part_name);
     let sizing = Sizing::uniform(size).unwrap();
