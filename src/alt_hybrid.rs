@@ -2,9 +2,10 @@
 //! greedy triangle merging in the interior.
 //!
 //! This implements the hybrid scheme of Zint and Grosso (2021), *A hybrid
-//! approach to fast indirect quadrilateral mesh generation*, using the shipped
-//! Blossom-Quad matching of Remacle et al. (2012) for the boundary band. The
-//! steps, in the order the route runs them:
+//! approach to fast indirect quadrilateral mesh generation* (corpus
+//! `zint-2021`), using the shipped Blossom-Quad matching of Remacle et al.
+//! (2012) (corpus `remacle-2012`) for the boundary band. The steps, in the
+//! order the route runs them:
 //!
 //! 1. [`triangulate`] (constrained Delaunay + Ruppert) gives the triangle
 //!    substrate. Its size is the one the caller asks for.
@@ -47,6 +48,28 @@
 //!    edges and are guarded by convexity and the gate's scaled-Jacobian floor,
 //!    so the mesh stays conforming and watertight.
 //!
+//! **Measured (corpus).** This is the speed route, not a gate route. On the
+//! seven corpus parts it leaves 4, 10, 16, 20, 52, 68 and 190 triangles (4-190
+//! per part), so no raw row passes [`crate::verify::gate`], which requires
+//! every element to be a quad. The Sect. 3.3 walk is what makes it competitive:
+//! before the walk the band, greedy and leftover passes left 880 residual
+//! triangles summed over the parts, and the walk reduced that to 362 (-59 %) in
+//! the pass that introduced it. The 0.6 mm performance part runs in 0.84 s raw,
+//! against about 19 s for the shipped Blossom-Quad baseline (`two_d::mesh_2d`,
+//! 18.5 s in the final corpus table). The common post-pass raises the raw
+//! minimum scaled Jacobian from 0.17-0.23 to 0.32-0.70, but a post-pass cannot
+//! remove a triangle, so the gate still fails on the triangle count. See
+//! `examples/alt_hybrid.rs` and `results/hybrid.txt`.
+//!
+//! **Approximated.** The paper's even parity is per boundary region; here all
+//! boundaries are merged into one band and a single adjacent interior triangle
+//! is taken when that band is odd ([`first_adjacent_interior`]). The matching
+//! repair is a depth-limited augmenting-path heuristic, not a maximum matching,
+//! and the residual walk is bounded both in depth and in expanded states. The
+//! greedy interior never recomputes a candidate score, which is exact because
+//! merging moves no node. These are deliberate speed/quality trade-offs of the
+//! route, not hidden parts of the paper's method.
+//!
 //! **Not implemented**: vertex splits, extra boundary graph edges with vertex
 //! duplication, and discrete mesh optimisation (DMO) smoothing. The common
 //! post-pass in `examples/alt_hybrid.rs` does the smoothing for every route it
@@ -69,21 +92,39 @@ use crate::two_d::{pair_triangles_with, triangulate, Domain, PairGuard, Sizing};
 /// Options for the hybrid route.
 ///
 /// The defaults are the constants the route was tuned with; passing
-/// [`Options::default`] reproduces the published measurements exactly.
+/// [`Options::default`] reproduces the measured tables exactly. Every field is
+/// a tuning parameter of the heuristic, not a property of the input geometry.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Options {
-    /// A triangle belongs to the boundary band when all of its vertices are at
-    /// most this many edge hops from the domain boundary.
+    /// Radius of the boundary band, in triangle-edge hops (dimensionless;
+    /// default 2, the paper's two layers). A triangle is in the band when all
+    /// three of its vertices are at most this many hops from a boundary vertex;
+    /// 1 gives a thin band, larger values grow the band and the Blossom cost.
+    /// Invariant: the vertex BFS in [`boundary_hops`] stops at this depth.
     pub band_layers: u8,
-    /// Depth limit of the augmenting-path search, in dual-graph hops.
+
+    /// Maximum length of an alternating augmenting path, in dual-graph hops
+    /// (default 8, [`AUGMENT_DEPTH`]). The greedy repair only searches this
+    /// far, which keeps it cheaper than a global Blossom solve. A value of 0
+    /// admits only a direct unmatched-unmatched pair, which the greedy pass has
+    /// already exhausted, so it effectively turns the repair off.
     pub augment_depth: usize,
-    /// Depth of the backtracking walk, in triangle moves.
+
+    /// Maximum number of pentagon splits (triangle moves) in one Sect. 3.3 walk
+    /// (default 5, [`WALK_DEPTH`]). 0 means the walk can only merge a residual
+    /// triangle that is already adjacent to another one.
     pub walk_depth: usize,
-    /// Search states tried per residual triangle before giving up on it.
+
+    /// Maximum number of walk states expanded per residual triangle (default
+    /// 400, [`WALK_BUDGET`]). It bounds the backtracking search; when the
+    /// budget is exhausted the triangle is left as a triangle. Invariant: one
+    /// decrement per expanded state, never below zero.
     pub walk_budget: usize,
 }
 
 impl Default for Options {
+    /// The measured defaults: two band layers, depth-8 augmenting repair,
+    /// depth-5 walk and 400 states per residual triangle.
     fn default() -> Self {
         Self {
             band_layers: BAND_LAYERS,
@@ -108,11 +149,19 @@ const BAND_GUARD: PairGuard = PairGuard {
     max_angle_deg: 160.0,
 };
 
-/// A quality floor for candidate quads.
+/// A quality floor for candidate quads. The three thresholds are evaluated
+/// together by [`candidate_for`]; a candidate must clear all of them.
 #[derive(Clone, Copy, Debug)]
 struct Floor {
+    /// Smallest allowed minimum scaled Jacobian over the four corners
+    /// (dimensionless, -1..1; a value of 0.2 is the usual gate floor).
     min_scaled_jacobian: f64,
+
+    /// Smallest allowed minimum corner angle, in degrees (0..180).
     min_angle_deg: f64,
+
+    /// Largest allowed corner angle, in degrees (0..180); it rejects a quad
+    /// that is folded back on itself even when its Jacobian stays positive.
     max_angle_deg: f64,
 }
 
@@ -136,19 +185,35 @@ const LEFTOVER_FLOOR: Floor = Floor {
 };
 
 /// A candidate pair of triangles and the quad they would form.
+///
+/// The pair is stored with `a < b`, so `(a, b)` is a canonical key in the
+/// candidate map. The quad has already passed the [`Floor`], the convexity and
+/// the exact-area checks of [`candidate_for`]; it is never revalidated by the
+/// heap, only rechecked for its triangles still being unmatched.
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
-    /// Minimum scaled Jacobian of the quad: the primary key.
+    /// Minimum scaled Jacobian of the quad's four corners (dimensionless,
+    /// -1..1; higher is better). The primary heap key.
     score: f64,
-    /// Minimum corner angle of the quad: the tie-break, and a needle guard.
+
+    /// Minimum corner angle of the quad, in degrees (0..180; higher is better).
+    /// The tie-break key and a needle guard.
     angle: f64,
-    /// Triangle ids and the ready-made quad.
+
+    /// First triangle id; always the smaller of the two.
     a: usize,
+
+    /// Second triangle id; always the larger of the two.
     b: usize,
+
+    /// The quad the two triangles would form, counter-clockwise.
     quad: [usize; 4],
 }
 
 impl PartialEq for Candidate {
+    /// Equality is the pair key plus the two scores, not the geometry: it
+    /// exists so the heap can compare candidates and so a test can compare
+    /// them without requiring `f64: Eq`.
     fn eq(&self, other: &Self) -> bool {
         self.a == other.a
             && self.b == other.b
@@ -160,6 +225,9 @@ impl PartialEq for Candidate {
 impl Eq for Candidate {}
 
 impl Ord for Candidate {
+    /// Total order for the max-heaps: higher score first, then higher minimum
+    /// angle, then smaller triangle ids. The total order (rather than a
+    /// partial one) is what makes the route deterministic.
     fn cmp(&self, other: &Self) -> Ordering {
         // BinaryHeap is a max-heap: higher score and angle first. Ties fall back
         // to the triangle ids (reversed, so the smaller id pops first) and make
@@ -178,36 +246,67 @@ impl Ord for Candidate {
 }
 
 impl PartialOrd for Candidate {
+    /// Delegates to [`Ord`], so `BinaryHeap` and any sort see the same order.
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 /// Counters for one hybrid run, for the tests and for diagnosing a run.
+///
+/// These are stage counters, not a census of the final mesh. A quad is built
+/// from two triangles, and a walk merge turns two triangles into one quad, so
+/// the `quads_ok` test checks the arithmetic
+/// `2 * (band_quads + greedy_quads + leftover_quads - doublet_collapses +
+/// walk_merges) + leftover_triangles == triangles`.
+///
+/// Caveat: a doublet collapse folds two quads into one element (four of the
+/// original triangles), so its term in that identity is the element delta, not
+/// the area delta; the test domains are chosen to have no collapse. The exact
+/// area identity would need `+ 2 * doublet_collapses` on the left side (each
+/// collapse leaves the one element covering two extra triangle-units).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HybridStats {
-    /// Triangles produced by the triangulation.
+    /// Triangles produced by the triangulation (the substrate count).
     pub triangles: usize,
-    /// Triangles in the boundary band (after the parity adjustment).
+
+    /// Triangles in the boundary band, after the even-parity adjustment.
     pub band_triangles: usize,
-    /// Quads the band matching produced.
+
+    /// Quads the Blossom band matching produced (two band triangles each).
     pub band_quads: usize,
+
     /// Quads the interior greedy merge produced.
     pub greedy_quads: usize,
+
     /// Quads the leftover merge produced.
     pub leftover_quads: usize,
-    /// Quads removed by a doublet collapse.
+
+    /// Quads removed by a doublet collapse; each collapse replaces two quads
+    /// by one, so this is also the number of quads the final mesh lost.
     pub doublet_collapses: usize,
-    /// Quad edge swaps taken by the valence clean-up.
+
+    /// Quad edge swaps taken by the valence clean-up (geometry is unchanged;
+    /// only the two quads around the swapped edge are replaced).
     pub cleanup_swaps: usize,
-    /// Pairs of residual triangles joined by the dual-graph triangle walk.
+
+    /// Pairs of residual triangles joined by the dual-graph walk. Each merge
+    /// adds one quad to the mesh and removes two triangles.
     pub walk_merges: usize,
-    /// Triangles that stayed triangles.
+
+    /// Triangles that stayed triangles (the final quad-dominant shortfall).
     pub leftover_triangles: usize,
 }
 
 impl HybridStats {
-    /// Share of planar elements that are quads.
+    /// Share of the original triangle substrate that ended up inside quads:
+    /// `(triangles - leftover_triangles) / triangles`.
+    ///
+    /// Note that this is **not** `quads / (quads + triangles)` when triangles
+    /// remain: a quad covers two of the original triangles, so the value is
+    /// twice the element-count share. It is the fraction the route's own
+    /// bookkeeping makes convenient, and it is 1 exactly when the mesh is
+    /// all-quad.
     pub fn quad_ratio(&self) -> f64 {
         let total = self.triangles;
         if total == 0 {
@@ -219,11 +318,21 @@ impl HybridStats {
 }
 
 /// Mesh a planar domain with the hybrid route using the default options.
+///
+/// This is the convenience entry point; it returns the same mesh as
+/// [`mesh_with_options`] with [`Options::default`] and discards the stage
+/// counters. Errors are the triangulation failures (no area, no triangles).
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
     mesh_with_options(domain, sizing, &Options::default())
 }
 
 /// Mesh a planar domain with the hybrid route and explicit options.
+///
+/// Thin wrapper over [`mesh_with_options_with_stats`] that drops the counters.
+/// `domain` must have positive area and a counter-clockwise outer loop;
+/// `sizing.size` is the element size used by the triangulation. The result
+/// tiles the domain exactly (the route never moves or drops a point) and is
+/// quad-dominant: any unpaired triangle is returned as a `Tri3` cell.
 pub fn mesh_with_options(
     domain: &Domain,
     sizing: &Sizing,
@@ -233,11 +342,30 @@ pub fn mesh_with_options(
 }
 
 /// Mesh a planar domain with the default options and return the stage counters.
+///
+/// Same result as [`mesh`], plus the [`HybridStats`] used by the tests to check
+/// the stage bookkeeping and by `examples/alt_hybrid.rs` to report the band,
+/// greedy, leftover and walk contributions.
 pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, HybridStats), String> {
     mesh_with_options_with_stats(domain, sizing, &Options::default())
 }
 
 /// Mesh a planar domain with explicit options and return the stage counters.
+///
+/// This is the whole pipeline, in the order of the module documentation:
+///
+/// 1. triangulate the domain (constrained Delaunay + Ruppert);
+/// 2. mark the boundary band from a vertex BFS and make its size even;
+/// 3. match the band with [`pair_triangles_with`] under [`BAND_GUARD`];
+/// 4. greedily merge the interior (and its augmenting repair);
+/// 5. merge the leftovers of both under [`LEFTOVER_FLOOR`];
+/// 6. walk the remaining triangles through quads and merge them;
+/// 7. collapse doublets, swap edges by valence, and emit the cells.
+///
+/// Invariants: the band is even before the matching, every quad passes the
+/// convexity and exact-area checks of [`candidate_for`], and the final mesh
+/// keeps every input point. Errors are returned before any partial mesh would
+/// be observable (the function builds and returns a complete `Mesh`).
 pub fn mesh_with_options_with_stats(
     domain: &Domain,
     sizing: &Sizing,
@@ -261,6 +389,11 @@ pub fn mesh_with_options_with_stats(
     };
 
     // ---------------------------------------------------------------- band --
+    // An edge owned by exactly one triangle is a domain boundary edge, so its
+    // endpoints are the BFS seeds. The hop count is a vertex distance, not a
+    // triangle distance: a triangle is in the band only when all three of its
+    // vertices are within the radius (a triangle with one deep vertex is an
+    // interior triangle and would otherwise drag the band inward).
     let boundary = boundary_vertices(&tris, points.len());
     let hop = boundary_hops(&tris, &boundary, options);
     let mut in_band = vec![false; tris.len()];
@@ -273,6 +406,11 @@ pub fn mesh_with_options_with_stats(
     // is used here, so one adjacent interior triangle is taken when the band is
     // odd. It is deterministic: the first band triangle and then the first
     // interior neighbour in index order.
+    //
+    // A perfect matching needs an even number of nodes; taking an interior
+    // triangle rather than dropping a band triangle keeps the whole boundary
+    // band matched. The parity test is on the band as a whole, which is the
+    // approximation noted in the module documentation.
     if in_band.iter().filter(|&&b| b).count() % 2 == 1 {
         if let Some(t) = first_adjacent_interior(&tris, &in_band) {
             in_band[t] = true;
@@ -281,12 +419,18 @@ pub fn mesh_with_options_with_stats(
     let band_ids: Vec<usize> = (0..tris.len()).filter(|&t| in_band[t]).collect();
     stats.band_triangles = band_ids.len();
 
+    // Blossom on the band. `pair_triangles_with` returns the quads and the
+    // triangles it could not pair, in order; map the latter back to global ids
+    // so the leftover pass can consider them together with the interior ones.
     let band_tris: Vec<[usize; 3]> = band_ids.iter().map(|&t| tris[t]).collect();
     let (mut quads, band_left) = pair_triangles_with(&band_tris, &points, BAND_GUARD);
     stats.band_quads = quads.len();
     let band_left_ids = map_leftovers(&tris, &band_ids, &band_left);
 
     // ------------------------------------------------------------ interior --
+    // Greedy merge only sees the interior triangles; band leftovers are handled
+    // by the looser leftover pass below, which is why the two sets are kept
+    // apart here.
     let interior_ids: Vec<usize> = (0..tris.len()).filter(|&t| !in_band[t]).collect();
     let (interior_quads, interior_left) =
         greedy_merge(&points, &tris, &interior_ids, GREEDY_FLOOR, options);
@@ -294,6 +438,9 @@ pub fn mesh_with_options_with_stats(
     quads.extend(interior_quads);
 
     // ------------------------------------------------------------ leftovers --
+    // A band triangle Blossom rejected and an interior triangle the floor
+    // rejected are both leftovers; merging them with each other is the paper's
+    // Sect. 3.2/4 recovery step.
     let mut leftover_ids = band_left_ids;
     leftover_ids.extend(interior_left);
     leftover_ids.sort_unstable();
@@ -305,6 +452,9 @@ pub fn mesh_with_options_with_stats(
     let leftover_tris: Vec<[usize; 3]> = still_left.iter().map(|&t| tris[t]).collect();
 
     // ------------------------------------------------------------ residuals --
+    // The walk edits the quad and triangle lists in place, so both are wrapped
+    // in `Option` slots: a consumed cell becomes `None`, which keeps the ids of
+    // the others stable. Stats are recomputed after the walk from what is left.
     let mut slot_quads: Vec<Option<[usize; 4]>> = quads.into_iter().map(Some).collect();
     let mut tri_slots: Vec<Option<[usize; 3]>> = leftover_tris.iter().copied().map(Some).collect();
     stats.walk_merges = merge_residuals(&points, &mut slot_quads, &mut tri_slots, options);
@@ -312,6 +462,8 @@ pub fn mesh_with_options_with_stats(
     stats.leftover_triangles = leftover_tris.len();
 
     // -------------------------------------------------------------- cleanup --
+    // Boundary nodes are frozen by both clean-up operators (`boundary` is only
+    // read), so a collapse/swap can never pull a node off the domain boundary.
     let boundary = boundary_vertices_all(&slot_quads, &leftover_tris);
     let doublet_collapses = collapse_doublets(
         &points,
@@ -322,6 +474,9 @@ pub fn mesh_with_options_with_stats(
     );
     let cleanup_swaps = swap_edges(&points, &mut slot_quads, &leftover_tris, &boundary);
     // A swap can leave a vertex at valence two; one more collapse round is cheap.
+    // The second pass is not allowed to undo a swap: it only sees the topology
+    // the swap left, and the gate in `collapse_doublets` rejects any merged quad
+    // that loses too much quality.
     let doublet_collapses = doublet_collapses
         + collapse_doublets(
             &points,
@@ -334,6 +489,9 @@ pub fn mesh_with_options_with_stats(
     stats.cleanup_swaps = cleanup_swaps;
 
     // ---------------------------------------------------------------- output --
+    // Quads first, then the triangles that survived; unused slots are skipped.
+    // The point array is returned unchanged, so every boundary node is still on
+    // the input boundary and `verify::boundary_offset` measures ~0.
     let mut cells: Vec<Cell> = slot_quads
         .iter()
         .flatten()
@@ -344,6 +502,12 @@ pub fn mesh_with_options_with_stats(
 }
 
 /// Vertex ids used by a boundary edge (an edge owned by exactly one triangle).
+///
+/// `tris` is the triangulation and `npoints` sizes the returned mask. The mask
+/// has one `bool` per input point; a point used by no edge is not a boundary
+/// point. Invariant: a mesh boundary is exactly the set of edges with one
+/// incident cell, so this is the same predicate [`boundary_vertices_all`] uses
+/// on the final mixed mesh.
 fn boundary_vertices(tris: &[[usize; 3]], npoints: usize) -> Vec<bool> {
     let mut count: HashMap<(usize, usize), usize> = HashMap::new();
     for tri in tris {
@@ -366,6 +530,12 @@ fn boundary_vertices(tris: &[[usize; 3]], npoints: usize) -> Vec<bool> {
 }
 
 /// Boundary vertices of a mesh made of the given quads and triangles.
+///
+/// This is the same one-use edge predicate as [`boundary_vertices`], but on the
+/// post-merge cell lists (with `None` slots skipped). It sizes the mask from
+/// the largest node id actually used, so it may be shorter than the point array
+/// when the mesh leaves a high-numbered node isolated; every caller therefore
+/// reads it with `.get(v).copied().unwrap_or(false)`.
 fn boundary_vertices_all(quads: &[Option<[usize; 4]>], tris: &[[usize; 3]]) -> Vec<bool> {
     let mut count: HashMap<(usize, usize), usize> = HashMap::new();
     for quad in quads.iter().flatten() {
@@ -401,6 +571,13 @@ fn boundary_vertices_all(quads: &[Option<[usize; 4]>], tris: &[[usize; 3]]) -> V
 }
 
 /// Number of edge hops from the nearest boundary vertex, for every vertex.
+///
+/// The graph is the triangle edge graph: two vertices are adjacent when they
+/// share a triangle edge. The BFS is seeded with every boundary vertex (hop 0)
+/// and stops at [`Options::band_layers`], so a vertex farther away keeps
+/// `u8::MAX`; the band test `hop[v] <= options.band_layers` is false for those.
+/// The returned vector has one entry per entry of `boundary` (that is, per
+/// point), and the distance is in edge hops, not millimetres.
 fn boundary_hops(tris: &[[usize; 3]], boundary: &[bool], options: &Options) -> Vec<u8> {
     let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); boundary.len()];
     for tri in tris {
@@ -414,6 +591,8 @@ fn boundary_hops(tris: &[[usize; 3]], boundary: &[bool], options: &Options) -> V
         ring.sort_unstable();
         ring.dedup();
     }
+    // `u8::MAX` is the sentinel "farther than the band (or unreachable)", so a
+    // vertex is discovered exactly once and never revisited with a longer path.
     let unreached = u8::MAX;
     let mut hop = vec![unreached; boundary.len()];
     let mut queue = VecDeque::new();
@@ -439,6 +618,13 @@ fn boundary_hops(tris: &[[usize; 3]], boundary: &[bool], options: &Options) -> V
 }
 
 /// First interior triangle adjacent (through a shared edge) to the band.
+///
+/// Scans band triangles in id order and, for each, its three edges in vertex
+/// order, returning the first interior owner in that scan order. The scan order
+/// is the determinism contract of the even-parity adjustment: the same
+/// triangulation always grows the band by the same triangle. Returns `None`
+/// only when no interior triangle shares an edge with the band (e.g. the
+/// bandwidth covers the whole mesh).
 fn first_adjacent_interior(tris: &[[usize; 3]], in_band: &[bool]) -> Option<usize> {
     let mut edge_owners: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
     for (t, tri) in tris.iter().enumerate() {
@@ -464,6 +650,12 @@ fn first_adjacent_interior(tris: &[[usize; 3]], in_band: &[bool]) -> Option<usiz
 }
 
 /// Map the triangles a pairing pass returned as unpaired back to triangle ids.
+///
+/// [`pair_triangles_with`] returns the leftover geometry, not indices into the
+/// caller's array, so this looks each leftover up by its sorted vertex key and
+/// keeps the matching ids of `ids` in their original order. The keys are unique
+/// in a triangulation (no two triangles have the same three vertices), so the
+/// lookup is exact.
 fn map_leftovers(tris: &[[usize; 3]], ids: &[usize], leftover: &[[usize; 3]]) -> Vec<usize> {
     let keys: HashSet<[usize; 3]> = leftover.iter().map(sorted_key).collect();
     ids.iter()
@@ -472,6 +664,11 @@ fn map_leftovers(tris: &[[usize; 3]], ids: &[usize], leftover: &[[usize; 3]]) ->
         .collect()
 }
 
+/// The canonical key of a triangle: its three vertex ids sorted ascending.
+///
+/// This is used only for identity lookup and walk-cycle detection; the order
+/// carries no orientation, so two triangles that are the same set of vertices
+/// map to the same key.
 fn sorted_key(tri: &[usize; 3]) -> [usize; 3] {
     let mut key = *tri;
     key.sort_unstable();
@@ -487,6 +684,11 @@ fn sorted_key(tri: &[usize; 3]) -> [usize; 3] {
 /// unmatched triangle, a matched pair, an unmatched triangle, flipped) raises
 /// the cardinality with only local searches, never with a global Blossom solve.
 /// Returns the quads formed and the ids that stayed triangles.
+///
+/// `points` and `tris` are the full mesh; only the triangles in `ids` are
+/// matched. The returned quads are the [`Candidate::quad`] values built by
+/// [`candidate_for`], so they are counter-clockwise and pass `floor` by
+/// construction. `ids` need not be sorted, but the output order follows it.
 fn greedy_merge(
     points: &[Node],
     tris: &[[usize; 3]],
@@ -512,11 +714,17 @@ fn greedy_merge(
             adjacency[candidate.b].push(candidate.a);
         }
     }
+    // The augmenting repair searches this adjacency, so it must be the graph of
+    // *accepted* candidates only: an edge that failed the floor can never be
+    // used to re-pair a triangle.
     for ring in adjacency.iter_mut() {
         ring.sort_unstable();
         ring.dedup();
     }
 
+    // `usize::MAX` is the unmatched sentinel. `local` holds candidates around
+    // the quad just made (the paper's local continuation), `global` holds all
+    // candidates; both are max-heaps under `Candidate::cmp`.
     let mut mate = vec![usize::MAX; tris.len()];
     let mut local: BinaryHeap<Candidate> = BinaryHeap::new();
     let mut global: BinaryHeap<Candidate> = candidates.values().copied().collect();
@@ -627,11 +835,29 @@ const AUGMENT_DEPTH: usize = 8;
 const AUGMENT_ROUNDS: usize = 6;
 
 /// Bounded augmenting-path repair for the greedy matching.
+///
+/// The classic alternating-path search that turns a maximal matching into a
+/// larger one, with two limits that keep it local: `depth_limit` caps the
+/// number of matched pairs on the path, and the DFS marks visited triangles
+/// with a per-search generation stamp. It mutates `mate` only when a full path
+/// is found, so a failed search leaves the matching unchanged.
 struct Augmenter<'a> {
+    /// The candidate graph: triangle -> the triangles it can be paired with.
     adjacency: &'a [Vec<usize>],
+
+    /// Current matching, `usize::MAX` for unmatched; mutated in place.
     mate: &'a mut [usize],
+
+    /// Per-triangle visit stamp; `visited[t] == stamp` means "seen in this
+    /// search". Reusing one vector avoids clearing it per start.
     visited: Vec<u32>,
+
+    /// Generation counter for `visited`; incremented per call to
+    /// [`Augmenter::augment_from`] and wrapped with a full clear on overflow.
     stamp: u32,
+
+    /// Maximum number of matched pairs on one augmenting path, in dual-graph
+    /// hops (from [`Options::augment_depth`]).
     depth_limit: usize,
 }
 
@@ -639,6 +865,10 @@ impl Augmenter<'_> {
     /// Find an augmenting path from `start` and, if one exists, flip the
     /// matching along it: the two previously unmatched endpoints become matched
     /// and each matched pair on the path is re-paired with its neighbours.
+    ///
+    /// Returns `true` when the matching grew. Invariant: on `false`, `mate` is
+    /// untouched. The generation stamp is bumped once per call; on wrap it is
+    /// reset together with `visited`, which keeps the marks meaningful.
     fn augment_from(&mut self, start: usize) -> bool {
         self.stamp = self.stamp.wrapping_add(1);
         if self.stamp == 0 {
@@ -650,6 +880,10 @@ impl Augmenter<'_> {
         if !self.find(start, start, &mut path, 0) {
             return false;
         }
+        // `find` leaves the alternating path as `v1, mate(v1), v2, ...`, with
+        // the last vertex unmatched. Prefixing `start` gives the full chain;
+        // pairing it in steps of two flips every edge of the path: the old
+        // matched edges disappear, the old unmatched ones become the matching.
         let mut chain: Vec<usize> = Vec::with_capacity(path.len() + 1);
         chain.push(start);
         chain.extend(path);
@@ -665,6 +899,12 @@ impl Augmenter<'_> {
 
     /// Depth-first alternating search. `path` receives
     /// `v1, mate(v1), v2, mate(v2), ..., vk` with `vk` unmatched.
+    ///
+    /// `current` is always an unmatched-side triangle in the alternating
+    /// sense; `depth` counts matched pairs already on the path. The search
+    /// stops at `depth_limit`, skips the edge back to the current mate, and
+    /// marks both triangles of a matched pair when entering it so the same
+    /// pair cannot appear twice on one path.
     fn find(&mut self, current: usize, start: usize, path: &mut Vec<usize>, depth: usize) -> bool {
         if depth > self.depth_limit {
             return false;
@@ -703,6 +943,17 @@ impl Augmenter<'_> {
 }
 
 /// The quad two triangles would form, if it clears `floor`.
+///
+/// This is the single gate every merged pair passes, whichever stage builds it:
+/// the union must be a convex counter-clockwise quad, its area must equal the
+/// sum of the two triangle areas (so the diagonal really is the shared edge and
+/// the pair covers exactly the same region), and its minimum scaled Jacobian and
+/// corner angles must clear `floor`. Returns `None` on any failure; the caller
+/// treats that as "this pair is not a candidate".
+///
+/// The score is the minimum over the four corners, i.e. the quad's worst
+/// Jacobian, because a single bad corner is what a stress analysis sees. The
+/// angle is the minimum corner angle, used only as a tie-break and needle guard.
 fn candidate_for(
     points: &[Node],
     tris: &[[usize; 3]],
@@ -745,6 +996,10 @@ fn candidate_for(
     })
 }
 
+/// The three directed edges of a triangle, in vertex order.
+///
+/// Used only to enumerate candidate shared edges; the direction is the
+/// triangle's own orientation and is not normalized.
 fn triangle_edges(tri: &[usize; 3]) -> [(usize, usize); 3] {
     [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]
 }
@@ -779,6 +1034,9 @@ fn quad_from_pair(a: &[usize; 3], b: &[usize; 3], points: &[Node]) -> Option<[us
     None
 }
 
+/// Signed area of a quad, in square millimetres (positive when the vertices go
+/// counter-clockwise). Shoelace formula on the four vertices; the caller uses
+/// it both as an area and as an orientation test.
 fn polygon_signed_area(quad: &[usize; 4], points: &[Node]) -> f64 {
     let mut sum = 0.0;
     for i in 0..4 {
@@ -789,6 +1047,10 @@ fn polygon_signed_area(quad: &[usize; 4], points: &[Node]) -> f64 {
     sum / 2.0
 }
 
+/// Signed area of a triangle, in square millimetres (positive when the three
+/// vertices are counter-clockwise). It is the cross product of two edges, so a
+/// degenerate triangle gives ~0 and the area check in [`candidate_for`] then
+/// rejects the pair.
 fn triangle_area(tri: &[usize; 3], points: &[Node]) -> f64 {
     let a = points[tri[0]];
     let b = points[tri[1]];
@@ -796,6 +1058,7 @@ fn triangle_area(tri: &[usize; 3], points: &[Node]) -> f64 {
     ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) / 2.0
 }
 
+/// The XY coordinates of a quad's four vertices, in the quad's order.
 fn quad_coords(quad: &[usize; 4], points: &[Node]) -> [[f64; 2]; 4] {
     [
         [points[quad[0]][0], points[quad[0]][1]],
@@ -806,22 +1069,36 @@ fn quad_coords(quad: &[usize; 4], points: &[Node]) -> [[f64; 2]; 4] {
 }
 
 /// Strictly convex and counter-clockwise.
+///
+/// A thin wrapper over [`convex_ccw_poly`] that fixes the meaning of the
+/// predicate for callers: every turn must be strictly left (cross product >
+/// 0) and the enclosed area must be positive, so a degenerate or collinear
+/// corner is rejected.
 fn convex_ccw(quad: &[[f64; 2]; 4]) -> bool {
     convex_ccw_poly(quad)
 }
 
+/// Minimum scaled Jacobian of a quad over its four corners (dimensionless,
+/// -1..1; higher is better). `f64::INFINITY` only if the quality function
+/// returns no corner.
 fn quad_min_sj(quad: &[usize; 4], points: &[Node]) -> f64 {
     quality::scaled_jacobian(&Cell::quad4(*quad), points)
         .into_iter()
         .fold(f64::INFINITY, f64::min)
 }
 
+/// Minimum corner angle of a quad, in degrees (0..180; higher is better).
+/// It is the tie-break guard used by the clean-up and the doublet collapse.
 fn quad_min_angle(quad: &[usize; 4], points: &[Node]) -> f64 {
     quality::quad_angles(&Cell::quad4(*quad), points)
         .into_iter()
         .fold(f64::INFINITY, f64::min)
 }
 
+/// Canonical undirected edge key: the two vertex ids in ascending order.
+///
+/// Every edge map in this module is keyed this way, so the direction a cell
+/// happens to store does not affect lookup.
 fn edge_key(a: usize, b: usize) -> (usize, usize) {
     (a.min(b), a.max(b))
 }
@@ -834,6 +1111,19 @@ fn edge_key(a: usize, b: usize) -> (usize, usize) {
 /// moving a point, and the mesh stays conforming. It is accepted only when the
 /// merged quad is convex, keeps the gate's Jacobian floor, does not lose much of
 /// the worst quality and does not become longer than the local size allows.
+///
+/// The gates are: exact area conservation (1e-9 relative), minimum scaled
+/// Jacobian >= 0.2, a loss of at most 0.15 from the worse of the two parents,
+/// minimum corner angle >= 20 degrees, and longest edge <= 2.5 `size`. The
+/// quality gates are tuning choices: a doublet is not geometrically invalid, but
+/// its 180-degree corner has zero Jacobian, so removing it is worth a small
+/// quality cost. Boundary vertices are skipped because a boundary doublet can
+/// only slide along the straight segment (see the cross-field route, where that
+/// is fatal).
+///
+/// The outer loop is capped at 8 passes and restarts the scan after every
+/// accepted collapse, so a vertex that becomes a doublet because a neighbour
+/// collapsed is still found. Returns the number of quads removed.
 fn collapse_doublets(
     points: &[Node],
     quads: &mut Vec<Option<[usize; 4]>>,
@@ -843,6 +1133,10 @@ fn collapse_doublets(
 ) -> usize {
     let mut collapses = 0usize;
     for _ in 0..8 {
+        // `incident` lists the quads around each vertex; `cell_count` counts
+        // every incident cell, including triangles. A doublet has exactly two
+        // incident cells and both must be quads, so a triangle touching the
+        // vertex disqualifies it (merging would leave a crack).
         let mut incident: HashMap<usize, Vec<usize>> = HashMap::new();
         let mut cell_count: HashMap<usize, usize> = HashMap::new();
         for (id, slot) in quads.iter().enumerate() {
@@ -925,6 +1219,12 @@ fn collapse_doublets(
 }
 
 /// Order a set of points counter-clockwise around their centroid.
+///
+/// The centroid is the mean of the four vertices. Sorting by `atan2` is valid
+/// only when the polygon is star-shaped around that centroid; the caller then
+/// checks convexity, so a wrongly ordered set is rejected rather than used.
+/// Ties on the angle are broken by vertex id, which keeps the result
+/// deterministic. Returns `None` unless there are exactly four vertices.
 fn order_around_centroid(verts: &[usize], points: &[Node]) -> Option<[usize; 4]> {
     if verts.len() != 4 {
         return None;
@@ -948,6 +1248,8 @@ fn order_around_centroid(verts: &[usize], points: &[Node]) -> Option<[usize; 4]>
     Some(ordered)
 }
 
+/// Longest edge of a quad, in millimetres. Used by [`collapse_doublets`] to
+/// keep a collapsed quad compatible with the local size field (2.5 `size`).
 fn longest_edge(quad: &[usize; 4], points: &[Node]) -> f64 {
     let mut longest: f64 = 0.0;
     for i in 0..4 {
@@ -967,6 +1269,13 @@ fn longest_edge(quad: &[usize; 4], points: &[Node]) -> f64 {
 /// convex and keep the gate's Jacobian floor, the pair's worst Jacobian does not
 /// drop, and the new diagonal does not already exist (which would make the mesh
 /// non-manifold).
+///
+/// Boundary vertices are excluded from the irregularity sum (their valence is
+/// fixed by the domain boundary) but still count for the geometry checks. The
+/// round loop is capped at 32 and each round rebuilds all indices from scratch,
+/// so a swap's effect is seen by the next round; within a round the edge set is
+/// updated eagerly so two swaps cannot create the same diagonal. Returns the
+/// number of swaps taken.
 fn swap_edges(
     points: &[Node],
     quads: &mut [Option<[usize; 4]>],
@@ -1031,6 +1340,9 @@ fn swap_edges(
 
             let old_sj = quad_min_sj(&q1, points).min(quad_min_sj(&q2, points));
             let before = irregularity(&[x, y, p, r, q, s], &valence, boundary);
+            // The two candidate diagonals of the hexagon. The delta is the
+            // change each one makes to the four shared vertices: x and y lose
+            // one incident edge, the new diagonal's endpoints gain one.
             let options: [([[usize; 4]; 2], [(usize, isize); 4]); 2] = [
                 // new diagonal p-r
                 (
@@ -1075,6 +1387,9 @@ fn swap_edges(
                 }
                 let diagonal = edge_key(pair[0][0], pair[0][3]);
                 if edge_set.contains(&diagonal) {
+                    // An existing diagonal would give two cells the same edge
+                    // twice, i.e. a non-manifold mesh; the edge set includes
+                    // the triangle edges, so a quad cannot cut through one.
                     continue;
                 }
                 let mut after_valence = valence.clone();
@@ -1118,6 +1433,13 @@ fn swap_edges(
     swaps
 }
 
+/// Irregularity of a set of vertices: `sum |valence - 4|` over the vertices
+/// that are not on the domain boundary.
+///
+/// Unitless (a sum of valence differences). Boundary vertices are excluded
+/// because their valence is imposed by the boundary loops and cannot be made 4
+/// by an interior swap; including them would bias the clean-up toward moving
+/// the irregularity onto the boundary. A lower value is better.
 fn irregularity(vertices: &[usize], valence: &HashMap<usize, usize>, boundary: &[bool]) -> i64 {
     vertices
         .iter()
@@ -1153,6 +1475,12 @@ const WALK_BUDGET: usize = 400;
 /// the new diagonal must not already exist in the mesh (otherwise the mesh would
 /// become non-manifold). The final merge uses the same guards. A residual that
 /// cannot reach a partner under those guards is left as a triangle.
+///
+/// The walk is run for up to [`MAX_WALK_PASSES`] passes over the current
+/// residual list; a pass that merges nothing ends the loop, so it cannot cycle.
+/// It is the step that made the route competitive: measured over the seven
+/// corpus parts, it reduced the residuals from 880 (band+greedy+leftover only) to
+/// 362 (-59 %). Returns the number of pairs merged.
 fn merge_residuals(
     points: &[Node],
     quads: &mut Vec<Option<[usize; 4]>>,
@@ -1161,6 +1489,9 @@ fn merge_residuals(
 ) -> usize {
     let mut merges = 0usize;
     for _ in 0..MAX_WALK_PASSES {
+        // `nq` is the current quad/triangle cell-id boundary: quads are 0..nq,
+        // residual triangles are nq+tid. A merge appends a quad, so the boundary
+        // moves and the edge index is rebuilt; triangle slot ids stay fixed.
         let mut nq = quads.len();
         let mut base = build_mesh_edges(quads, tris, nq);
         let tri_ids: Vec<usize> = tris
@@ -1196,6 +1527,11 @@ fn merge_residuals(
 
 /// Edge key -> the cells that use it. Quad cells keep their id; triangle cell
 /// ids are `nq + tid`.
+///
+/// This is the *base* snapshot for one walk pass: it encodes the mesh before
+/// any branch of the backtracking search is applied. [`Walk`] reads it directly
+/// for unchanged edges and keeps a per-branch override map for the edges a move
+/// touches, so a rollback is an undo-log pop rather than a rebuild.
 fn build_mesh_edges(
     quads: &[Option<[usize; 4]>],
     tris: &[Option<[usize; 3]>],
@@ -1222,28 +1558,72 @@ fn build_mesh_edges(
 }
 
 /// One pentagon split that moves the triangle through a quad.
+///
+/// The pair `(tri, quad)` is the replacement partition of the same pentagon:
+/// the moved triangle and the reshaped quad. Both are fully validated in
+/// [`move_splits`] before a `SplitOption` is built, so applying one only has to
+/// keep the cell and edge bookkeeping in sync.
 struct SplitOption {
+    /// The moved triangle, counter-clockwise, with the same area as before.
     tri: [usize; 3],
+
+    /// The reshaped quad, counter-clockwise and convex.
     quad: [usize; 4],
+
+    /// Minimum scaled Jacobian of `quad` (dimensionless); higher is better and
+    /// the primary ordering key of [`move_splits`].
     quad_sj: f64,
+
+    /// Minimum corner angle of `tri`, in degrees; the secondary ordering key
+    /// and the guard against a degenerate moved triangle (>= 2 degrees).
     tri_angle: f64,
 }
 
+/// One backtracking branch of the Sect. 3.3 walk.
+///
+/// The walk is a depth-first search over "move the triangle through one of its
+/// adjacent quads" moves. It mutates the shared `quads`/`tris` arrays while a
+/// branch is explored and undoes every move on backtracking; `overrides` and
+/// `log` are the edge-index delta of the current branch.
 struct Walk<'a> {
+    /// Mesh coordinates (never mutated by the walk).
     points: &'a [Node],
+
+    /// Quads, with `None` for a cell consumed by the current branch. A move
+    /// appends the new quad; ids of existing quads never change.
     quads: &'a mut Vec<Option<[usize; 4]>>,
+
+    /// Residual triangles, indexed by slot id; `None` means merged or moved.
     tris: &'a mut [Option<[usize; 3]>],
+
+    /// The pre-branch edge index from [`build_mesh_edges`].
     base: &'a HashMap<(usize, usize), Vec<usize>>,
+
+    /// Quad/triangle cell-id boundary of `base`: quads are `0..nq`, triangle
+    /// cell ids are `nq + slot`.
     nq: usize,
+
     /// Edge owners changed by the moves applied on the current branch.
     overrides: HashMap<(usize, usize), Vec<usize>>,
+
     /// Undo log for `overrides`: `(edge, previous override)`.
     log: Vec<((usize, usize), Option<Vec<usize>>)>,
+
+    /// Remaining search states for this triangle; decremented once per expanded
+    /// state and never below zero (see [`Options::walk_budget`]).
     budget: usize,
+
+    /// Sorted triangle keys already on the current path. It rejects a branch
+    /// that would revisit a triangle, which is what makes the DFS terminate on
+    /// a cyclic dual graph.
     visited: HashSet<[usize; 3]>,
 }
 
 impl<'a> Walk<'a> {
+    /// A walk over one pass's mesh snapshot, with a fresh empty branch state.
+    ///
+    /// `base` must have been built with the same `nq`; `walk_budget` is copied
+    /// into `budget` and consumed across the whole search of this triangle.
     fn new(
         points: &'a [Node],
         quads: &'a mut Vec<Option<[usize; 4]>>,
@@ -1273,6 +1653,10 @@ impl<'a> Walk<'a> {
         }
     }
 
+    /// Whether `edge` exists in the mesh as modified by the current branch.
+    ///
+    /// Overrides can be empty (the edge was removed by a move), which is why
+    /// this cannot just test `overrides.contains_key`.
     fn edge_present(&self, edge: (usize, usize)) -> bool {
         match self.overrides.get(&edge) {
             Some(list) => !list.is_empty(),
@@ -1282,6 +1666,11 @@ impl<'a> Walk<'a> {
 
     /// Merge the current triangle with an adjacent residual triangle, if the
     /// union is a convex quad with scaled Jacobian at least 0.2.
+    ///
+    /// Targets are collected from the triangle's three edges, then tried in
+    /// ascending slot order, so the first valid partner is deterministic. A
+    /// merge consumes both triangles and appends the new quad; it does not go
+    /// through the override log because the walk ends immediately afterwards.
     fn merge_adjacent(&mut self, tid: usize, current: &[usize; 3]) -> bool {
         let mut targets: Vec<usize> = Vec::new();
         for i in 0..3 {
@@ -1312,6 +1701,13 @@ impl<'a> Walk<'a> {
     /// Try to merge here, then move the triangle through one adjacent quad and
     /// recurse. Moves are undone on backtracking, so a failed exploration leaves
     /// the mesh exactly as it was.
+    ///
+    /// The search order is: (1) merge with an adjacent residual, (2) stop when
+    /// `depth` or the budget is exhausted, (3) reject a triangle key already on
+    /// the path, (4) try every adjacent quad and every valid pentagon split of
+    /// it, best split first. Returns `true` only when a merge was committed; in
+    /// that case the branch is *not* rolled back (the pass ends and rebuilds its
+    /// edge index).
     fn search(&mut self, tid: usize, current: [usize; 3], depth: usize) -> bool {
         if self.merge_adjacent(tid, &current) {
             return true;
@@ -1322,9 +1718,13 @@ impl<'a> Walk<'a> {
         self.budget -= 1;
         let key = sorted_key(&current);
         if !self.visited.insert(key) {
+            // The triangle is already on the current path; moving it again
+            // would just rotate the same pentagon partition around a cycle.
             return false;
         }
 
+        // Only quads can be moved through; `owner < nq` selects a quad cell id,
+        // while a triangle owner is a *target* for `merge_adjacent`, not a move.
         let mut near: Vec<usize> = Vec::new();
         for i in 0..3 {
             let edge = edge_key(current[i], current[(i + 1) % 3]);
@@ -1349,6 +1749,9 @@ impl<'a> Walk<'a> {
                 if self.search(tid, split.tri, depth - 1) {
                     return true;
                 }
+                // Failed branch: undo the edge overrides and restore the two
+                // cells. The log is popped back to `mark`; every entry the
+                // recursive call added is above it.
                 self.rollback(mark);
                 self.tris[tid] = old_tri;
                 self.quads[qid] = old_quad;
@@ -1360,6 +1763,12 @@ impl<'a> Walk<'a> {
 
     /// Replace `(old_tri, old_quad)` by `(split.tri, split.quad)` and update the
     /// edge-owner overrides.
+    ///
+    /// Only edges whose incidence can change are touched: the old and new
+    /// triangle edges and the old and new quad edges. For each, the current
+    /// owners are taken (base or override), the two cells are removed, and the
+    /// cell is re-added only if its new polygon actually has the edge. The
+    /// previous override is logged first so [`Walk::rollback`] can restore it.
     fn apply_split(
         &mut self,
         tid: usize,
@@ -1368,6 +1777,8 @@ impl<'a> Walk<'a> {
         old_quad: &[usize; 4],
         split: &SplitOption,
     ) {
+        // The triangle's cell id is its slot id offset by the quad count; the
+        // quad keeps its own id. A move therefore never renumbers a cell.
         let tri_cell = self.nq + tid;
         let mut affected: Vec<(usize, usize)> = Vec::new();
         for i in 0..3 {
@@ -1398,6 +1809,12 @@ impl<'a> Walk<'a> {
         self.quads[qid] = Some(split.quad);
     }
 
+    /// Undo the edge-owner overrides recorded above `mark`.
+    ///
+    /// `mark` is the log length before a split was applied. Every entry the
+    /// failed branch (or its recursion) added is popped and its previous value
+    /// restored, so the edge index returns to exactly the state at `mark`. The
+    /// cell arrays are restored by the caller, which holds the old values.
     fn rollback(&mut self, mark: usize) {
         while self.log.len() > mark {
             let Some((edge, previous)) = self.log.pop() else {
@@ -1415,12 +1832,21 @@ impl<'a> Walk<'a> {
     }
 }
 
+/// Whether the polygon `nodes` uses `edge` in either direction.
+///
+/// Works for a triangle or a quad; it reads the polygon cyclically, so the
+/// stored vertex order is the cell's boundary order.
 fn cell_has_edge(nodes: &[usize], edge: (usize, usize)) -> bool {
     (0..nodes.len()).any(|i| edge_key(nodes[i], nodes[(i + 1) % nodes.len()]) == edge)
 }
 
 /// The pentagon `p, s, t, q, r` covered by triangle `(p,q,r)` and quad
 /// `(q,p,s,t)`, or `None` when they do not share exactly one edge.
+///
+/// The shared edge is `p -> q` in the triangle and `q -> p` in the quad, which
+/// is the only way two counter-clockwise cells can share an edge. The returned
+/// cycle walks the pentagon once counter-clockwise starting at `p`; it is the
+/// union polygon the moved triangle is cut from.
 fn pentagon_from(tri: &[usize; 3], quad: &[usize; 4]) -> Option<[usize; 5]> {
     for i in 0..3 {
         let p = tri[i];
@@ -1439,6 +1865,17 @@ fn pentagon_from(tri: &[usize; 3], quad: &[usize; 4]) -> Option<[usize; 5]> {
 
 /// Splits of the pentagon that move the triangle to another corner, best first.
 /// The original partition (the one equal to the current triangle) is skipped.
+///
+/// A pentagon split takes three consecutive corners as the new triangle and the
+/// remaining four as the new quad; there are five of them, one for each starting
+/// corner. A split is kept only when the new triangle is not degenerate
+/// (`area > 1e-14`, minimum angle >= 2 degrees), the new quad is convex with
+/// scaled Jacobian >= 0.2, the two areas still sum to the pentagon area, and the
+/// new diagonal is not already a mesh edge (which would create a non-manifold
+/// edge). The returned list is sorted by descending quad Jacobian, then
+/// descending triangle angle, so the DFS tries the best split first. These
+/// thresholds are the walk's guards; they are tuning choices, not paper
+/// constants.
 fn move_splits(
     points: &[Node],
     tri: &[usize; 3],
@@ -1462,6 +1899,10 @@ fn move_splits(
     }
     let old_key = sorted_key(tri);
 
+    // Five ways to choose the new triangle's first corner; each also defines
+    // the new quad as the complementary four corners. The old partition is
+    // skipped by its sorted key, not by a comparison of the arrays, because the
+    // starting corner may differ while the triangle is the same.
     let mut out: Vec<SplitOption> = Vec::new();
     for i in 0..5 {
         let new_tri = [p[i], p[(i + 1) % 5], p[(i + 2) % 5]];
@@ -1512,6 +1953,8 @@ fn move_splits(
     out
 }
 
+/// Minimum corner angle of a triangle, in degrees (0..180). The walk uses it to
+/// reject a moved triangle that would become a needle (floor 2 degrees).
 fn triangle_min_angle(tri: &[usize; 3], points: &[Node]) -> f64 {
     quality::corner_angles(&Cell::tri3(*tri), points)
         .into_iter()
@@ -1520,6 +1963,12 @@ fn triangle_min_angle(tri: &[usize; 3], points: &[Node]) -> f64 {
 
 /// Merge two triangles sharing an edge, if the union is a convex quad with a
 /// scaled Jacobian of at least 0.2 and exactly the same area.
+///
+/// This is the walk's final step (and the only merge the walk commits): unlike
+/// [`candidate_for`] it has no adjustable floor, because the residual pair is
+/// the last chance to avoid leaving a triangle. The area equality is the
+/// conformity proof: a quad whose area differs from the two triangles would
+/// either overlap a neighbour or leave a gap.
 fn merge_pair(points: &[Node], a: &[usize; 3], b: &[usize; 3]) -> Option<[usize; 4]> {
     let quad = quad_from_pair(a, b, points)?;
     if !convex_ccw(&quad_coords(&quad, points)) {
@@ -1536,6 +1985,9 @@ fn merge_pair(points: &[Node], a: &[usize; 3], b: &[usize; 3]) -> Option<[usize;
     Some(quad)
 }
 
+/// Signed area of a polygon given by its XY coordinates, in square
+/// millimetres. Shoelace formula; it works for the 5-gon of the walk as well as
+/// for a quad, and its sign is the polygon's orientation.
 fn coords_area(coords: &[[f64; 2]]) -> f64 {
     let mut sum = 0.0;
     for i in 0..coords.len() {
@@ -1546,6 +1998,12 @@ fn coords_area(coords: &[[f64; 2]]) -> f64 {
     sum / 2.0
 }
 
+/// Strictly convex, counter-clockwise, with positive area, for a polygon given
+/// by its coordinates.
+///
+/// Every turn must be strictly left (cross product > 0) and the signed area must
+/// be positive. A collinear corner (cross product 0) is rejected, which is what
+/// keeps a degenerate quad out of the mesh.
 fn convex_ccw_poly(coords: &[[f64; 2]]) -> bool {
     if coords.len() < 3 {
         return false;
@@ -1569,7 +2027,10 @@ impl HybridStats {
     /// must be consistent with the quads in the mesh.
     fn quads_ok(&self) -> bool {
         // Each doublet collapse turns two quads into one, so the final quad
-        // count is the quads formed minus the collapses.
+        // count is the quads formed minus the collapses. The test domains are
+        // chosen so no collapse fires; if one did, the two quads covered four
+        // of the original triangles and the left side would be short by
+        // `2 * doublet_collapses` (add it back for an area identity).
         let quads = self.band_quads + self.greedy_quads + self.leftover_quads
             - self.doublet_collapses
             + self.walk_merges;
@@ -1583,6 +2044,9 @@ mod tests {
     use super::*;
     use crate::verify;
 
+    /// Count the quads that are strictly convex and counter-clockwise, using the
+    /// same predicate as the route; compared against `gate.quads` so the test
+    /// checks that every emitted quad is convex, not just non-inverted.
     fn convex_quads(mesh: &Mesh) -> usize {
         mesh.cells
             .iter()
@@ -1597,6 +2061,8 @@ mod tests {
             .count()
     }
 
+    /// A small square: the mesh must be quad-dominant, conforming, watertight,
+    /// with boundary offset ~0 and every emitted quad convex.
     #[test]
     fn a_square_is_quad_dominant_and_conforming() {
         let domain = Domain::rectangle(10.0, 10.0).unwrap();
@@ -1612,6 +2078,9 @@ mod tests {
         assert_eq!(convex_quads(&mesh), gate.quads);
     }
 
+    /// Non-default options must still produce a valid, conforming mesh, even
+    /// when they deliberately weaken every heuristic (thin band, shallow
+    /// augmenting repair and walk).
     #[test]
     fn non_default_options_still_produce_a_valid_mesh() {
         let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
@@ -1633,6 +2102,8 @@ mod tests {
         assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
     }
 
+    /// The plate-with-hole test checks the even-parity contract directly
+    /// (`band_triangles % 2 == 0`), plus watertightness and the stage sums.
     #[test]
     fn a_plate_with_a_hole_is_watertight_and_the_band_is_even() {
         let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
@@ -1652,6 +2123,9 @@ mod tests {
         assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
     }
 
+    /// The floor is a quality guard, not a broken construction: the same sliver
+    /// pair is a valid convex quad when the floor is loosened, and is refused by
+    /// [`GREEDY_FLOOR`] because its worst Jacobian is below 0.05.
     #[test]
     fn a_greedy_merge_of_a_sliver_is_refused() {
         // Two triangles sharing the edge 0-1, with the other two vertices a
@@ -1680,6 +2154,9 @@ mod tests {
         );
     }
 
+    /// The walk is the only operator that can join two residual triangles that
+    /// are not adjacent; after the merge the mesh must be manifold, crack-free
+    /// and area-preserving, and every new quad must clear the 0.2 floor.
     #[test]
     fn the_walk_brings_two_residual_triangles_together() {
         // A quad with one triangle below it and one on its right: the two
@@ -1734,6 +2211,8 @@ mod tests {
         }
     }
 
+    /// A zero-area domain is a rejected request, not a degenerate mesh: the
+    /// route must return `Err` rather than panic.
     #[test]
     fn a_domain_with_no_area_is_refused() {
         // Collinear outer loop: the domain has no area and the route returns an

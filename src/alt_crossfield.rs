@@ -2,32 +2,43 @@
 //!
 //! Papers: Pellenard, Orbay, Chen, Sohan, Kwok & Tristano, *QMCF: QMorph
 //! Cross Field-Driven Quad-Dominant Meshing Algorithm*, Procedia Engineering 82
-//! (2014) 338-350; Pellenard, Alliez & Morvan, *Isotropic 2D Quadrangle Meshing
-//! with Size and Orientation Control* (2011); and Remacle et al., *A frontal
-//! Delaunay quad mesh generator using the L1 norm* (2013), §3 (cross fields).
+//! (2014) 338-350 (corpus `pellenard-2014`); Pellenard, Alliez & Morvan,
+//! *Isotropic 2D Quadrangle Meshing with Size and Orientation Control* (2011)
+//! (corpus `pellenard-2011`); and Remacle et al., *A frontal Delaunay quad mesh
+//! generator using the L1 norm* (2013), §3 (cross fields) (corpus
+//! `remacle-2013`).
 //!
 //! Steps implemented here:
 //!
 //! 1. **Cross field on a background grid** (Pellenard 2014 §3, Remacle 2013 §3).
-//!    The field is represented by the complex number `e^{i 4 theta}` at every
-//!    node of a regular grid covering the domain. Nodes inside a band next to
-//!    the boundary are fixed to the direction of the nearest boundary segment
-//!    (modulo 90°, so a square has the same cross on all four sides); the
+//!    The field is a direction *cross*: `theta` and `theta + 90°` are the same
+//!    object, so it is represented by the unit complex number `e^{i 4 theta}` at
+//!    every node of a regular grid covering the domain (the double-angle
+//!    representation removes the 90-degree ambiguity). Nodes inside a band next
+//!    to the boundary are fixed to the direction of the nearest boundary segment
+//!    (again modulo 90°, so a square has the same cross on all four sides); the
 //!    interior is the solution of the two Laplace equations for
 //!    `(cos 4 theta, sin 4 theta)`, obtained by Gauss-Seidel averaging with the
-//!    boundary band held fixed. A singular node (zero averaged magnitude) is
-//!    given a deterministic fallback orientation.
+//!    boundary band held fixed. Each sweep normalizes the average back onto the
+//!    unit circle; a singular node (zero averaged magnitude) is given a
+//!    deterministic fallback orientation. The sweep loop stops early when the
+//!    largest update over a sweep is below `1e-7`, and is capped by
+//!    [`Options::field_sweeps`] (400 by default).
 //! 2. **Field-aligned row paving** (the QMCF idea of driving new fronts by the
 //!    cross field: Pellenard 2014 §4.2). The initial front is the sampled domain
 //!    boundary (every boundary loop is made even first). A front edge `a -> b`
 //!    is advanced by placing the side nodes along the cross-field branch that
 //!    points into the unmeshed region; side nodes are shared with the previous
 //!    quad of the row when they coincide, so quads are laid **row by row along
-//!    the field**. A placement is refused when the quad is not convex, when a
+//!    the field**. Concretely, a new side node is reused when it is within
+//!    `0.35 * size` of the one the previous/following front edge already owns,
+//!    which is what turns independent placements into a row. A placement is
+//!    refused when the quad is not convex with a 20° minimum corner, when a
 //!    node would fall inside it, when a new edge would cross the existing mesh
-//!    or the domain boundary, or when a new node is too close to an existing
-//!    one. Refusals leave the unmeshed region valid; the front stops when a
-//!    whole pass makes no progress.
+//!    or the domain boundary, or when a new node is closer than `0.45 * size`
+//!    to an existing one. Refusals leave the unmeshed region valid; the front
+//!    stops when a whole pass makes no progress. The pass count is the paving
+//!    depth, one of [`PAVING_DEPTHS`].
 //! 3. **Closure with the existing front/matching pair** (Pellenard 2014 §4.1;
 //!    the crate's `qmorph`/`twostage`/`sun` helpers). Each remaining unmeshed
 //!    component is triangulated (constrained Delaunay, with interior points at
@@ -60,15 +71,23 @@
 //!    alone. That fallback is what passes the 0.6 mm performance part.
 //!
 //! **Paving depth.** The front is advanced for one of four fixed depths
-//! (`PAVING_DEPTHS`); the produced mesh with the best gate margin is returned.
+//! ([`PAVING_DEPTHS`]); the produced mesh with the best gate margin is returned.
 //! This is a deterministic geometric choice, not a per-input search: a shallow
 //! front leaves a large residual to Q-Morph and keeps the aligned boundary
-//! rows, a deep front closes most of the domain itself. Measured: all seven
-//! corpus parts are all-quad, conforming and pass the gate after the common
-//! post-pass (post SJ 0.23–0.78, minimum angle 30–55°). The 0.6 mm
-//! performance part needs the pre-walk fallback and gains ~5.1k quads (20 586
-//! instead of 15 500): the cascade has to carry 48 residual triangles to the
-//! boundary. See `examples/alt_crossfield.rs`.
+//! rows, a deep front closes most of the domain itself. Measured on the corpus,
+//! depth 1 wins on the 4 mm and 1 mm plate, depth 7 on the 2 mm plate, depth 3
+//! on the stepped part, and the full front on the ring and the L-bracket. The
+//! choice is made after all four runs, so it costs four `generate` calls.
+//!
+//! **Measured.** All seven corpus parts are all-quad, conforming and pass the
+//! gate after the common post-pass (7/7 post; post SJ 0.23-0.78, minimum angle
+//! 30-55°). The 0.6 mm performance part needs the pre-walk fallback: it grows
+//! from 15 500 quads + 2 triangles to 20 586 quads (+5 086 quads, +33 %, and no
+//! triangles), because the cascade has to carry 48 residual triangles to the
+//! boundary. That +33 % is the price of the parity-safe fallback, and it is the
+//! reason this route is heavier than the paving route on fine parts even though
+//! the two produce the same kind of boundary rows. See
+//! `examples/alt_crossfield.rs`; the tables are in `results/crossfield.txt`.
 //!
 //! What is **not** implemented: the globally optimal mixed-integer cross field
 //! of Knöppel et al. (Pellenard 2014 uses an over-constrained least-squares
@@ -94,29 +113,48 @@ use crate::sun;
 use crate::two_d::{Domain, Sizing};
 use crate::twostage;
 
-/// Number of Gauss-Seidel sweeps for the two Laplace equations.
+/// Number of Gauss-Seidel sweeps for the two Laplace equations (default
+/// [`Options::field_sweeps`]). One sweep visits every free grid node once in
+/// row-major order and averages its four neighbours. The loop also stops early
+/// when a whole sweep changes no component by more than `1e-7`, so this is a cap
+/// rather than a fixed cost.
 const FIELD_SWEEPS: usize = 400;
-/// Grid spacing of the background cross field, as a share of the element size.
+/// Grid spacing of the background cross field, as a share of the element size
+/// (dimensionless; default 0.5, so two grid nodes per element). A finer grid
+/// resolves a curved boundary field but grows the Laplace cost quadratically;
+/// a coarser one blurs the boundary tangents into the interior.
 const FIELD_GRID_FRACTION: f64 = 0.5;
 /// Upper bound on background-grid nodes (a smaller size field increases `h`).
+/// It is a memory guard: the field is a dense `nx * ny` array, so a very fine
+/// size on a large part would otherwise allocate without limit. When the bound
+/// is hit, `h` is grown by 1.25 until the grid fits.
 const MAX_FIELD_NODES: usize = 250_000;
 /// A grid node inside the domain and this close (in grid spacings) to the
-/// boundary is a Dirichlet node of the cross field.
+/// boundary is a Dirichlet node of the cross field. `1.5` covers the boundary
+/// layer plus one interior ring, which is what makes the field tangential to
+/// the boundary without freezing too much of the domain.
 const FIELD_BAND: f64 = 1.5;
 
 /// Options for the cross-field-aligned route.
 ///
 /// The defaults are the constants this route was tuned with, so
-/// `Options::default()` reproduces the measured behaviour exactly.
+/// `Options::default()` reproduces the measured behaviour exactly. The only
+/// field is the solver cap; the paving depths and the geometric guards are
+/// constants because they are part of the deterministic route, not inputs.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Options {
     /// Number of Gauss-Seidel sweeps for the two Laplace equations of the
-    /// cross field. More sweeps let the boundary-aligned field propagate
-    /// farther into the domain.
+    /// cross field (default 400, [`FIELD_SWEEPS`]). More sweeps let the
+    /// boundary-aligned field propagate farther into the domain; the solver
+    /// also stops early when the largest per-sweep update is below `1e-7`.
+    /// Invariant: a value of 0 leaves the initial nearest-segment field
+    /// without relaxation.
     pub field_sweeps: usize,
 }
 
 impl Default for Options {
+    /// The measured default: 400 Gauss-Seidel sweeps (with the `1e-7` early
+    /// exit, this is a cap, not necessarily the number actually run).
     fn default() -> Self {
         Self {
             field_sweeps: FIELD_SWEEPS,
@@ -127,15 +165,35 @@ impl Default for Options {
 /// The cross field is `theta` modulo 90°, represented univocally as
 /// `(cos 4 theta, sin 4 theta)`. It lives on a regular grid that covers the
 /// bounding box of the domain, so it can be evaluated anywhere in the box.
+///
+/// Invariants: `values.len() == nx * ny`, the grid spacing is `h` in both
+/// directions, and every stored pair is either unit length or the deterministic
+/// `(1, 0)` fallback for a singular node. The grid is extended by one spacing
+/// beyond the domain's bounding box, so bilinear interpolation at a boundary
+/// point always has four in-range nodes.
 #[derive(Clone, Debug)]
 pub struct CrossField {
+    /// X coordinate of grid node `(0, 0)`, in millimetres (one spacing left of
+    /// the domain bounding box).
     xmin: f64,
+
+    /// Y coordinate of grid node `(0, 0)`, in millimetres (one spacing below
+    /// the domain bounding box).
     ymin: f64,
+
+    /// Uniform grid spacing in both directions, in millimetres (`> 0`).
     h: f64,
+
+    /// Number of grid nodes in X (`>= 2`; the `+3` margin in the constructor
+    /// guarantees at least one interpolation cell around the box).
     nx: usize,
+
+    /// Number of grid nodes in Y (`>= 2`).
     ny: usize,
+
     /// `(cos 4 theta, sin 4 theta)` per grid node, row-major `j * nx + i`.
     values: Vec<[f64; 2]>,
+
     /// Dirichlet nodes: inside the domain, within `FIELD_BAND` grid spacings of
     /// the boundary. Kept for the smoothness test.
     fixed: Vec<bool>,
@@ -144,11 +202,28 @@ pub struct CrossField {
 impl CrossField {
     /// Build the boundary-aligned cross field of a planar domain with the
     /// default options.
+    ///
+    /// Convenience wrapper over [`CrossField::new_with_options`] with
+    /// [`Options::default`] (400 sweeps).
     pub fn new(domain: &Domain, sizing: &Sizing) -> Result<Self, String> {
         Self::new_with_options(domain, sizing, &Options::default())
     }
 
     /// Build the boundary-aligned cross field of a planar domain.
+    ///
+    /// The background grid spacing is `FIELD_GRID_FRACTION * sizing.size`
+    /// (millimetres), enlarged by 1.25 as needed to keep `nx * ny` under
+    /// [`MAX_FIELD_NODES`]. Every node starts at the orientation of the nearest
+    /// boundary segment (angle `theta`, stored as `e^{i 4 theta}`); nodes
+    /// inside the domain and within [`FIELD_BAND`] spacings of the boundary are
+    /// marked Dirichlet. The interior is then relaxed with
+    /// `options.field_sweeps` Gauss-Seidel sweeps of the two Laplace equations,
+    /// with the Dirichlet nodes held fixed and every averaged value normalized
+    /// back to unit length.
+    ///
+    /// Errors: a non-finite or non-positive size, or a degenerate domain
+    /// bounding box. The returned field owns its dense grid; it borrows nothing
+    /// from `domain` or `sizing`.
     pub fn new_with_options(
         domain: &Domain,
         sizing: &Sizing,
@@ -159,6 +234,9 @@ impl CrossField {
             return Err("the element size must be positive and finite".to_string());
         }
         let (mut xmin, mut xmax, mut ymin, mut ymax) = bounds(domain)?;
+        // One grid spacing is half an element, so a boundary tangent is
+        // represented by roughly two samples per element. `+3` leaves one full
+        // interpolation cell of margin on each side of the bounding box.
         let mut h = (FIELD_GRID_FRACTION * size).max(1.0e-9);
         let mut nx = (((xmax - xmin) / h).ceil() as usize).max(2) + 3;
         let mut ny = (((ymax - ymin) / h).ceil() as usize).max(2) + 3;
@@ -169,6 +247,9 @@ impl CrossField {
             nx = (((xmax - xmin) / h).ceil() as usize).max(2) + 3;
             ny = (((ymax - ymin) / h).ceil() as usize).max(2) + 3;
         }
+        // Shift the grid so node (0, 0) is one spacing outside the bounding
+        // box; the recomputed `xmax`/`ymax` are then implied by `nx`/`ny` and
+        // `h` and are not needed after this point.
         xmin -= h;
         ymin -= h;
         xmax = xmin + (nx - 1) as f64 * h;
@@ -181,17 +262,27 @@ impl CrossField {
         for j in 0..ny {
             for i in 0..nx {
                 let p = [xmin + i as f64 * h, ymin + j as f64 * h];
+                // Initial guess and Dirichlet value: the tangent of the
+                // nearest boundary segment. The `4 * theta` encoding makes the
+                // four branches of the cross equivalent (theta and theta+90°
+                // give the same value).
                 let (a, b, _) = domain.nearest_segment(p);
                 let (ta, tb) = tangent(a, b);
                 let theta = tb.atan2(ta);
                 let four = 4.0 * theta;
                 values[j * nx + i] = [four.cos(), four.sin()];
+                // Only nodes *inside* the domain and close to the boundary are
+                // Dirichlet; outside nodes are free, which lets the field
+                // interpolate smoothly across the boundary for the paving.
                 fixed[j * nx + i] =
                     domain.contains(p) && domain.distance_to_boundary(p) <= FIELD_BAND * h;
             }
         }
 
-        // Gauss-Seidel for the two Laplace equations, Dirichlet band fixed.
+        // Gauss-Seidel for the two Laplace equations, Dirichlet band fixed. A
+        // sweep uses the values updated earlier in the same sweep (in-place),
+        // which is what makes it Gauss-Seidel rather than Jacobi and lets 400
+        // sweeps carry the boundary orientation across a normal-sized part.
         for _ in 0..options.field_sweeps {
             let mut worst = 0.0f64;
             for j in 0..ny {
@@ -227,6 +318,10 @@ impl CrossField {
                         continue;
                     }
                     let (mut a, mut b) = (sa / count as f64, sb / count as f64);
+                    // The Laplace unknowns are the two components of a unit
+                    // complex number, so the average must be projected back
+                    // onto the unit circle; otherwise the field would decay
+                    // toward zero in the interior.
                     let norm = (a * a + b * b).sqrt();
                     if norm > 1.0e-12 {
                         a /= norm;
@@ -237,11 +332,15 @@ impl CrossField {
                         a = 1.0;
                         b = 0.0;
                     }
+                    // One sweep's convergence measure: the L1 change of the
+                    // encoded cross (not an angle). `1e-7` is the early exit;
+                    // it is a numerical tolerance, not a quality threshold.
                     worst = worst.max((a - values[id][0]).abs() + (b - values[id][1]).abs());
                     values[id] = [a, b];
                 }
             }
             if worst < 1.0e-7 {
+                // A steady field: more sweeps would not change the paving.
                 break;
             }
         }
@@ -258,6 +357,10 @@ impl CrossField {
     }
 
     /// Cross orientation at `p`, in radians, modulo 90° (`-pi/4 .. pi/4`).
+    ///
+    /// One branch of the four is returned; `theta` and `theta + 90°` are the
+    /// same cross. The value is interpolated (`raw_at`), so it is smooth inside
+    /// a grid cell. A sample whose interpolated magnitude is ~0 returns 0.
     pub fn angle_at(&self, p: [f64; 2]) -> f64 {
         let (a, b) = self.raw_at(p);
         let norm = (a * a + b * b).sqrt();
@@ -268,6 +371,12 @@ impl CrossField {
     }
 
     /// The unit direction of the cross branch closest to `target`.
+    ///
+    /// Tries the four 90°-rotations of [`CrossField::angle_at`] and returns the
+    /// one with the largest dot product with `target`; `target` need not be
+    /// normalized (only its direction matters). Ties keep the first branch
+    /// (`k = 0`), so the result is deterministic. This is the paving's
+    /// "which of the four directions points into the unmeshed region" step.
     pub fn nearest_direction(&self, p: [f64; 2], target: [f64; 2]) -> [f64; 2] {
         let theta = self.angle_at(p);
         let mut best = [theta.cos(), theta.sin()];
@@ -285,6 +394,12 @@ impl CrossField {
     }
 
     /// Bilinear interpolation of `(cos 4 theta, sin 4 theta)`.
+    ///
+    /// The query is clamped to the grid's outer cell, so points slightly
+    /// outside the extended box (or exactly on the top/right edge) are
+    /// evaluated by clamping the fractional coordinates to `[0, 1]` rather than
+    /// extrapolating. The result is *not* renormalized here; `angle_at` and
+    /// `nearest_direction` handle a near-zero magnitude.
     fn raw_at(&self, p: [f64; 2]) -> (f64, f64) {
         let fx = (p[0] - self.xmin) / self.h;
         let fy = (p[1] - self.ymin) / self.h;
@@ -309,6 +424,13 @@ impl CrossField {
 
     /// Largest angular jump between a free grid node and its four neighbours,
     /// in degrees (the smoothness diagnostic used by the tests).
+    ///
+    /// Only free (non-Dirichlet) nodes inside the domain are considered, and
+    /// only neighbours inside the domain, so the boundary tangents themselves
+    /// do not count as jumps. The angle difference is computed in the
+    /// four-angle representation (`0.25 * acos(dot)`, then degrees), so the
+    /// reported value is at most 45°: a jump near 45° is a full branch swap,
+    /// not a small geometric change.
     pub fn max_neighbour_angle_deg(&self, domain: &Domain) -> f64 {
         let mut worst: f64 = 0.0;
         for j in 0..self.ny {
@@ -362,11 +484,31 @@ const PAVING_DEPTHS: [usize; 4] = [1, 3, 7, usize::MAX];
 
 /// Mesh a planar domain with the cross-field-aligned route and the default
 /// options.
+///
+/// Convenience wrapper over [`mesh_with_options`] with [`Options::default`].
+/// The result is all-quad when the refinement cascade can close the last
+/// residuals; otherwise the surviving triangles are returned rather than
+/// dropped.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
     mesh_with_options(domain, sizing, &Options::default())
 }
 
 /// Mesh a planar domain with the cross-field-aligned route.
+///
+/// Pipeline: build the [`CrossField`], run [`generate`] once for every depth in
+/// [`PAVING_DEPTHS`], keep the result with the best [`gate_margin`], and — when
+/// that result is not clean (a triangle or a boundary doublet) — try the
+/// refinement cascade on each depth's *pre-walk* [`ComponentState`]. The
+/// fallback is the important measured detail: on the 0.6 mm performance part
+/// the ordinary residual walk leaves a boundary doublet, and only the
+/// pre-walk state closes to 20 586 all-quad elements (+33 % over the 15 500
+/// quads + 2 triangles of the non-fallback output). All seven corpus parts are
+/// all-quad and pass the gate after the common post-pass.
+///
+/// Errors: a non-positive/non-finite size, a domain without area, an outer loop
+/// with fewer than three points, or a field build failure. A domain that
+/// produces no quads at any depth is also an error. The function never returns
+/// a partial mesh; the chosen mesh is validated by the caller's gate.
 pub fn mesh_with_options(
     domain: &Domain,
     sizing: &Sizing,
@@ -387,10 +529,15 @@ pub fn mesh_with_options(
     // which the post-pass cannot move away), the refinement cascade is run on
     // the clean component output instead.
     let mut states: Vec<ComponentState> = Vec::with_capacity(PAVING_DEPTHS.len());
+    // `(score, cell count, mesh)`: score decides, the cell count only breaks an
+    // exact tie (the smaller mesh wins), so the choice is deterministic.
     let mut best: Option<(f64, usize, Mesh)> = None;
     for &depth in &PAVING_DEPTHS {
         let (mesh, state) = generate(domain, sizing, &field, depth)?;
         let score = gate_margin(&mesh);
+        // A `1e-9` band treats two runs with the same quality as a tie; without
+        // it, floating-point noise could make the depth choice depend on the
+        // order of the fixed array.
         let better = match &best {
             None => true,
             Some((best_score, best_quads, _)) => {
@@ -406,6 +553,8 @@ pub fn mesh_with_options(
     let Some((_, _, full_mesh)) = best else {
         return Err("the route produced no mesh".into());
     };
+    // A clean walk result is returned as is; the fallback below is only for the
+    // pathological boundary-doublet case described in the module docs.
     if closure_is_clean(&full_mesh) {
         return Ok(full_mesh);
     }
@@ -423,9 +572,14 @@ pub fn mesh_with_options(
             mut tris,
         } = state;
         if tris.is_empty() {
+            // A pre-walk state with no residual triangle needs no cascade; it
+            // is the cleaning step itself that can introduce a doublet, so
+            // there is nothing to repair here.
             continue;
         }
         if close_residuals(&mut points, &mut quads, &mut tris).is_err() || !tris.is_empty() {
+            // The cascade is atomic: on error the state is unchanged, and
+            // `tris` is still non-empty, so this candidate is simply skipped.
             continue;
         }
         let cells: Vec<Cell> = quads.into_iter().map(Cell::quad4).collect();
@@ -434,6 +588,10 @@ pub fn mesh_with_options(
             continue;
         }
         let gate = crate::verify::gate(&mesh);
+        // The fallback must itself be an acceptable all-quad base: the common
+        // post-pass can smooth a low quad, but it cannot remove a triangle,
+        // repair a crack or move a boundary-flat corner. A cascade result that
+        // fails here is discarded even if it is better than the others.
         if gate.triangles > 0
             || gate.inverted > 0
             || gate.overlapping > 0
@@ -478,6 +636,11 @@ fn closure_is_clean(mesh: &Mesh) -> bool {
 /// the node belong to one quad, so its Jacobian at that corner is zero and the
 /// node can only be moved along the straight boundary segment, which cannot
 /// change the angle. The common post-pass cannot repair one.
+///
+/// `179.5` rather than `180.0` is a numerical guard: the computed angle of a
+/// truly collinear corner is rarely exactly 180. Only quads are inspected; a
+/// residual triangle is already a gate failure and is caught by
+/// [`closure_is_clean`].
 fn boundary_flat_corners(mesh: &Mesh) -> usize {
     let mut use_count: HashMap<(usize, usize), usize> = HashMap::new();
     for cell in &mesh.cells {
@@ -487,6 +650,8 @@ fn boundary_flat_corners(mesh: &Mesh) -> usize {
             *use_count.entry((a.min(b), a.max(b))).or_default() += 1;
         }
     }
+    // A mesh boundary is the set of edges used by exactly one cell; a node is a
+    // boundary node when it is an endpoint of one of them.
     let mut boundary = vec![false; mesh.points.len()];
     for ((a, b), n) in use_count {
         if n == 1 {
@@ -518,6 +683,13 @@ fn boundary_flat_corners(mesh: &Mesh) -> usize {
 /// all-quad and sound, and a negative value (ordered by triangle count, then by
 /// boundary doublets) when it is not. Used only to choose among the fixed paving
 /// depths and fallback candidates.
+///
+/// For a sound all-quad mesh the score is
+/// `min(min_sj / 0.2, min_angle / 30)`, so `>= 1` means the mesh is at or above
+/// both gate floors and the larger value is the larger margin. A failing mesh
+/// gets `-1 - ...` (triangles/inverted/overlap/cracks) or `-2 - ...`
+/// (boundary doublets), which orders every failure below every success and
+/// keeps the failure classes distinct.
 fn gate_margin(mesh: &Mesh) -> f64 {
     let gate = crate::verify::gate(mesh);
     if gate.triangles > 0 || gate.inverted > 0 || gate.overlapping > 0 || gate.cracks > 0 {
@@ -533,13 +705,30 @@ fn gate_margin(mesh: &Mesh) -> f64 {
 /// The mesh after the unmeshed components have been closed, but before the
 /// leftover-triangle walk and the quality repairs. The cascade fallback starts
 /// from this state because the walk is what creates boundary doublets.
+///
+/// This is a *copy* of the geometry at that point; [`generate`] keeps editing
+/// its own arrays afterwards, so the state is a clean snapshot, not a view.
 struct ComponentState {
+    /// Node coordinates (millimetres), including the paving and the closure
+    /// points; the cascade may append midpoints.
     points: Vec<Node>,
+
+    /// All-quad part of the component mesh, counter-clockwise.
     quads: Vec<[usize; 4]>,
+
+    /// Residual triangles the component conversion could not pair. Empty when
+    /// the pre-walk mesh is already all-quad.
     tris: Vec<[usize; 3]>,
 }
 
 /// Build the mesh for one paving depth, together with the pre-walk state.
+///
+/// Steps: sample and advance the front to `depth`; group the remaining front
+/// loops into components and close each with [`close_component`]; snapshot that
+/// mesh as [`ComponentState`]; then run the ordinary residual walk, the
+/// refinement cascade on any leftovers, and the three quality repairs. The
+/// returned `Mesh` is the final (post-clean-up) mesh, while the state is the
+/// clean pre-walk base used by the fallback in [`mesh_with_options`].
 fn generate(
     domain: &Domain,
     sizing: &Sizing,
@@ -564,6 +753,9 @@ fn generate(
         return Err("the route produced no quads".into());
     }
     let state = ComponentState {
+        // Clone, not move: the walk below edits the live arrays, and the
+        // fallback must still see the clean pre-walk geometry. This is the
+        // price of the fallback (one copy of the component mesh per depth).
         points: points.clone(),
         quads: quads.clone(),
         tris: tris.clone(),
@@ -572,7 +764,9 @@ fn generate(
     // The leftover triangle walk of the ordinary Q-Morph conversion, the
     // cavity quadrangulation and the matching alternate: each can change the
     // neighbourhood that blocked the previous one. The loop stops as soon as a
-    // full round makes no progress, so it cannot cycle.
+    // full round makes no progress, so it cannot cycle. `before` is the
+    // progress test; a round that does not reduce the residual count is the
+    // last one.
     for _ in 0..4 {
         if tris.is_empty() {
             break;
@@ -642,20 +836,57 @@ fn generate(
 
 /// A punctured planar mesh whose unmeshed region is bounded by the directed
 /// front edges. Every front edge has the unmeshed region on its left.
+///
+/// Invariants: `next` and `prev` are inverse permutations on the active front
+/// (`prev[next[u]] == u`, `next[prev[v]] == v`) and describe one or more closed
+/// cycles; `edge_set` contains every edge of the meshed part, including the
+/// front edges; `quads` tile the meshed part exactly. `next`, `prev`, `edges`
+/// and `nodes` are acceleration structures and must be kept consistent by every
+/// mutation ([`Paving::add_front`], [`Paving::remove_front`],
+/// [`Paving::add_mesh_edge`], [`Paving::push_node`]).
 struct Paving {
+    /// Node coordinates (millimetres); `points[id]` is node `id`.
     points: Vec<Node>,
+
+    /// Quads produced so far, counter-clockwise. The front is the boundary of
+    /// the region not covered by these quads.
     quads: Vec<[usize; 4]>,
+
+    /// Front successor: `next[a] = b` means the directed front edge `a -> b`
+    /// exists and has the unmeshed region on its left. Missing for a node with
+    /// no outgoing front edge.
     next: HashMap<usize, usize>,
+
+    /// Front predecessor, the inverse of `next`: `prev[b] = a`.
     prev: HashMap<usize, usize>,
+
+    /// Uniform grid of the meshed edges, for segment-crossing queries.
     edges: EdgeIndex,
+
+    /// The set of meshed edges (front included), used to reject a duplicate
+    /// insertion and, through the index, to test crossings.
     edge_set: HashSet<(usize, usize)>,
+
+    /// Uniform grid of the mesh nodes, for "too close" queries.
     nodes: NodeIndex,
+
+    /// Target element size, in millimetres; it sets the node-clearance and
+    /// node-reuse tolerances and is copied from [`Sizing::size`].
     size: f64,
 }
 
 impl Paving {
     /// Sample the domain boundary into a front. Every loop is made even (an
     /// all-quad mesh needs an even number of edges on each mesh boundary loop).
+    ///
+    /// Each input segment is split into `ceil(length / (1.05 * size))` pieces,
+    /// so the front starts at (slightly finer than) the requested size. The
+    /// orientation is normalized: the outer loop counter-clockwise and holes
+    /// clockwise, which puts the meshed side on the right of every directed
+    /// front edge. An odd loop is made even by splitting its longest edge at
+    /// the midpoint (the least disruptive choice; deterministic because ties
+    /// resolve to the last edge in scan order). Errors: a non-positive size, or
+    /// fewer than three front nodes after sampling.
     fn from_boundary(domain: &Domain, size: f64) -> Result<Self, String> {
         if size <= 0.0 || !size.is_finite() {
             return Err("the element size must be positive and finite".into());
@@ -729,6 +960,8 @@ impl Paving {
         Ok(paving)
     }
 
+    /// Append a node at `p` and index it for the proximity query; returns its
+    /// new id (which is always `points.len() - 1`).
     fn push_node(&mut self, p: [f64; 2]) -> usize {
         let id = self.points.len();
         self.points.push([p[0], p[1], 0.0]);
@@ -736,6 +969,11 @@ impl Paving {
         id
     }
 
+    /// Mark `u -> v` as a front edge, maintaining the predecessor map.
+    ///
+    /// A duplicate `u` is a programming error in the update logic (a node has
+    /// one successor in a valid front); the maps are simply overwritten with
+    /// the new pair, which keeps `prev` consistent with `next`.
     fn add_front(&mut self, u: usize, v: usize) {
         if self.next.insert(u, v).is_none() {
             self.prev.insert(v, u);
@@ -747,6 +985,9 @@ impl Paving {
         }
     }
 
+    /// Remove the front edge `u -> v` when it is still the current successor of
+    /// `u`; returns whether it was removed. A stale request is a no-op, which
+    /// lets [`Paving::advance`] iterate over a snapshot safely.
     fn remove_front(&mut self, u: usize, v: usize) -> bool {
         if self.next.get(&u) == Some(&v) {
             self.next.remove(&u);
@@ -757,6 +998,10 @@ impl Paving {
         }
     }
 
+    /// Record `u - v` as a meshed edge and add it to the crossing index.
+    ///
+    /// Insertion is idempotent: an edge already in `edge_set` is not indexed
+    /// twice, so a quad that reuses a row edge does not corrupt the query.
     fn add_mesh_edge(&mut self, u: usize, v: usize) {
         let key = (u.min(v), u.max(v));
         if self.edge_set.insert(key) {
@@ -766,6 +1011,14 @@ impl Paving {
 
     /// Advance the front until a whole pass makes no progress or `depth` passes
     /// have run (`usize::MAX` means "until no progress", capped for safety).
+    ///
+    /// A pass takes a snapshot of the directed front edges, sorts it (for
+    /// determinism) and calls [`Paving::try_edge`] on each edge that is still
+    /// current. The per-pass traversal order is therefore fixed, but a
+    /// successful placement changes the front for the next edges in the same
+    /// pass, which is what makes rows grow. The hard caps (`600` passes,
+    /// `250_000` quads) are runaway guards, not tuning: a legal front stops on
+    /// its own far below them.
     fn advance(&mut self, field: &CrossField, domain: &Domain, size: f64, depth: usize) {
         let max_quads = 250_000usize;
         let max_passes = depth.min(600);
@@ -791,6 +1044,12 @@ impl Paving {
     }
 
     /// Try to place one quad on the left of the front edge `a -> b`.
+    ///
+    /// The first attempt uses the cross-field branch nearest the inward normal
+    /// at each endpoint: this is what makes the quad row follow the field. The
+    /// second attempt uses the normal itself, which keeps the front advancing
+    /// through a singularity or a sharp turn where the field offers no good
+    /// branch. Returns `true` when a quad was committed.
     fn try_edge(
         &mut self,
         a: usize,
@@ -822,6 +1081,16 @@ impl Paving {
         self.attempt_quad(a, b, normal, normal, domain, size)
     }
 
+    /// Try to commit the quad `a, b, d, c` with the requested side directions.
+    ///
+    /// The two side nodes are either reused from the neighbouring front edges
+    /// (within `0.35 * size`, which is what continues a row) or created at the
+    /// ideal positions `a + size * da`, `b + size * db`. Every new node and
+    /// edge is validated before the commit; on any failure the function returns
+    /// `false` and the paving state is unchanged (no node, edge, quad or front
+    /// entry has been written). On success it commits the nodes, the four quad
+    /// edges, the quad, and the front update: the base edge and the reused side
+    /// edges are consumed, the new interface edges are added.
     fn attempt_quad(
         &mut self,
         a: usize,
@@ -836,6 +1105,9 @@ impl Paving {
         };
         let pa2 = [pa[0], pa[1]];
         let pb2 = [pb[0], pb[1]];
+        // The ideal side nodes: one element size along the requested cross
+        // directions. They are only candidates; the checks below decide whether
+        // they can be committed.
         let ideal_c = [pa2[0] + size * da[0], pa2[1] + size * da[1]];
         let ideal_d = [pb2[0] + size * db[0], pb2[1] + size * db[1]];
 
@@ -863,6 +1135,9 @@ impl Paving {
 
         let c_is_new = c_reuse.is_none();
         let d_is_new = d_reuse.is_none();
+        // Reserve the ids the nodes will get when pushed: c first, then d. The
+        // later `push_node` calls must return exactly these ids; the checks
+        // guard that assumption.
         let c = c_reuse.unwrap_or(self.points.len());
         let d = if d_is_new {
             self.points.len() + usize::from(c_is_new)
@@ -909,7 +1184,9 @@ impl Paving {
             return false;
         }
 
-        // Commit the new geometry.
+        // Commit the new geometry. Everything above this line is read-only, so
+        // a refusal leaves the paving exactly as it was and the front can try
+        // the next edge.
         if c_is_new {
             let id = self.push_node(ideal_c);
             if id != c {
@@ -947,6 +1224,8 @@ impl Paving {
         true
     }
 
+    /// The XY coordinates of node `id`; `[0, 0]` for an out-of-range id (the
+    /// callers guard ids, so a sentinel is safer than a panic).
     fn point(&self, id: usize) -> [f64; 2] {
         self.points
             .get(id)
@@ -954,6 +1233,12 @@ impl Paving {
             .unwrap_or([0.0, 0.0])
     }
 
+    /// Whether a new node at `p` is legal: finite, inside the domain and at
+    /// least `0.45 * size` away from every existing node.
+    ///
+    /// The clearance is below the element size (a full-size spacing would reject
+    /// every slightly irregular row) but large enough to prevent two paving
+    /// fronts from collapsing onto each other. It is a tuning choice.
     fn node_ok(&self, domain: &Domain, p: [f64; 2]) -> bool {
         if !p[0].is_finite() || !p[1].is_finite() || !domain.contains(p) {
             return false;
@@ -963,6 +1248,14 @@ impl Paving {
 
     /// Convex, inside, no existing node strictly inside, no new edge crossing
     /// the mesh or the domain boundary.
+    ///
+    /// `p` is the candidate quad in order, `corners` its node ids (used to
+    /// exempt the corners from the "node inside" test), and `new_edges` the
+    /// directed edges that do not exist yet, as `(a, b, u, v)` with `u`/`v`
+    /// their endpoint ids (used to skip self-intersection at the shared
+    /// endpoints). The convexity check uses a 20° minimum corner, which is
+    /// stricter than the gate and is a paving tuning choice: a quad with a
+    /// sharper corner is better left to the residual closure than committed.
     fn quad_ok(
         &self,
         domain: &Domain,
@@ -1002,6 +1295,14 @@ impl Paving {
         true
     }
 
+    /// Whether the segment `a - b` crosses any indexed mesh edge other than
+    /// the edge itself (identified by its endpoint ids `u`, `v`).
+    ///
+    /// The uniform grid narrows the candidate set; the exact orientation tests
+    /// of [`segments_cross`] decide, including touching/collinear overlaps. The
+    /// domain boundary is in the index (it was added as mesh edges when the
+    /// front was built), so the same query also rejects a quad that would cross
+    /// the boundary.
     fn edge_crosses(&self, a: [f64; 2], b: [f64; 2], u: usize, v: usize) -> bool {
         for (c, d) in self.edges.candidates(&self.points, a, b) {
             if c == u || c == v || d == u || d == v {
@@ -1017,6 +1318,14 @@ impl Paving {
     }
 
     /// Extract the directed front loops after paving.
+    ///
+    /// Every active front edge belongs to exactly one closed cycle. The method
+    /// walks from each unvisited node (starts sorted, for determinism) until it
+    /// returns to the start; a walk that hits a missing successor or a node
+    /// already seen without closing is not a loop and is discarded. The
+    /// returned loops have `unmeshed region on the left`, which the component
+    /// grouping then uses to tell outer loops from holes. A loop shorter than
+    /// three nodes is not a usable polygon and is dropped.
     fn front_loops(&self) -> Vec<Vec<usize>> {
         let mut visited: HashSet<usize> = HashSet::new();
         let mut starts: Vec<usize> = self.next.keys().copied().collect();
@@ -1058,13 +1367,28 @@ impl Paving {
 
 /// An unmeshed component: one positive-area loop and the negative-area loops
 /// nested directly in it.
+///
+/// The node ids are indices into the paving's `points`; the loops are in front
+/// order, so the component's interior is on the left of the outer loop and on
+/// the right of each hole. A component is closed as one domain (the
+/// triangulation sees it as a polygon with holes), which is what keeps the
+/// interface with the paving conforming.
 struct ResidualComponent {
+    /// Outer boundary loop of the unmeshed region, positive signed area.
     outer: Vec<usize>,
+
+    /// Hole loops nested directly in `outer`, each with negative signed area.
+    /// Empty for a simply connected residual.
     holes: Vec<Vec<usize>>,
 }
 
 /// Group the front loops by nesting. A positive signed area is an outer loop of
 /// the unmeshed region (the region is on its left), a negative one is a hole.
+///
+/// Holes are assigned to the smallest containing outer loop (smallest area),
+/// which is the direct parent in the nesting tree. Node ids are preserved; this
+/// function only clones the loop vectors and does not touch the mesh. A loop
+/// with area within `1e-12` of zero is ignored as degenerate.
 fn group_residual_loops(points: &[Node], loops: &[Vec<usize>]) -> Vec<ResidualComponent> {
     let mut outers: Vec<(usize, f64)> = Vec::new();
     let mut holes: Vec<(usize, Vec<usize>)> = Vec::new();
@@ -1111,6 +1435,20 @@ fn group_residual_loops(points: &[Node], loops: &[Vec<usize>]) -> Vec<ResidualCo
 
 /// Triangulate one unmeshed component and convert it with the two-stage
 /// Q-Morph + matching route; return its quads and unpaired triangles.
+///
+/// The component's loops use the paving's node ids, so the front boundary is
+/// shared exactly and the closure is conforming. The triangulation is compacted
+/// to local ids first (`sub_points`), and the result is mapped back afterwards:
+/// existing local nodes recover their global id through `global_of`, any point
+/// the two-stage conversion inserted is appended to the caller's `points`.
+///
+/// Matching is tried first because the residual triangulation already has
+/// interior points at the size field; the Q-Morph two-stage conversion is the
+/// fallback when matching leaves triangles, and the result with fewer triangles
+/// wins. On a malformed component (a missing point, a degenerate domain, a
+/// failed triangulation) the function returns two empty vectors; the caller
+/// treats that as "nothing to add", which is safe only because a valid front
+/// should never hit those branches.
 fn close_component(
     points: &mut Vec<Node>,
     component: &ResidualComponent,
@@ -1188,8 +1526,12 @@ fn close_component(
     let mut remap: Vec<usize> = Vec::with_capacity(best_points.len());
     for (i, p) in best_points.iter().enumerate() {
         if let Some(&global) = global_of.get(i) {
+            // A point that came from the front keeps its global id, which is
+            // what makes the interface with the paving share the exact nodes.
             remap.push(global);
         } else {
+            // A point the two-stage conversion inserted: append it to the
+            // caller's point array and remember its new global id.
             points.push(*p);
             remap.push(points.len() - 1);
         }
@@ -1219,6 +1561,14 @@ fn close_component(
 /// Constrained Delaunay triangulation of a residual component. The boundary
 /// nodes are the front nodes (so the closure is conforming with the paving);
 /// interior points at the size field keep the triangles well sized.
+///
+/// A grid of candidate interior points at the element size is inserted with a
+/// `0.55 * size` clearance from the boundary, so the triangulation does not
+/// crowd the interface. Only faces whose centroid is inside the component
+/// domain are kept; this is what removes the convex-hull faces that `spade`
+/// creates outside a non-convex component. Returns `None` when the component
+/// cannot be constrained (a malformed front) or produces no face; the caller
+/// then skips the component.
 fn triangulate_component(
     points: &mut Vec<Node>,
     component: &ResidualComponent,
@@ -1235,6 +1585,9 @@ fn triangulate_component(
         let p = points.get(global)?;
         let point = Point2::new(p[0], p[1]);
         let key = (p[0].to_bits(), p[1].to_bits());
+        // Two front loops can share a node at a pinch; spade rejects a duplicate
+        // position, so the bit key keeps only the first occurrence and the
+        // second loop reuses the same vertex through `lookup`.
         if lookup.contains_key(&key) {
             continue;
         }
@@ -1271,7 +1624,10 @@ fn triangulate_component(
         }
     }
 
-    // Interior points, kept clear of the interface with the paving.
+    // Interior points, kept clear of the interface with the paving. The grid is
+    // offset by half a step so no candidate lies exactly on a cell boundary,
+    // and the 0.55*size margin is larger than the clearance the paving uses, so
+    // a closure point cannot end up on top of a front node.
     let (xmin, xmax, ymin, ymax) = bounds_of_domain(domain);
     let step = size.max(1.0e-9);
     let margin = 0.55 * step;
@@ -1303,6 +1659,8 @@ fn triangulate_component(
             let q = vertex.position();
             p[k] = [q.x, q.y];
             let key = (q.x.to_bits(), q.y.to_bits());
+            // Every vertex should be one of the points inserted above; an
+            // unknown one would mean spade moved a point, which it does not.
             match lookup.get(&key) {
                 Some(&global) => ids[k] = global,
                 None => {
@@ -1318,6 +1676,10 @@ fn triangulate_component(
             (p[0][0] + p[1][0] + p[2][0]) / 3.0,
             (p[0][1] + p[1][1] + p[2][1]) / 3.0,
         ];
+        // The CDT fills the convex hull; a face between two separate loop arms
+        // (or across a hole) has a centroid outside the component and is
+        // dropped. This is the step that makes a non-convex component close
+        // without spurious faces.
         if domain.contains(centroid) {
             tris.push(ids);
         }
@@ -1356,17 +1718,29 @@ fn triangulate_component(
 // caller keeps the mixed mesh it had.
 
 /// Statistics of one refinement-cascade closure.
+///
+/// The counters are cumulative over the cascade and are diagnostic: a healthy
+/// run has `low_children == 0` and `relaxed_triangles == 0`, and a nonzero
+/// `quads_split` is expected whenever the triangle fan propagates.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CascadeStats {
-    /// Residual triangles replaced by quads.
+    /// Residual triangles replaced by quads (each becomes three quads).
     pub triangles_closed: usize,
-    /// Quads split by the cascade.
+
+    /// Quads split by the cascade (each parent is replaced by two to four
+    /// children, depending on how many of its edges hang).
     pub quads_split: usize,
-    /// Quads added to the mesh (the children minus the parent).
+
+    /// Quads added to the mesh, summed over the whole cascade (the fan
+    /// children minus the parent for a split, or the three children for a
+    /// closed triangle). This is a delta on the mesh, not the final count.
     pub quads_added: usize,
-    /// Triangles whose fan could only be built with the relaxed floor (SJ 0.05,
-    /// 1°). Normally zero.
+
+    /// Triangles whose fan could only be built with the relaxed floor
+    /// (scaled Jacobian 0.05, 1°). Normally zero; it records a real quality
+    /// compromise, which the common post-pass then has to repair.
     pub relaxed_triangles: usize,
+
     /// New quads whose scaled Jacobian is below the gate's 0.2 (only possible
     /// when the parent quad was already below it, which the common post-pass
     /// then has to repair).
@@ -1376,29 +1750,69 @@ pub struct CascadeStats {
 /// Hard cap on cascade steps; a runaway cascade is a bug, not a slow input.
 const CASCADE_OPERATIONS: usize = 200_000;
 
+/// Canonical undirected edge key: the two vertex ids in ascending order.
+///
+/// Every edge map in the cascade is keyed this way, so the direction a quad
+/// happens to store does not affect lookup.
 fn edge_key(a: usize, b: usize) -> (usize, usize) {
     (a.min(b), a.max(b))
 }
 
+/// Exact coordinate key of a point: the two `f64` bit patterns.
+///
+/// A midpoint is always the same bit pattern when computed from the same
+/// endpoints, so this is a safe identity for "the midpoint already exists".
+/// It is not a geometric tolerance; two points that are merely close are
+/// distinct nodes.
 fn point_key(p: [f64; 2]) -> (u64, u64) {
     (p[0].to_bits(), p[1].to_bits())
 }
 
 /// One refinement-cascade closure. It owns the work lists but borrows the mesh
 /// arrays, so the caller can roll the arrays back if `run` returns an error.
+///
+/// Invariants: `ids` maps a coordinate to the *first* node with that coordinate,
+/// `owners` maps a mesh edge to the quads that use it, and every node that a
+/// child polygon refers to is in `points`. `hanging` records the midpoints
+/// created on edges; a midpoint that exists is never created twice.
 struct Cascade<'a> {
+    /// Node coordinates (millimetres); new midpoints and centroids are appended.
     points: &'a mut Vec<Node>,
+
+    /// Quad cells; a split replaces the parent in place and appends the other
+    /// children. Existing ids remain valid.
     quads: &'a mut Vec<[usize; 4]>,
+
+    /// Residual triangles; a closed triangle is removed by `swap_remove`, so
+    /// only the *set* is stable, not the slot order.
     tris: &'a mut Vec<[usize; 3]>,
+
+    /// Coordinate -> first node id, for "reuse a point at the same place".
     ids: HashMap<(u64, u64), usize>,
+
+    /// Edge -> the midpoint node created on it. This is the hanging-node map
+    /// that drives the cascade.
     hanging: HashMap<(usize, usize), usize>,
+
+    /// Edge -> quads that use it, kept current through split/remove.
     owners: HashMap<(usize, usize), Vec<usize>>,
+
+    /// Pending `(edge, midpoint)` work: each entry asks "split the cell that
+    /// owns this edge, because its midpoint is hanging".
     queue: Vec<((usize, usize), usize)>,
+
+    /// Counters for the public [`CascadeStats`].
     stats: CascadeStats,
+
+    /// Number of queue steps processed, checked against
+    /// [`CASCADE_OPERATIONS`]; a runaway cascade is a bug, not a slow input.
     operations: usize,
 }
 
 impl<'a> Cascade<'a> {
+    /// Build a cascade over the given arrays, indexing the existing points and
+    /// quad edges. No mesh mutation happens here; the first mutation is in
+    /// [`Cascade::run`].
     fn new(
         points: &'a mut Vec<Node>,
         quads: &'a mut Vec<[usize; 4]>,
@@ -1431,6 +1845,10 @@ impl<'a> Cascade<'a> {
     }
 
     /// Return the id of the point at `p`, appending it when it is new.
+    ///
+    /// Identity is the exact bit pattern (see [`point_key`]); this is how a
+    /// cascade that reaches a midpoint created by an earlier cascade reuses the
+    /// same node instead of creating a duplicate.
     fn point(&mut self, p: [f64; 2]) -> usize {
         let key = point_key(p);
         if let Some(&id) = self.ids.get(&key) {
@@ -1442,6 +1860,11 @@ impl<'a> Cascade<'a> {
         id
     }
 
+    /// The midpoint of the edge `a - b`, created if necessary.
+    ///
+    /// Returns `usize::MAX` when either endpoint is missing; that sentinel makes
+    /// every downstream quality check fail, so a corrupt index can never produce
+    /// a mesh silently.
     fn midpoint(&mut self, a: usize, b: usize) -> usize {
         let (Some(pa), Some(pb)) = (self.points.get(a), self.points.get(b)) else {
             // A missing node is a programming error, not a user error: return
@@ -1451,6 +1874,8 @@ impl<'a> Cascade<'a> {
         self.point([0.5 * (pa[0] + pb[0]), 0.5 * (pa[1] + pb[1])])
     }
 
+    /// The centroid of the quad `v`, created if necessary. Missing nodes are
+    /// skipped rather than read out of range, so the sentinel path stays safe.
     fn centroid(&mut self, v: [usize; 4]) -> usize {
         let mut x = 0.0;
         let mut y = 0.0;
@@ -1463,6 +1888,9 @@ impl<'a> Cascade<'a> {
         self.point([0.25 * x, 0.25 * y])
     }
 
+    /// `(minimum scaled Jacobian, minimum corner angle in degrees)` of a quad.
+    /// The two values are exactly the gate quantities, so the cascade's floors
+    /// are expressed on the same scale as [`crate::verify::gate`].
     fn quad_quality(&self, q: [usize; 4]) -> (f64, f64) {
         let cell = Cell::quad4(q);
         let sj = quality::scaled_jacobian(&cell, self.points)
@@ -1474,6 +1902,13 @@ impl<'a> Cascade<'a> {
     }
 
     /// Convex, finite, and above both quality floors.
+    ///
+    /// `sj_floor` is a minimum scaled Jacobian and `angle_floor` a minimum
+    /// corner angle in degrees. The angle floor is compared with a `2°`
+    /// tolerance because a split that keeps a 30° corner at 29.999999° is the
+    /// same geometry, and the common post-pass smooths it; the Jacobian floor
+    /// uses a `1e-6` tolerance for the same reason. `angle < 180` rejects a
+    /// folded corner even if the sine-based convexity test passed.
     fn quad_is_acceptable(&self, q: [usize; 4], sj_floor: f64, angle_floor: f64) -> bool {
         let (Some(p0), Some(p1), Some(p2), Some(p3)) = (
             self.points.get(q[0]),
@@ -1516,6 +1951,13 @@ impl<'a> Cascade<'a> {
         (sj_floor - 1.0e-9, angle_floor - 1.0e-9)
     }
 
+    /// Whether the three-quad fan around a triangle can be accepted.
+    ///
+    /// Two attempts: the strict gate floor (0.2, 30°) and the relaxed closure
+    /// floor (0.05, 1°). The relaxed floor exists so one marginal fan cannot
+    /// abort a closure that is otherwise valid; a fan that only passes the
+    /// relaxed test is counted in `relaxed_triangles`. A fan that passes
+    /// neither is refused.
     fn triangle_quads_ok(&self, quads: &[[usize; 4]; 3]) -> bool {
         let strict = (0.2 - 1.0e-9, 30.0 - 1.0e-9);
         let relaxed = (0.05, 1.0);
@@ -1524,6 +1966,9 @@ impl<'a> Cascade<'a> {
             .any(|(sj, angle)| quads.iter().all(|&q| self.quad_is_acceptable(q, sj, angle)))
     }
 
+    /// Index the four edges of quad `qid` under their current owner.
+    /// Idempotence is the caller's job: this function must not be called twice
+    /// for one insertion.
     fn add_quad_edges(&mut self, qid: usize) {
         let Some(q) = self.quads.get(qid).copied() else {
             return;
@@ -1536,6 +1981,9 @@ impl<'a> Cascade<'a> {
         }
     }
 
+    /// Remove `qid` from the owner list of each of its edges, dropping an
+    /// owner list that becomes empty. The edge key itself disappears from the
+    /// map in that case, which is what makes `find_quad` a real presence test.
     fn remove_quad_edges(&mut self, qid: usize) {
         let Some(q) = self.quads.get(qid).copied() else {
             return;
@@ -1554,6 +2002,10 @@ impl<'a> Cascade<'a> {
         }
     }
 
+    /// The id of a quad that uses the edge `a - b`, preferring the first in the
+    /// owner list. The extra scan of the quad's edges filters a stale owner
+    /// list (an edge can be shared by two quads, and the list may contain a
+    /// quad that no longer has it after a split).
     fn find_quad(&self, a: usize, b: usize) -> Option<usize> {
         for &qid in self.owners.get(&edge_key(a, b))? {
             let Some(q) = self.quads.get(qid) else {
@@ -1570,6 +2022,8 @@ impl<'a> Cascade<'a> {
         None
     }
 
+    /// The first triangle that uses the edge `a - b`, in either direction.
+    /// The cascade only needs one; the choice is deterministic (lowest index).
     fn find_tri(&self, a: usize, b: usize) -> Option<usize> {
         self.tris.iter().position(|t| {
             (0..3).any(|i| {
@@ -1581,6 +2035,14 @@ impl<'a> Cascade<'a> {
     }
 
     /// Replace triangular `index` by three quads around its centroid.
+    ///
+    /// The fan is `[t0, m01, c, m20]`, `[t1, m12, c, m01]`, `[t2, m20, c, m12]`
+    /// with `m..` the edge midpoints and `c` the centroid. Every midpoint is
+    /// recorded in `hanging` before the quad edges are indexed, and the three
+    /// original edges are pushed to the queue so the neighbouring quads are
+    /// split (the cascade). The operation is atomic: if the fan fails the
+    /// quality test, it returns `Err` before touching the arrays, and the
+    /// caller's `close_residuals` rolls the whole closure back.
     fn close_triangle(&mut self, index: usize) -> Result<(), String> {
         let Some(&t) = self.tris.get(index) else {
             return Err("triangle index out of range".to_string());
@@ -1590,6 +2052,8 @@ impl<'a> Cascade<'a> {
             let a = t[i];
             let b = t[(i + 1) % 3];
             let key = edge_key(a, b);
+            // Reuse a midpoint another cascade already created on this edge, so
+            // two cascades that meet share a node instead of duplicating it.
             mids[i] = match self.hanging.get(&key) {
                 Some(&m) => m,
                 None => {
@@ -1607,6 +2071,9 @@ impl<'a> Cascade<'a> {
             return Err("triangle node out of range".to_string());
         };
         let c = self.point([(p0[0] + p1[0] + p2[0]) / 3.0, (p0[1] + p1[1] + p2[1]) / 3.0]);
+        // One quad per triangle edge, all sharing the centroid. The order of
+        // each child follows the triangle's counter-clockwise order, so the fan
+        // is counter-clockwise too.
         let new_quads = [
             [t[0], mids[0], c, mids[2]],
             [t[1], mids[1], c, mids[0]],
@@ -1627,8 +2094,13 @@ impl<'a> Cascade<'a> {
             .iter()
             .all(|&q| self.quad_is_acceptable(q, 0.2 - 1.0e-9, 30.0 - 1.0e-9));
         if !strict {
+            // The fan only passed the relaxed (0.05, 1°) test; record it so the
+            // caller knows the closure traded quality for parity.
             self.stats.relaxed_triangles += 1;
         }
+        // Remove the triangle by swapping the last one into its slot: only the
+        // set of triangles is stable, not the slot order. The copy `t` above is
+        // what the fan uses.
         self.tris.swap_remove(index);
         for &q in &new_quads {
             let id = self.quads.len();
@@ -1640,6 +2112,8 @@ impl<'a> Cascade<'a> {
                 self.stats.low_children += 1;
             }
         }
+        // Every original triangle edge now carries a midpoint, so each
+        // neighbouring quad has a hanging edge and must be split too.
         for i in 0..3 {
             self.queue.push((edge_key(t[i], t[(i + 1) % 3]), mids[i]));
         }
@@ -1649,6 +2123,21 @@ impl<'a> Cascade<'a> {
 
     /// Split `qid` because one or more of its edges already carries a hanging
     /// midpoint. The template depends on how many edges hang.
+    ///
+    /// - 1 hanging edge: split from that midpoint to the midpoint of the
+    ///   opposite edge (which becomes hanging on the next quad, so it is pushed
+    ///   to the queue);
+    /// - 2 opposite: the classic two-quad split;
+    /// - 2 adjacent: fan the resulting hexagon into three quads around the
+    ///   centroid;
+    /// - 3: the boundary is a heptagon (odd), so the fourth edge is split too
+    ///   and the octagon is fanned into four quads;
+    /// - 4: the full four-quad fan around the centroid.
+    ///
+    /// All children are checked against [`Cascade::split_floors`], which is
+    /// `min(parent, gate)` on both quantities: a split never makes a quad worse
+    /// than its parent, and a parent already at the gate keeps the gate. The
+    /// operation is atomic: the `Err` paths run before any array is modified.
     fn split_quad(&mut self, qid: usize) -> Result<(), String> {
         let Some(&q) = self.quads.get(qid) else {
             return Err("quad index out of range".to_string());
@@ -1669,6 +2158,8 @@ impl<'a> Cascade<'a> {
         let mut children: Vec<[usize; 4]> = Vec::new();
         let at = |i: usize| q[i % 4];
 
+        // The number of hanging edges fixes the template; `children` is built
+        // first and validated as a group, so an invalid split changes nothing.
         match hung.len() {
             1 => {
                 let i = hung[0];
@@ -1778,6 +2269,17 @@ impl<'a> Cascade<'a> {
         Ok(())
     }
 
+    /// Drive the cascade to completion.
+    ///
+    /// The outer loop closes the next residual triangle (always index 0 after
+    /// the removals), then drains the queue: for each hanging edge it splits
+    /// the owning quad, or closes the owning triangle if the edge belongs to
+    /// one, until the edge is on the domain boundary (the cascade has reached
+    /// the stop) or has already been split. Each queue pop is counted; more than
+    /// [`CASCADE_OPERATIONS`] is a non-terminating cascade and an error, which
+    /// the public entry point rolls back. On success every `Err` path has
+    /// already been ruled out, so the mesh is triangle-free with no hanging
+    /// midpoint.
     fn run(&mut self) -> Result<(), String> {
         while !self.tris.is_empty() {
             self.close_triangle(0)?;
@@ -1833,6 +2335,12 @@ pub fn close_residuals(
 // Geometry and spatial indices
 // ---------------------------------------------------------------------------
 
+/// Bounding box of every loop of `domain`, in millimetres, as
+/// `(xmin, xmax, ymin, ymax)`.
+///
+/// Errors when a coordinate is not finite or the box has zero width/height: a
+/// field over a degenerate box cannot be interpolated, and an infinite box
+/// would make the grid size arithmetic meaningless.
 fn bounds(domain: &Domain) -> Result<(f64, f64, f64, f64), String> {
     let mut xmin = f64::INFINITY;
     let mut xmax = f64::NEG_INFINITY;
@@ -1856,10 +2364,15 @@ fn bounds(domain: &Domain) -> Result<(f64, f64, f64, f64), String> {
     Ok((xmin, xmax, ymin, ymax))
 }
 
+/// Infinitely/fallibly-safe bounding box: the unit square `(0, 1, 0, 1)` when
+/// [`bounds`] fails. Used only by the triangulation's interior-point grid,
+/// where a wrong box would waste points but cannot corrupt the mesh.
 fn bounds_of_domain(domain: &Domain) -> (f64, f64, f64, f64) {
     bounds(domain).unwrap_or((0.0, 1.0, 0.0, 1.0))
 }
 
+/// Unit tangent of the segment `a -> b`, or `(1, 0)` for a zero-length segment.
+/// The components are dimensionless direction cosines.
 fn tangent(a: [f64; 2], b: [f64; 2]) -> (f64, f64) {
     let dx = b[0] - a[0];
     let dy = b[1] - a[1];
@@ -1871,12 +2384,19 @@ fn tangent(a: [f64; 2], b: [f64; 2]) -> (f64, f64) {
     }
 }
 
+/// Euclidean distance between two XY points, in millimetres.
 fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
     let dx = a[0] - b[0];
     let dy = a[1] - b[1];
     (dx * dx + dy * dy).sqrt()
 }
 
+/// Signed area of the polygon `ids` (in order), in square millimetres.
+///
+/// Positive for a counter-clockwise loop and negative for a clockwise one,
+/// which is how [`group_residual_loops`] tells outer loops from holes. A
+/// missing node makes the result `0` rather than an out-of-range read, so a
+/// malformed loop is treated as degenerate and ignored.
 fn signed_area(points: &[Node], ids: &[usize]) -> f64 {
     let mut sum = 0.0;
     for i in 0..ids.len() {
@@ -1891,6 +2411,8 @@ fn signed_area(points: &[Node], ids: &[usize]) -> f64 {
     0.5 * sum
 }
 
+/// The 2D cross product `(b - a) x (c - a)`, in square millimetres when the
+/// inputs are points. Positive means `a, b, c` turn left; zero means collinear.
 fn cross2(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 }
@@ -1927,6 +2449,13 @@ fn convex_ccw(p: &[[f64; 2]; 4], min_angle: f64) -> bool {
     true
 }
 
+/// Strict point-in-convex-quad test: `q` is inside only when it is strictly to
+/// the left of all four counter-clockwise edges.
+///
+/// A point exactly on an edge or a corner returns `false` (the cross product is
+/// `<= 0`), which is deliberate: the paving uses this to reject a new quad that
+/// would put an existing node on its boundary, and a shared node on an edge is
+/// as bad as one inside for conformity.
 fn point_in_convex(p: &[[f64; 2]; 4], q: [f64; 2]) -> bool {
     for i in 0..4 {
         let a = p[i];
@@ -1938,6 +2467,13 @@ fn point_in_convex(p: &[[f64; 2]; 4], q: [f64; 2]) -> bool {
     true
 }
 
+/// Even-odd point-in-polygon test, for an arbitrary (possibly non-convex)
+/// polygon. Returns `false` for fewer than three points.
+///
+/// The horizontal ray to +x is counted. A point exactly on an edge is
+/// classified arbitrarily by the crossing count; the only caller samples the
+/// first vertex of a hole loop against an outer loop it does not touch, so this
+/// ambiguity is not exercised.
 fn point_in_polygon(p: [f64; 2], polygon: &[[f64; 2]]) -> bool {
     let mut inside = false;
     let n = polygon.len();
@@ -1957,6 +2493,12 @@ fn point_in_polygon(p: [f64; 2], polygon: &[[f64; 2]]) -> bool {
     inside
 }
 
+/// Whether the closed segments `a - b` and `c - d` intersect.
+///
+/// First the proper-crossing test (each segment strictly separates the other's
+/// endpoints, with a `1e-12` orientation epsilon), then the four collinear
+/// touching cases via [`on_segment`]. Touching counts as crossing, which is
+/// what the paving wants: a new edge may not even touch an existing one.
 fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
     let eps = 1.0e-12;
     let o1 = cross2(a, b, c);
@@ -1974,6 +2516,9 @@ fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
         || (o4.abs() <= eps && on_segment(c, d, b))
 }
 
+/// Whether `p`, already known to be collinear with `a - b`, lies within the
+/// segment's bounding box. The `1e-12` padding makes a point exactly on an
+/// endpoint count as on the segment.
 fn on_segment(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> bool {
     p[0] >= a[0].min(b[0]) - 1.0e-12
         && p[0] <= a[0].max(b[0]) + 1.0e-12
@@ -1982,12 +2527,21 @@ fn on_segment(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> bool {
 }
 
 /// Uniform grid over mesh edges, for segment-intersection queries.
+///
+/// An edge is stored in every cell its bounding box overlaps, so the grid is a
+/// conservative broad phase: a query returns a superset of the edges that could
+/// intersect, and [`segments_cross`] makes the exact decision.
 struct EdgeIndex {
+    /// Cell size, in millimetres (`> 0`; the constructor clamps it).
     bucket: f64,
+
+    /// Cell coordinates `(floor(x / bucket), floor(y / bucket))` -> the edges
+    /// whose bounding box overlaps that cell.
     map: HashMap<(i64, i64), Vec<(usize, usize)>>,
 }
 
 impl EdgeIndex {
+    /// An empty index with cell size `bucket` (clamped to at least `1e-9`).
     fn new(bucket: f64) -> Self {
         EdgeIndex {
             bucket: bucket.max(1.0e-9),
@@ -1995,6 +2549,7 @@ impl EdgeIndex {
         }
     }
 
+    /// The cell coordinate of a point.
     fn key(&self, p: [f64; 2]) -> (i64, i64) {
         (
             (p[0] / self.bucket).floor() as i64,
@@ -2002,6 +2557,13 @@ impl EdgeIndex {
         )
     }
 
+    /// Insert `edge` into every cell its endpoints' bounding box overlaps.
+    ///
+    /// A missing endpoint is ignored (the caller indexes only real mesh edges).
+    /// The `4096` span cap is a guard against a pathological long edge that
+    /// would otherwise fill a huge number of cells; such an edge is simply not
+    /// indexed, and a crossing query may miss it. The paving edges are one
+    /// element long, so the cap is never reached in practice.
     fn insert(&mut self, points: &[Node], edge: (usize, usize)) {
         let (Some(a), Some(b)) = (points.get(edge.0), points.get(edge.1)) else {
             return;
@@ -2018,6 +2580,9 @@ impl EdgeIndex {
         }
     }
 
+    /// All edges whose cells overlap the query segment's bounding box, sorted
+    /// and deduplicated. `points` is accepted for API symmetry with `insert`
+    /// and is not read.
     fn candidates(&self, points: &[Node], a: [f64; 2], b: [f64; 2]) -> Vec<(usize, usize)> {
         let (i0, j0) = self.key(a);
         let (i1, j1) = self.key(b);
@@ -2040,12 +2605,19 @@ impl EdgeIndex {
 }
 
 /// Uniform grid over mesh nodes, for "is a node too close" queries.
+///
+/// Like [`EdgeIndex`], this is a broad phase over cell buckets; the exact
+/// distance is squared in `too_close` to avoid a square root.
 struct NodeIndex {
+    /// Cell size, in millimetres (`> 0`; the constructor clamps it).
     bucket: f64,
+
+    /// Cell coordinate -> node ids that fall in that cell.
     map: HashMap<(i64, i64), Vec<usize>>,
 }
 
 impl NodeIndex {
+    /// An empty index with cell size `bucket` (clamped to at least `1e-9`).
     fn new(bucket: f64) -> Self {
         NodeIndex {
             bucket: bucket.max(1.0e-9),
@@ -2053,6 +2625,7 @@ impl NodeIndex {
         }
     }
 
+    /// The cell coordinate of a point.
     fn key(&self, p: [f64; 2]) -> (i64, i64) {
         (
             (p[0] / self.bucket).floor() as i64,
@@ -2060,12 +2633,20 @@ impl NodeIndex {
         )
     }
 
+    /// Index node `id` at `p`. `points` is accepted for API symmetry with
+    /// `too_close` and is not read.
     fn insert(&mut self, points: &[Node], id: usize, p: [f64; 2]) {
         let _ = points;
         let key = self.key(p);
         self.map.entry(key).or_default().push(id);
     }
 
+    /// Whether any indexed node is strictly closer than `radius` to `p`.
+    ///
+    /// The scan covers the cells within `ceil(radius / bucket) + 1` of `p`'s
+    /// cell; the `+1` covers a point near a cell corner. Strict `<` means a node
+    /// exactly at the clearance is allowed, which keeps the test stable when a
+    /// row is laid at exactly `0.45 * size`.
     fn too_close(&self, points: &[Node], p: [f64; 2], radius: f64) -> bool {
         let (i0, j0) = self.key(p);
         let span = (radius / self.bucket).ceil() as i64 + 1;
@@ -2089,6 +2670,10 @@ impl NodeIndex {
         false
     }
 
+    /// All node ids in the cells overlapped by the quad's bounding box, sorted
+    /// and deduplicated. Used by [`Paving::quad_ok`] as the candidate set for
+    /// the "no existing node inside the new quad" test; `points` is accepted for
+    /// API symmetry and is not read.
     fn in_box(&self, points: &[Node], p: &[[f64; 2]; 4]) -> Vec<usize> {
         let mut xmin = f64::INFINITY;
         let mut xmax = f64::NEG_INFINITY;
@@ -2137,6 +2722,9 @@ mod tests {
         d
     }
 
+    /// On a rectangle the field must be tangential at the boundary and
+    /// constant in the interior: the boundary tangents are (1, 0) on the
+    /// horizontal sides and (0, 1) on the vertical ones (same cross modulo 90°).
     #[test]
     fn field_is_boundary_aligned_on_a_square() {
         let domain = Domain::rectangle(10.0, 6.0).unwrap();
@@ -2164,6 +2752,9 @@ mod tests {
         assert!(angle_diff_mod_90(theta, 0.0) < 1.0e-6, "{theta}");
     }
 
+    /// A smooth curved boundary (a quarter annulus): neighbouring grid nodes
+    /// must not jump between crosses, and the field at mid-radius must contain
+    /// the tangential direction (45° at the sampled diagonal).
     #[test]
     fn field_is_smooth_inside() {
         // A quarter annulus: the boundary tangents vary smoothly, so the
@@ -2192,6 +2783,9 @@ mod tests {
         assert!(angle_diff_mod_90(theta, 45.0) < 10.0, "{theta}");
     }
 
+    /// A square is the all-quad contract: every cell must be a quad, the gate
+    /// must pass, the boundary must be exact and every corner's Jacobian must
+    /// be above the gate floor.
     #[test]
     fn mesh_of_a_square_is_all_quads() {
         let domain = Domain::rectangle(20.0, 20.0).unwrap();
@@ -2217,6 +2811,10 @@ mod tests {
         }
     }
 
+    /// A plate with a hole exercises the front-loop grouping (outer loop plus
+    /// hole), the component closure and the interface conformity: no crack, no
+    /// overlap, no inversion, boundary offset ~0, and every quad has a positive
+    /// Jacobian (the gate's 0.2 is checked in the measurements, not here).
     #[test]
     fn mesh_of_a_rectangle_with_a_hole_is_conforming() {
         let domain = Domain::plate_with_hole(40.0, 30.0, 5.0, 16).unwrap();
@@ -2235,6 +2833,8 @@ mod tests {
         }
     }
 
+    /// A convex pentagon checks that the paving and the residual closure work
+    /// on a non-axis-aligned domain, not only on rectangles.
     #[test]
     fn mesh_of_a_convex_pentagon_is_conforming() {
         let domain = Domain::new(
@@ -2252,6 +2852,9 @@ mod tests {
         assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
     }
 
+    /// `field_sweeps = 40` is a deliberately under-converged field; the route
+    /// must still return a conforming mesh (quality may be lower, but no crack,
+    /// inversion or overlap).
     #[test]
     fn mesh_with_non_default_options_is_a_valid_mesh() {
         let domain = Domain::rectangle(20.0, 20.0).unwrap();
@@ -2270,6 +2873,9 @@ mod tests {
         assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-9);
     }
 
+    /// The parity case the cascade exists for: a 3x3 grid with the last square
+    /// split into two triangles. The cascade must remove both triangles, add no
+    /// low child, keep the gate floor and leave no boundary-flat corner.
     #[test]
     fn cascade_closes_residual_triangles_and_keeps_the_mesh_conforming() {
         // A 3x3 grid of points with three quads and the fourth square split
@@ -2298,6 +2904,9 @@ mod tests {
         assert_eq!(boundary_flat_corners(&mesh), 0);
     }
 
+    /// The atomicity contract: a needle triangle cannot be fanned, so the
+    /// closure returns `Err` and must restore points, quads and triangles
+    /// exactly. This is the test that guards the fallback path's safety.
     #[test]
     fn cascade_rolls_back_a_hopeless_triangle() {
         // A needle with a 1 degree corner cannot be fanned into quads; the
@@ -2314,6 +2923,8 @@ mod tests {
         assert_eq!(tris, tris_before);
     }
 
+    /// No residual triangles means no work and zero stats; the cascade must not
+    /// touch a valid all-quad mesh.
     #[test]
     fn cascade_with_no_triangles_is_a_no_op() {
         let mut points = vec![
@@ -2328,6 +2939,8 @@ mod tests {
         assert_eq!(stats, CascadeStats::default());
     }
 
+    /// Bad requests (zero/negative size, a clockwise or empty domain) must be
+    /// errors, never panics; the route has no `unwrap` on user input.
     #[test]
     fn an_unusable_size_is_an_error_not_a_panic() {
         let domain = Domain::rectangle(10.0, 10.0).unwrap();
