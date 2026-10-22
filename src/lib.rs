@@ -41,3 +41,9 @@ pub use msh::{to_msh, write_msh};
 pub use quad::{mesh_quads, QuadError, QuadMesh};
 pub use quality::{report, report_with, Report, Thresholds, Verdict};
 pub use two_d::{mesh_2d, Domain, Sizing, TwoDResult, TwoDStats};
+
+pub mod alt_paving;
+
+pub mod alt_hybrid;
+
+pub mod alt_untangle;
