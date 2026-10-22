@@ -696,26 +696,60 @@ impl CellMesh {
 
     /// Insert a node at `p`, or as close to it as the reachable region allows.
     fn insert_near(&mut self, seed: usize, p: [f64; 2]) -> Option<usize> {
+        // Do not split a triangle with a point this close to an existing node:
+        // the split would create an edge of a few percent of the local size, and
+        // a quad built on that edge has a corner near zero (measured 0.004 x
+        // size on the perf part, and the resulting 0.02 quad then fails the gate
+        // for good). Insertion is a response to a size mismatch, not a licence to
+        // make a degenerate edge.
+        let floor = MIN_INSERT_SPACING * self.bucket;
+        // Neither the seed front triangle nor the triangle that actually gets
+        // split may have a node this close to the new point.
+        if !self.point_clear(p, &[seed], floor) {
+            return None;
+        }
         let region = self.live_region(seed, p, 3.0 * self.bucket);
         for &id in &region {
-            let Some(Some(Cell::Tri(t))) = self.cells.get(id) else {
+            let Some(Some(Cell::Tri(t))) = self.cells.get(id).copied() else {
                 continue;
             };
-            let tri = *t;
-            if point_strictly_inside(&self.points, tri, p) {
-                return Some(self.split_triangle(id, tri, p));
+            if point_strictly_inside(&self.points, t, p) {
+                // Check the triangle that will actually be split, not the seed:
+                // its three nodes are the ones the new point gets edges to.
+                if !self.point_clear(p, &[id], floor) {
+                    return None;
+                }
+                return Some(self.split_triangle(id, t, p));
             }
         }
         for id in 0..self.cells.len() {
-            let Some(Some(Cell::Tri(t))) = self.cells.get(id) else {
+            let Some(Some(Cell::Tri(t))) = self.cells.get(id).copied() else {
                 continue;
             };
-            let tri = *t;
-            if point_strictly_inside(&self.points, tri, p) {
-                return Some(self.split_triangle(id, tri, p));
+            if point_strictly_inside(&self.points, t, p) {
+                if !self.point_clear(p, &[id], floor) {
+                    return None;
+                }
+                return Some(self.split_triangle(id, t, p));
             }
         }
         None
+    }
+
+    /// True when `p` is at least `floor` from every node of `cells`.
+    fn point_clear(&self, p: [f64; 2], cells: &[usize], floor: f64) -> bool {
+        for &id in cells {
+            let Some(Some(cell)) = self.cells.get(id) else {
+                continue;
+            };
+            for i in 0..cell.n_nodes() {
+                let q = self.points[cell.node(i)];
+                if ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt() < floor {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn split_triangle(&mut self, id: usize, t: [usize; 3], p: [f64; 2]) -> usize {
@@ -826,13 +860,27 @@ impl CellMesh {
         {
             return false;
         }
-        // NOTE: the reversed order below (`[p, q, u]`, `[q, p, v]`) is only
-        // correct when `t1` traverses v→u; on the other half of the cases it
-        // writes both new triangles **inverted**. Fixing the winding changes the
-        // closure's trajectory (measured 4/6 → 2/6 on the gate table), because
-        // the closure's tie-breaks follow the stored node order; see the record.
-        self.set_cell(owners0, Cell::Tri([p, q, u]));
-        self.set_cell(owners1, Cell::Tri([q, p, v]));
+        // The other diagonal splits the quadrilateral into two triangles, and
+        // the new winding must follow the winding of `t1`'s traversal of the
+        // shared edge: the boundary is `p,u,q,v` when `t1` traverses u→v, and
+        // `u,p,v,q` when it traverses v→u. Writing one order unconditionally —
+        // which this code did — leaves both new triangles **inverted** on half
+        // the flips. That was invisible to the quality report (a `Tri3` has a
+        // scaled Jacobian of 1.0 by construction) and every later pairing, merge
+        // or cavity then refused those triangles.
+        let mut t1_forward = false;
+        for i in 0..3 {
+            if t1[i] == u && t1[(i + 1) % 3] == v {
+                t1_forward = true;
+            }
+        }
+        if t1_forward {
+            self.set_cell(owners0, Cell::Tri([p, u, q]));
+            self.set_cell(owners1, Cell::Tri([q, v, p]));
+        } else {
+            self.set_cell(owners0, Cell::Tri([p, q, u]));
+            self.set_cell(owners1, Cell::Tri([q, p, v]));
+        }
         true
     }
 
@@ -960,6 +1008,10 @@ const MIN_QUAD_ANGLE_DEG: f64 = 25.0;
 /// Number of best-scoring side pairs examined before the edge is declared
 /// failed. This is candidate selection among existing nodes, not insertion.
 const MAX_PAIR_TRIALS: usize = 8;
+
+/// A node is never inserted closer than this fraction of the local size to an
+/// existing node: such a split creates an edge the quads cannot absorb.
+const MIN_INSERT_SPACING: f64 = 0.25;
 
 /// Why one front edge could not become a quad.
 #[derive(Clone, Copy, Debug)]
@@ -1537,6 +1589,58 @@ mod tests {
             let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
             assert!(area >= 0.0, "clockwise triangle {t:?} after the front");
         }
+    }
+
+    #[test]
+    fn a_flip_keeps_both_triangles_counter_clockwise() {
+        // Both windings of the shared edge: the new pair must be CCW in either.
+        let points = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        for tris in [
+            // t1 = (0, 1, 2) traverses the edge 2→0 (v→u).
+            vec![[0, 1, 2], [0, 2, 3]],
+            // t1 = (0, 2, 3) traverses it 0→2 (u→v).
+            vec![[0, 2, 3], [2, 0, 1]],
+        ] {
+            let mut mesh = CellMesh::new(&points, &tris, 1.0);
+            let before = 1.0;
+            assert!(mesh.flip(0, 2), "flip must be legal: {tris:?}");
+            let mut area = 0.0;
+            for id in mesh.cell_ids() {
+                match mesh.cells[id] {
+                    Some(Cell::Tri(t)) => {
+                        let (a, b, c) = (mesh.points[t[0]], mesh.points[t[1]], mesh.points[t[2]]);
+                        let signed =
+                            ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) / 2.0;
+                        assert!(
+                            signed > 0.0,
+                            "clockwise triangle {t:?} after flip: {tris:?}"
+                        );
+                        area += signed;
+                    }
+                    other => panic!("unexpected cell {other:?}"),
+                }
+            }
+            assert!((area - before).abs() < 1e-12, "area changed: {tris:?}");
+        }
+    }
+
+    #[test]
+    fn insertion_never_makes_a_tiny_edge() {
+        let points = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let mut mesh = CellMesh::new(&points, &[[0, 1, 2]], 1.0);
+        assert!(
+            mesh.insert_near(0, [0.01, 0.01]).is_none(),
+            "a point 0.014 from node 0 must not be inserted"
+        );
+        assert!(
+            mesh.insert_near(0, [0.3, 0.3]).is_some(),
+            "a point in the middle of the triangle must be inserted"
+        );
     }
 
     #[test]

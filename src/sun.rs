@@ -1963,6 +1963,150 @@ fn quad_min_angle(points: &[Node], quad: &[usize; 4]) -> f64 {
     }
 }
 
+/// Move the nodes of low-quality quads slightly, maximising the **gate margin**
+/// of the incident quads: `min(angle / 30°, min_sj / 0.2)`.
+///
+/// This is the geometric companion of [`repair_degenerate_quads`]. It serves two
+/// cases that no swap reaches: a quad with a ~0 corner Jacobian (three collinear
+/// nodes), where the corner node has to leave the line; and a transition quad
+/// whose corner is below the 30° floor because its two opposite edges differ in
+/// length, where sliding a node rebalances it. The step is a small fraction of
+/// the local size, and a move is kept only when it raises the worst incident
+/// margin, so a good area of the mesh does not move.
+pub fn perturb_low_quads(
+    points: &[Node],
+    quads: &[[usize; 4]],
+    tris: &[[usize; 3]],
+    size: f64,
+    rounds: usize,
+) -> (Vec<Node>, Vec<[usize; 4]>, Vec<[usize; 3]>, usize) {
+    let mut pts = points.to_vec();
+    let quads = quads.to_vec();
+    let tris = tris.to_vec();
+    let mut incident: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (id, q) in quads.iter().enumerate() {
+        for &v in q {
+            incident.entry(v).or_default().push(id);
+        }
+    }
+    // The score is the worst incident margin, so a move that improves one quad
+    // while inverting another lowers the score and is not taken. A negative value
+    // (inverted or degenerate quad) is a real score, not a skip: a move that lifts
+    // a 0 Jacobian to 0.3 must be allowed to beat it.
+    let margin = |pts: &[Node], v: usize| -> f64 {
+        let mut score = f64::INFINITY;
+        for &id in incident.get(&v).map(Vec::as_slice).unwrap_or(&[]) {
+            let sj = quad_min_sj(pts, &quads[id]);
+            let angle = quad_min_angle(pts, &quads[id]);
+            score = score.min((angle / 30.0).min(sj / 0.2));
+        }
+        score
+    };
+    let mut moved = 0usize;
+    for _ in 0..rounds {
+        let mut best: Option<(f64, usize, [f64; 2])> = None;
+        for &v in incident.keys() {
+            let current = margin(&pts, v);
+            if current >= 1.0 {
+                continue;
+            }
+            let here = [pts[v][0], pts[v][1]];
+            for radius in [0.02 * size, 0.05 * size, 0.1 * size] {
+                for k in 0..8 {
+                    let a = std::f64::consts::TAU * k as f64 / 8.0;
+                    let candidate = [here[0] + radius * a.cos(), here[1] + radius * a.sin()];
+                    pts[v] = [candidate[0], candidate[1], 0.0];
+                    let score = margin(&pts, v);
+                    pts[v] = [here[0], here[1], 0.0];
+                    if score > current + 1.0e-9 && best.as_ref().is_none_or(|(b, _, _)| score > *b)
+                    {
+                        best = Some((score, v, candidate));
+                    }
+                }
+            }
+        }
+        let Some((_, v, p)) = best else {
+            break;
+        };
+        pts[v] = [p[0], p[1], 0.0];
+        moved += 1;
+    }
+    (pts, quads, tris, moved)
+}
+
+/// Re-split pairs of quads across their shared edge when the pair's **worst
+/// corner Jacobian** improves, for quads below `floor`.
+///
+/// This is the repair for a quad whose corner Jacobian is ~0 because three of its
+/// nodes are collinear: `quad_min_sj` sees it, the corner-angle criterion does not
+/// (the collinear corner is 180°), and an angle-driven swap never picks it. The
+/// swap only touches pairs with a bad member, and both new quads must clear the
+/// floor, so an all-good mesh is left untouched.
+pub fn repair_degenerate_quads(
+    points: &[Node],
+    quads: &[[usize; 4]],
+    tris: &[[usize; 3]],
+    floor: f64,
+    rounds: usize,
+) -> (Vec<Node>, Vec<[usize; 4]>, Vec<[usize; 3]>, usize) {
+    let mut mesh = WalkMesh::new(points, quads, tris);
+    let mut repaired = 0usize;
+    for _ in 0..rounds {
+        let mut best: Option<(f64, usize, usize, [usize; 4], [usize; 4])> = None;
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        for id in 0..mesh.cells.len() {
+            let Some(q1) = mesh.quad(id) else {
+                continue;
+            };
+            let q1 = normalize_quad(&mesh.points, q1);
+            let old1 = quad_min_sj(&mesh.points, &q1);
+            for i in 0..4 {
+                let edge = (q1[i].min(q1[(i + 1) % 4]), q1[i].max(q1[(i + 1) % 4]));
+                let owners = mesh.edge_cells(edge);
+                if owners.len() != 2 {
+                    continue;
+                }
+                let other = if owners[0] == id {
+                    owners[1]
+                } else {
+                    owners[0]
+                };
+                let Some(q2) = mesh.quad(other) else {
+                    continue;
+                };
+                let q2 = normalize_quad(&mesh.points, q2);
+                let old = old1.min(quad_min_sj(&mesh.points, &q2));
+                if old >= floor {
+                    continue;
+                }
+                let key = (id.min(other), id.max(other));
+                if !seen.insert(key) {
+                    continue;
+                }
+                let Some((score, left, right)) = mesh.best_swap_between(id, other) else {
+                    continue;
+                };
+                if score < floor || score <= old + 1.0e-6 {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|(bs, _, _, _, _)| score > *bs) {
+                    best = Some((score, id, other, left, right));
+                }
+            }
+        }
+        let Some((_, a, b, left, right)) = best else {
+            break;
+        };
+        mesh.remove(a);
+        mesh.remove(b);
+        mesh.add(Cell::Quad(left));
+        mesh.add(Cell::Quad(right));
+        repaired += 1;
+    }
+    let (quads, tris) = mesh.collect();
+    (mesh.points, quads, tris, repaired)
+}
+
 /// Post-process the leftovers with the local cavity quadrangulation. This runs
 /// after the ordinary pairing/absorption/template pipeline has stalled; the
 /// cavity is deliberately not part of that pipeline because it changes the
@@ -2018,11 +2162,24 @@ fn cell_has_edge(cell: Cell, edge: (usize, usize)) -> bool {
 }
 
 fn normalize_tri(points: &[Node], t: [usize; 3]) -> [usize; 3] {
-    if tri_area2(points, t) < 0.0 {
+    let t = if tri_area2(points, t) < 0.0 {
         [t[0], t[2], t[1]]
     } else {
         t
-    }
+    };
+    // Canonical rotation: start at the smallest node id. The walk's tie-breaks
+    // follow the stored node order, so the same triangle written as (1, 2, 0)
+    // instead of (0, 1, 2) sent the closure down a different path. Normalising
+    // the rotation makes the result depend on the cells, not on the order the
+    // caller happened to write them.
+    let i = if t[0] <= t[1] && t[0] <= t[2] {
+        0
+    } else if t[1] <= t[2] {
+        1
+    } else {
+        2
+    };
+    [t[i], t[(i + 1) % 3], t[(i + 2) % 3]]
 }
 
 fn normalize_quad(points: &[Node], q: [usize; 4]) -> [usize; 4] {
@@ -2034,11 +2191,19 @@ fn normalize_quad(points: &[Node], q: [usize; 4]) -> [usize; 4] {
             a[0] * b[1] - b[0] * a[1]
         })
         .sum();
-    if twice < 0.0 {
+    let q = if twice < 0.0 {
         [q[0], q[3], q[2], q[1]]
     } else {
         q
+    };
+    // Canonical rotation, for the same reason as `normalize_tri`.
+    let mut i = 0;
+    for k in 1..4 {
+        if q[k] < q[i] {
+            i = k;
+        }
     }
+    [q[i], q[(i + 1) % 4], q[(i + 2) % 4], q[(i + 3) % 4]]
 }
 
 /// The bilinear scaled Jacobian minima used by the quality contract. It may be
@@ -2139,6 +2304,66 @@ mod tests {
             [1.0, 1.0, 0.0],
             [0.0, 1.0, 0.0],
         ]
+    }
+
+    #[test]
+    fn a_quad_with_three_collinear_nodes_is_perturbed_away() {
+        let points = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let quads = [[0, 1, 2, 3]];
+        assert!(
+            quad_min_sj(&points, &quads[0]) <= 1e-9,
+            "input is degenerate"
+        );
+        let (pts, quads, tris, moved) = perturb_low_quads(&points, &quads, &[], 1.0, 200);
+        assert!(moved > 0, "the degenerate corner was not moved");
+        assert!(quad_min_sj(&pts, &quads[0]) >= 0.2, "{:?}", quads[0]);
+        assert!(tris.is_empty());
+    }
+
+    #[test]
+    fn the_degenerate_repair_leaves_a_good_mesh_alone() {
+        let points = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+        ];
+        let quads = [[0, 1, 2, 3], [1, 5, 4, 2]];
+        let (_, out, _, repaired) = repair_degenerate_quads(&points, &quads, &[], 0.25, 8);
+        assert_eq!(repaired, 0);
+        assert_eq!(out, quads);
+    }
+
+    #[test]
+    fn the_closure_does_not_depend_on_triangle_rotation() {
+        // The front's cells, with every triangle rotated by one: the closure must
+        // produce the same quads. Before the canonical rotation, the walk's
+        // tie-breaks followed the stored node order and the result changed.
+        let points = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.5, 1.6, 0.0],
+        ];
+        let quads = [[0, 1, 2, 3]];
+        let tris = [[1, 4, 2], [0, 1, 3]];
+        let rotated: Vec<[usize; 3]> = tris.iter().map(|t| [t[1], t[2], t[0]]).collect();
+        let (_, q1, t1, _) = close_residuals(&points, &quads, &tris);
+        let (_, q2, t2, _) = close_residuals(&points, &quads, &rotated);
+        let mut a: Vec<[usize; 4]> = q1.clone();
+        a.sort_unstable();
+        let mut b: Vec<[usize; 4]> = q2.clone();
+        b.sort_unstable();
+        assert_eq!(a, b, "closure changed with rotation: {q1:?} vs {q2:?}");
+        assert_eq!(t1.len(), t2.len());
     }
 
     #[test]

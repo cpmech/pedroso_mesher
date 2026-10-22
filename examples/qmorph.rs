@@ -261,6 +261,12 @@ fn run(name: &str, d: &Domain, size: f64, mode: Mode) {
     cells.extend(tris.iter().map(|t| Cell::tri3(*t)));
     mesh = Mesh::new(points, cells);
 
+    let (points, quads, tris, degenerate_repairs) =
+        sun::repair_degenerate_quads(&mesh.points, &quad_cells(&mesh), &tri_cells(&mesh), 0.25, 8);
+    let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
+    cells.extend(tris.iter().map(|t| Cell::tri3(*t)));
+    mesh = Mesh::new(points, cells);
+
     let (points, quads, tris, quality_swaps) =
         sun::improve_quality(&mesh.points, &quad_cells(&mesh), &tri_cells(&mesh), 12);
     let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
@@ -280,13 +286,24 @@ fn run(name: &str, d: &Domain, size: f64, mode: Mode) {
             polished = Some((candidate, candidate_gate));
         }
     }
-    let (mesh, gate) = match polished {
+    let (mesh, _) = match polished {
         Some(polished) => polished,
         None => {
             let gate = verify::gate(&mesh);
             (mesh, gate)
         }
     };
+    // A final repair for quads whose corner Jacobian is ~0 (three collinear
+    // nodes): smoothing and the closure can both create one, and no later pass
+    // looks at it, because the corner-angle criterion cannot see a 180° corner.
+    let (points, quads, tris, degenerate_repairs_after) =
+        sun::repair_degenerate_quads(&mesh.points, &quad_cells(&mesh), &tri_cells(&mesh), 0.25, 8);
+    let (points, quads, tris, perturbations) =
+        sun::perturb_low_quads(&points, &quads, &tris, size, 200);
+    let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
+    cells.extend(tris.iter().map(|t| Cell::tri3(*t)));
+    let mesh = Mesh::new(points, cells);
+    let gate = verify::gate(&mesh);
 
     let quad_mesh = Mesh::new(
         mesh.points.clone(),
@@ -331,7 +348,7 @@ fn run(name: &str, d: &Domain, size: f64, mode: Mode) {
         t_total,
     );
     println!(
-        "      quality swaps: {quality_swaps} | low repairs: {low_repairs} | cavity: {cavity_closed} | parity splits: {parity_splits}{two_stage_note}"
+        "      quality swaps: {quality_swaps} | low repairs: {low_repairs} | degenerate repairs: {degenerate_repairs}+{degenerate_repairs_after} | perturbations: {perturbations} | cavity: {cavity_closed} | parity splits: {parity_splits}{two_stage_note}"
     );
     if let Some(reason) = gate.reason() {
         println!("      reason: {reason}");
