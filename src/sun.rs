@@ -2016,11 +2016,7 @@ pub fn perturb_low_quads(
     // (0,0) moved to (0,1.08) by the projection).
     let mut at_corner = vec![false; pts.len()];
     if let Some(d) = domain {
-        let mut corners: Vec<[f64; 2]> = Vec::new();
-        for (a, b) in d.segments() {
-            corners.push(a);
-            corners.push(b);
-        }
+        let corners = d.sharp_corners();
         for (v, p) in pts.iter().enumerate() {
             if !on_boundary[v] {
                 continue;

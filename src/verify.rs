@@ -132,13 +132,8 @@ pub fn corner_offset(domain: &crate::two_d::Domain, mesh: &Mesh) -> f64 {
     if boundary.is_empty() {
         return f64::INFINITY;
     }
-    let mut corners: Vec<[f64; 2]> = Vec::new();
-    for (a, b) in domain.segments() {
-        corners.push(a);
-        corners.push(b);
-    }
     let mut worst: f64 = 0.0;
-    for c in corners {
+    for c in domain.sharp_corners() {
         let mut best = f64::INFINITY;
         for p in &boundary {
             let d = ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2)).sqrt();
@@ -319,6 +314,30 @@ mod tests {
             vec![Cell::quad4([0, 1, 2, 3])],
         );
         assert!(corner_offset(&domain, &on) < 1.0e-12);
+    }
+
+    #[test]
+    fn a_shallow_boundary_vertex_is_not_a_corner() {
+        use crate::two_d::Domain;
+        // A 24-gon approximation of a circle: every vertex turns 15 degrees, so
+        // none of them is a feature and dropping one is not a geometry error.
+        let pts: Vec<[f64; 2]> = (0..24)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / 24.0;
+                [1.0 + a.cos(), 1.0 + a.sin()]
+            })
+            .collect();
+        let domain = Domain::new(pts.clone(), vec![]).unwrap();
+        assert!(domain.sharp_corners().is_empty());
+        let mesh = Mesh::new(
+            vec![
+                [pts[0][0], pts[0][1], 0.0],
+                [pts[1][0], pts[1][1], 0.0],
+                [1.0, 1.0, 0.0],
+            ],
+            vec![Cell::tri3([0, 1, 2])],
+        );
+        assert!(corner_offset(&domain, &mesh) < 1.0e-12);
     }
 
     #[test]

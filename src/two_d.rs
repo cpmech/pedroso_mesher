@@ -120,6 +120,39 @@ impl Domain {
     }
 
     /// Boundary segments, outer loop and holes.
+    /// Vertices where the boundary turns by more than 30 degrees.
+    ///
+    /// A circular boundary discretised as a 24-gon turns 15 degrees per vertex:
+    /// those are sampling points, not features, and a mesh may legitimately skip
+    /// one. A square corner turns 90 degrees and must be a mesh node. This is the
+    /// set `corner_offset` measures and that `smooth` must not slide.
+    pub fn sharp_corners(&self) -> Vec<[f64; 2]> {
+        let mut out = Vec::new();
+        for loop_pts in std::iter::once(&self.outer).chain(self.holes.iter()) {
+            let n = loop_pts.len();
+            if n < 3 {
+                continue;
+            }
+            for i in 0..n {
+                let p = loop_pts[(i + n - 1) % n];
+                let v = loop_pts[i];
+                let q = loop_pts[(i + 1) % n];
+                let a = [p[0] - v[0], p[1] - v[1]];
+                let b = [q[0] - v[0], q[1] - v[1]];
+                let la = (a[0] * a[0] + a[1] * a[1]).sqrt();
+                let lb = (b[0] * b[0] + b[1] * b[1]).sqrt();
+                if la < 1.0e-12 || lb < 1.0e-12 {
+                    continue;
+                }
+                let cos = ((a[0] * b[0] + a[1] * b[1]) / (la * lb)).clamp(-1.0, 1.0);
+                if cos.acos().to_degrees() < 150.0 {
+                    out.push(v);
+                }
+            }
+        }
+        out
+    }
+
     pub fn segments(&self) -> Vec<([f64; 2], [f64; 2])> {
         let mut out = Vec::new();
         for loop_points in std::iter::once(&self.outer).chain(self.holes.iter()) {
@@ -432,6 +465,11 @@ pub fn smooth_mesh(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f6
 
 fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
     let n = mesh.points.len();
+    // A sharp corner is a feature of the geometry: sliding it along one of the
+    // two adjacent edges cuts the corner. Measured on the plate-with-hole: a
+    // 24-gon hole's shallow vertices were being slid, and on the ring a 90-degree
+    // corner sat 1.0 away from the nearest node after smoothing.
+    let corners = domain.sharp_corners();
     let mut incident: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (c, cell) in mesh.cells.iter().enumerate() {
         for &v in &cell.nodes {
@@ -447,6 +485,13 @@ fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
             }
             let current = [mesh.points[v][0], mesh.points[v][1]];
             let on_boundary = domain.distance_to_boundary(current) < 1e-9;
+            if on_boundary
+                && corners
+                    .iter()
+                    .any(|c| (c[0] - current[0]).powi(2) + (c[1] - current[1]).powi(2) < 1.0e-18)
+            {
+                continue;
+            }
 
             let mut ring = Vec::new();
             for &c in &incident[v] {

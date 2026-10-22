@@ -69,6 +69,19 @@ fn part(name: &str) -> (Domain, f64) {
             .unwrap(),
             2.0,
         ),
+        "ring" => {
+            let arc = |r: f64, a0: f64, a1: f64, n: usize| -> Vec<[f64; 2]> {
+                (0..=n)
+                    .map(|i| {
+                        let a = a0 + (a1 - a0) * i as f64 / n as f64;
+                        [r * a.cos(), r * a.sin()]
+                    })
+                    .collect()
+            };
+            let mut pts = arc(20.0, 0.0, std::f64::consts::FRAC_PI_2, 24);
+            pts.extend(arc(10.0, std::f64::consts::FRAC_PI_2, 0.0, 12));
+            (Domain::new(pts, vec![]).unwrap(), 1.0)
+        }
         "stepped" => (
             Domain::new(
                 vec![
@@ -121,6 +134,7 @@ fn main() {
             println!("{label}: no mesh");
             continue;
         };
+        let corner_before = verify::corner_offset(&domain, &mesh);
         post_pass(&domain, &mut mesh, size);
         let gate = verify::gate(&mesh);
         let title = format!(
@@ -141,13 +155,14 @@ fn main() {
         let path = format!("figures/alts/{name}-{label}.png");
         draw::draw_domain_with_mesh(&domain, &mesh, &path, &opts).unwrap();
         println!(
-            "{label:8} q {:5} tri {:3} SJ {:.3} ang {:.1} off {:.1e} corner {:.1e} {} -> {path}",
+            "{label:8} q {:5} tri {:3} SJ {:.3} ang {:.1} off {:.1e} corner {:.1e} (was {:.1e}) {} -> {path}",
             gate.quads,
             gate.triangles,
             gate.min_scaled_jacobian,
             gate.min_corner_angle_deg,
             verify::boundary_offset(&domain, &mesh),
             verify::corner_offset(&domain, &mesh),
+            corner_before,
             if gate.passes() { "PASS" } else { "FAIL" }
         );
     }
