@@ -6,7 +6,9 @@
 //! clockwise, so that the material is always on the left of the loop – and
 //! advances each loop towards the interior by one row at a time. Every row is
 //! built between the old front nodes and their inward projections, so a quad is
-//! always added between existing nodes and a T-junction can never appear.
+//! always added between existing nodes and a T-junction can never appear. When
+//! a projected row reaches another front it is seamed onto it instead of being
+//! refused (§2.8), so the two fronts merge and paving continues.
 //!
 //! What is implemented
 //! -------------------
@@ -36,6 +38,16 @@
 //!   scaled Jacobian. If a row fails, that loop stops advancing. A separate
 //!   pass refuses the row before any quad of it is committed, so the partial
 //!   mesh is always conforming and crack-free.
+//! * Seaming (§2.8): a row that would run into another front is no longer
+//!   refused outright. When a run of consecutive projected nodes has, on the
+//!   met front, consecutive nearest nodes within `SEAM_REACH` (in reverse, as
+//!   two facing fronts run in opposite directions), the run is merged
+//!   node-to-node: the row quads take the met front's node ids, the welded
+//!   edges (already front edges of that front) become interior, and the
+//!   unseamed parts of the two loops are spliced into one. This is the paper's
+//!   node-combining seam; nothing is split. The candidate is checked against
+//!   the whole mesh (cracks, inverted cells, overlapping cells) and the row is
+//!   refused as before if any of them would be broken.
 //! * Smoothing (§2.7): a global `smooth_mesh` pass at the end; the smoother is
 //!   the project's, not a paving-specific boundary smoother.
 //! * Cleanup (§2.11): `sun::repair_low_quads` and `sun::perturb_low_quads` run
@@ -55,12 +67,22 @@
 //!   edge-split retries are tried and a simply connected residual is closed by
 //!   an unconditional fan. Without this the route would not finish on all
 //!   corpus parts; with it every part is all-quad.
-//! * Seaming of negative/small front angles (§2.8), row adjustment with tucks
-//!   and wedges (§2.9) and perimeter-intersection connection (§2.10) are not
-//!   implemented. Their effect is approximated by the clearance/validity guard:
-//!   a row that would need one of them is refused and the residual is closed by
-//!   the fallback instead. This is why the ring still uses one row and the
-//!   matched core remains 55–83 % of the quads on the corpus (rows 17–45 %).
+//! * Seaming only covers the count-matched case above. A *transition seam*
+//!   between sides of unequal length (the wedge of Figures 21 and 23) is not
+//!   implemented, and neither is §2.9 row adjustment with tucks and wedges.
+//!   On a front that is expanding into the interior the node spacing grows
+//!   with every row, so its nodes no longer line up with the finer front it
+//!   meets; that contact cannot be seamed and still goes to the residual
+//!   closure. §2.10 perimeter-intersection connection (a front crossing itself
+//!   or another front, rather than touching it) is also not implemented.
+//! * Rows are closed rings advanced around a whole loop, not the paper's open
+//!   rows that begin and end at row-end nodes (§2.4/§2.6). At a 90° convex
+//!   corner the front edge next to the corner therefore contracts by one node
+//!   spacing per row and its two corner quads invert after two rows. This is
+//!   why the single-loop parts (l-bracket, stepped, ring) stop after one or
+//!   two rows; seaming cannot help there because no second front exists at the
+//!   corner. The paper removes the contraction with row-end termination and
+//!   tucks (§2.9).
 //! * Anisotropic sizing, feature capture beyond the boundary segments, and
 //!   curved geometry (the boundary is the input polyline) are out of scope.
 //!
@@ -84,6 +106,11 @@ const CORNER_MARGIN: f64 = 2.4;
 const MIN_EDGE: f64 = 0.08;
 /// New fronts closer than this to another front are refused, in sizes.
 const FRONT_GAP: f64 = 1.2;
+/// A row node within this distance of a node of the front it meets is seamed
+/// onto it, in sizes. The paper's seam is a node merge; a run of consecutive
+/// row nodes must line up with consecutive nodes of the other front (in reverse
+/// order, because two facing fronts run in opposite directions).
+const SEAM_REACH: f64 = 1.5;
 /// Rounds of rows before the residual closure takes over.
 const MAX_ROW_ROUNDS: usize = 32;
 
@@ -98,6 +125,13 @@ pub struct Options {
     pub front_gap: f64,
     /// Rounds of rows before the residual closure takes over.
     pub max_row_rounds: usize,
+    /// Seam a row onto the front it meets instead of refusing it (§2.8).
+    #[serde(default = "default_seam")]
+    pub seam: bool,
+}
+
+fn default_seam() -> bool {
+    true
 }
 
 impl Default for Options {
@@ -107,6 +141,7 @@ impl Default for Options {
             min_edge_fraction: MIN_EDGE,
             front_gap: FRONT_GAP,
             max_row_rounds: MAX_ROW_ROUNDS,
+            seam: default_seam(),
         }
     }
 }
@@ -120,6 +155,8 @@ pub struct Stats {
     pub core_quads: usize,
     /// Paving rows committed.
     pub row_rounds: usize,
+    /// Rows committed by seaming a row onto the front it met.
+    pub seam_rows: usize,
 }
 
 impl Stats {
@@ -145,6 +182,7 @@ struct Paving {
     row_quads: usize,
     core_quads: usize,
     row_rounds: usize,
+    seam_rows: usize,
 }
 
 impl Paving {
@@ -183,7 +221,8 @@ pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats)
     mesh_with_stats_options(domain, sizing, &Options::default())
 }
 
-fn mesh_with_stats_options(
+/// Like [`mesh_with_stats`], but with explicit [`Options`].
+pub fn mesh_with_stats_options(
     domain: &Domain,
     sizing: &Sizing,
     options: &Options,
@@ -215,8 +254,14 @@ fn mesh_with_stats_options(
                 continue;
             }
             if let Some(row) = next_row(&paving, li, domain, h, options) {
+                let merged = row.merge_other.is_some();
                 commit_row(&mut paving, li, row);
                 advanced = true;
+                if merged {
+                    // The seam removed a loop, so the remaining indices of this
+                    // round's order are stale. Recompute the order next round.
+                    break;
+                }
             }
         }
         if !advanced {
@@ -229,13 +274,14 @@ fn mesh_with_stats_options(
 
     // Residual closure (documented deviation): constrained Delaunay plus
     // triangle pairing. Loops that are left after this must be empty.
-    if !paving.loops.is_empty() {
+    if paving.loops.iter().any(|loop_ids| !loop_ids.is_empty()) {
         fill_residual(&mut paving, domain, h)?;
     }
     let stats = Stats {
         row_quads: paving.row_quads,
         core_quads: paving.core_quads,
         row_rounds: paving.row_rounds,
+        seam_rows: paving.seam_rows,
     };
 
     let cells: Vec<Cell> = paving.quads.iter().map(|q| Cell::quad4(*q)).collect();
@@ -446,6 +492,7 @@ fn sample(domain: &Domain, h: f64, options: &Options) -> Result<Paving, String> 
         row_quads: 0,
         core_quads: 0,
         row_rounds: 0,
+        seam_rows: 0,
     };
     let mut loops: Vec<Vec<[f64; 2]>> = Vec::new();
     loops.push(sample_loop(&domain.outer, h, true, options)?);
@@ -468,9 +515,15 @@ fn sample(domain: &Domain, h: f64, options: &Options) -> Result<Paving, String> 
 // --------------------------------------------------------------------------- //
 
 struct Row {
+    /// Node ids of the front left after the row (all new ids for a plain row;
+    /// the merged loop for a seam row).
     new_loop: Vec<usize>,
+    /// Points to append, in the order their predicted ids were assigned.
     new_points: Vec<[f64; 2]>,
     quads: Vec<[usize; 4]>,
+    /// Set when the row was seamed onto loop `other`: that loop disappears and
+    /// its unseamed part is merged into `new_loop`.
+    merge_other: Option<usize>,
 }
 
 fn front_length(paving: &Paving, li: usize) -> f64 {
@@ -641,17 +694,32 @@ fn next_row(paving: &Paving, li: usize, domain: &Domain, h: f64, options: &Optio
             return None;
         }
     }
-    // Distance from the new front to the other fronts.
+
+    // Distance from the new front to the other fronts. A row that would run
+    // into another front is no longer refused outright: §2.8 seams it onto the
+    // front it meets when the two node chains line up. If the seam is not
+    // sound the row is refused exactly as before.
+    let mut closest: Option<(f64, usize)> = None;
     for other in 0..paving.loops.len() {
         if other == li {
             continue;
         }
         for p in &new_points {
-            if loop_distance(paving, *p, other) < options.front_gap * h {
-                return None;
+            let d = loop_distance(paving, *p, other);
+            if d < options.front_gap * h && closest.map(|(best, _)| d < best).unwrap_or(true) {
+                closest = Some((d, other));
             }
         }
     }
+    if let Some((_d, other)) = closest {
+        if options.seam {
+            if let Some(row) = seam_row(paving, li, other, &old, &new_points, h) {
+                return Some(row);
+            }
+        }
+        return None;
+    }
+
     // Simple polygon test on the scratch coordinates.
     let scratch: Vec<Node> = new_points.iter().map(|p| [p[0], p[1], 0.0]).collect();
     let ids: Vec<usize> = (0..n).collect();
@@ -681,7 +749,279 @@ fn next_row(paving: &Paving, li: usize, domain: &Domain, h: f64, options: &Optio
         new_loop,
         new_points,
         quads,
+        merge_other: None,
     })
+}
+
+/// A run of row nodes that lines up with a run of nodes of the front it meets.
+struct SeamRun {
+    /// First row node of the run.
+    start: usize,
+    /// Number of row nodes in the run (and edges, one fewer).
+    len: usize,
+    /// Index in the other loop of the node matched to `start`.
+    other_start: usize,
+    /// Worst node-to-node distance of the run, in sizes.
+    worst: f64,
+}
+
+/// Seam the projected row `new_points` (from loop `li`) onto loop `other`.
+///
+/// §2.8 performs a seam by combining two nodes into one. Here a *run* of
+/// consecutive row nodes is matched to consecutive nodes of the met front (in
+/// reverse, because two facing fronts run in opposite directions); each pair is
+/// merged, the row quads are built on the met front's node ids, and the unseamed
+/// parts of the two loops are spliced into one loop. Nothing is split: the
+/// welded edges were front edges of `other`, so they become interior edges
+/// shared by the last row of `other` and the new row. The candidate is checked
+/// against the whole mesh (cracks, inversion, overlapping cells) before it is
+/// returned, so a seam that would break the mesh is refused.
+fn seam_row(
+    paving: &Paving,
+    li: usize,
+    other: usize,
+    old: &[usize],
+    new_points: &[[f64; 2]],
+    h: f64,
+) -> Option<Row> {
+    let n = old.len();
+    let other_loop = paving.loops.get(other)?;
+    let m = other_loop.len();
+    if n < 2 || m < 2 || other == li {
+        return None;
+    }
+    let reach = SEAM_REACH * h;
+    // Nearest node of the met front for every row node.
+    let mut nearest: Vec<(usize, f64)> = Vec::with_capacity(n);
+    for p in new_points {
+        let mut best = (usize::MAX, f64::INFINITY);
+        for (j, &id) in other_loop.iter().enumerate() {
+            let q = paving.coord(id);
+            let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
+            if d < best.1 {
+                best = (j, d);
+            }
+        }
+        nearest.push(best);
+    }
+    // Longest run of row nodes whose nearest nodes are consecutive in reverse.
+    let mut run: Option<SeamRun> = None;
+    for start in 0..n {
+        if nearest[start].1 > reach {
+            continue;
+        }
+        let mut len = 1usize;
+        let mut worst = nearest[start].1;
+        while len < n && len < m {
+            let i = (start + len) % n;
+            let d = nearest[i].1;
+            if d > reach {
+                break;
+            }
+            let expect = (nearest[start].0 + m - len) % m;
+            if nearest[i].0 != expect {
+                break;
+            }
+            worst = worst.max(d);
+            len += 1;
+        }
+        // A run shorter than two nodes is not a seam (it is one node, not an
+        // edge). A run that swallows either whole loop cannot be spliced: the
+        // unseamed remainder would not be closed.
+        if len < 2 || len > n || len > m {
+            continue;
+        }
+        if (len == n && len != m) || (len == m && len != n) {
+            continue;
+        }
+        let better = match &run {
+            None => true,
+            Some(best) => len > best.len || (len == best.len && worst < best.worst),
+        };
+        if better {
+            run = Some(SeamRun {
+                start,
+                len,
+                other_start: nearest[start].0,
+                worst,
+            });
+        }
+    }
+    let run = run?;
+
+    // Merge the matched nodes and give the unseamed row nodes fresh ids.
+    let base = paving.points.len();
+    let mut new_ids = vec![usize::MAX; n];
+    let mut fresh: Vec<[f64; 2]> = Vec::new();
+    let closed = run.len == n && run.len == m;
+    for i in 0..n {
+        let offset = (i + n - run.start) % n;
+        if offset < run.len {
+            let j = (run.other_start + m - offset) % m;
+            new_ids[i] = other_loop[j];
+        } else {
+            new_ids[i] = base + fresh.len();
+            fresh.push(new_points[i]);
+        }
+    }
+    let mut quads = Vec::with_capacity(n);
+    for i in 0..n {
+        quads.push([old[i], old[(i + 1) % n], new_ids[(i + 1) % n], new_ids[i]]);
+    }
+
+    // Spliced front: the met loop walked forward from the far end of the seam
+    // to its near end, then the row's unseamed part walked forward.
+    let mut merged: Vec<usize> = Vec::new();
+    if !closed {
+        let j_start = run.other_start;
+        let j_end = (run.other_start + m - (run.len - 1)) % m;
+        let mut j = j_start;
+        loop {
+            merged.push(other_loop[j]);
+            if j == j_end {
+                break;
+            }
+            j = (j + 1) % m;
+        }
+        for k in 0..(n - run.len) {
+            let i = (run.start + run.len + k) % n;
+            merged.push(new_ids[i]);
+        }
+    }
+    if !closed && merged.len() < 3 {
+        return None;
+    }
+
+    // Validate the candidate on the whole mesh before committing anything.
+    let mut scratch_points = paving.points.clone();
+    for p in &fresh {
+        scratch_points.push([p[0], p[1], 0.0]);
+    }
+    for q in &quads {
+        if !quad_ok(&scratch_points, *q) {
+            return None;
+        }
+    }
+    if !closed && !loop_is_simple(&scratch_points, &merged) {
+        return None;
+    }
+    if !seam_is_sound(paving, &scratch_points, &quads) {
+        return None;
+    }
+    Some(Row {
+        new_loop: merged,
+        new_points: fresh,
+        quads,
+        merge_other: Some(other),
+    })
+}
+
+/// True when adding `quads` to the mesh leaves no crack, no inverted cell, no
+/// pair of cells sharing more than one edge, and no geometric overlap between
+/// the new quads and the cells they touch.
+fn seam_is_sound(paving: &Paving, points: &[Node], quads: &[[usize; 4]]) -> bool {
+    let mut cells: Vec<Cell> = paving.quads.iter().map(|q| Cell::quad4(*q)).collect();
+    cells.extend(quads.iter().map(|q| Cell::quad4(*q)));
+    let mesh = Mesh::new(points.to_vec(), cells);
+    let topo = mesh.topology();
+    if topo.cracks != 0 || topo.non_manifold != 0 || topo.inconsistent != 0 {
+        return false;
+    }
+    let gate = crate::verify::gate(&mesh);
+    if gate.inverted != 0 || gate.overlapping != 0 {
+        return false;
+    }
+    // The gate's overlap test is topological (two cells sharing two edges), so
+    // also test the new quads geometrically against the existing cells that
+    // share a node with them, and against each other.
+    let mut incident: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (qi, q) in paving.quads.iter().enumerate() {
+        for &v in q {
+            incident.entry(v).or_default().push(qi);
+        }
+    }
+    for q in quads {
+        let mut candidates: Vec<usize> = Vec::new();
+        for &v in q {
+            if let Some(list) = incident.get(&v) {
+                candidates.extend_from_slice(list);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        for qi in candidates {
+            if let Some(other) = paving.quads.get(qi) {
+                if quads_overlap(points, *q, *other) {
+                    return false;
+                }
+            }
+        }
+    }
+    for i in 0..quads.len() {
+        for j in (i + 1)..quads.len() {
+            if !bboxes_apart(points, quads[i], quads[j])
+                && quads_overlap(points, quads[i], quads[j])
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn quad_bbox(points: &[Node], q: [usize; 4]) -> [f64; 4] {
+    let mut b = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for &v in &q {
+        b[0] = b[0].min(points[v][0]);
+        b[1] = b[1].min(points[v][1]);
+        b[2] = b[2].max(points[v][0]);
+        b[3] = b[3].max(points[v][1]);
+    }
+    b
+}
+
+/// True when the two quads' bounding boxes are disjoint (touching is enough to
+/// say they cannot overlap).
+fn bboxes_apart(points: &[Node], a: [usize; 4], b: [usize; 4]) -> bool {
+    let (p, q) = (quad_bbox(points, a), quad_bbox(points, b));
+    p[2] <= q[0] || q[2] <= p[0] || p[3] <= q[1] || q[3] <= p[1]
+}
+
+/// Separating-axis test for two convex quads: true when their interiors
+/// overlap. Quads that only share an edge or a vertex do not overlap.
+fn quads_overlap(points: &[Node], a: [usize; 4], b: [usize; 4]) -> bool {
+    let project = |q: [usize; 4], axis: [f64; 2]| -> (f64, f64) {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &v in &q {
+            let t = points[v][0] * axis[0] + points[v][1] * axis[1];
+            lo = lo.min(t);
+            hi = hi.max(t);
+        }
+        (lo, hi)
+    };
+    for q in [a, b] {
+        for i in 0..4 {
+            let p = points[q[i]];
+            let r = points[q[(i + 1) % 4]];
+            let axis = [-(r[1] - p[1]), r[0] - p[0]];
+            if axis[0].abs() < 1e-15 && axis[1].abs() < 1e-15 {
+                continue;
+            }
+            let (alo, ahi) = project(a, axis);
+            let (blo, bhi) = project(b, axis);
+            let eps = 1e-12 * (ahi.abs() + blo.abs() + 1.0);
+            if ahi <= blo + eps || bhi <= alo + eps {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn commit_row(paving: &mut Paving, li: usize, row: Row) {
@@ -690,9 +1030,30 @@ fn commit_row(paving: &mut Paving, li: usize, row: Row) {
     }
     paving.row_quads += row.quads.len();
     paving.row_rounds += 1;
+    if row.merge_other.is_some() {
+        paving.seam_rows += 1;
+    }
     paving.quads.extend(row.quads);
-    if let Some(slot) = paving.loops.get_mut(li) {
-        *slot = row.new_loop;
+    let new_loop = row.new_loop;
+    match row.merge_other {
+        None => {
+            if let Some(slot) = paving.loops.get_mut(li) {
+                *slot = new_loop;
+            }
+        }
+        Some(other) => {
+            if new_loop.is_empty() {
+                // Both fronts closed: the seam consumed all of both loops.
+                paving.loops.remove(other);
+                let li = if other < li { li - 1 } else { li };
+                paving.loops.remove(li);
+            } else {
+                if let Some(slot) = paving.loops.get_mut(li) {
+                    *slot = new_loop;
+                }
+                paving.loops.remove(other);
+            }
+        }
     }
 }
 
@@ -1390,6 +1751,41 @@ mod tests {
         assert!(stats.row_quads > 0);
         assert!(stats.row_rounds > 0);
         assert!(stats.row_share() > 0.0 && stats.row_share() < 100.0);
+    }
+
+    #[test]
+    fn seaming_raises_the_row_share_on_a_plate_with_a_hole() {
+        let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
+        let sizing = Sizing::uniform(4.0).unwrap();
+        let (plain_mesh, plain) = mesh_with_stats_options(
+            &domain,
+            &sizing,
+            &Options {
+                seam: false,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let (seamed_mesh, seamed) =
+            mesh_with_stats_options(&domain, &sizing, &Options::default()).unwrap();
+        assert!(all_quads(&plain_mesh) && all_quads(&seamed_mesh));
+        // Turning the seam off reproduces the pre-seam route exactly.
+        assert_eq!((plain.row_quads, plain.core_quads), (128, 200));
+        assert_eq!(plain.seam_rows, 0);
+        // The hole front meets the plate front head-on; seaming connects them
+        // and both keep advancing, so fewer quads are left to the matched core.
+        assert!(seamed.seam_rows > 0);
+        assert!(seamed.row_quads > plain.row_quads);
+        assert!(seamed.core_quads < plain.core_quads);
+        assert!(seamed.row_share() > plain.row_share() + 5.0);
+        for mesh in [&plain_mesh, &seamed_mesh] {
+            let gate = verify::gate(mesh);
+            assert_eq!(gate.cracks, 0);
+            assert_eq!(gate.triangles, 0);
+            assert_eq!(gate.inverted, 0);
+            assert_eq!(gate.overlapping, 0);
+            assert!(verify::boundary_offset(&domain, mesh) < 1e-9);
+        }
     }
 
     #[test]
