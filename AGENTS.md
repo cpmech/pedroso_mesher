@@ -21,14 +21,6 @@ No code is ported from anywhere and non-MIT code is not even looked, ever.
 
 ## Never crash
 - **No panics in non-test code:** no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`,
-  `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`). The exceptions, in the app crate and in
-  `crates/threedx-client` (which deny it instead), have no safe API: the macOS-only
-  `crates/threedx-client/src/macos.rs` (loads the 3Dconnexion driver's client framework at run time
-  and calls through its function pointers), two functions in
-  `apps/solidcraft/src/open_documents.rs` (macOS hands Finder files only to an Objective-C
-  method), the Windows-only `apps/solidcraft/src/native_crash.rs` (the exception filter that
-  records crashes inside native code such as graphics drivers) and the Windows-only
-  `apps/solidcraft/src/native_frame.rs` (the window procedure that answers the resize-border hit
-  test of the window without OS decorations).
+  `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`).
 - **Errors are `Result<T, E>`** through the crate's error type and `?`. An unfinished feature
   returns an error ("not supported yet: …"); it never panics.
