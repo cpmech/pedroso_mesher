@@ -355,7 +355,7 @@ impl WalkMesh {
             let Some(sj) = quad_sj(&self.points, &quad) else {
                 continue;
             };
-            if sj <= 0.0 {
+            if sj <= 0.0 || !self.valid_new_cell(Cell::Quad(quad), &[t1, t2]) {
                 continue;
             }
             self.remove(t1);
@@ -406,7 +406,7 @@ impl WalkMesh {
                 return Move::Adjacent { id: other, edge };
             }
             if self.quad(other).is_some() {
-                if let Some((quad, residual)) = self.recombination(t, other, u, v, pm, None) {
+                if let Some((quad, residual)) = self.recombination(t, id, other, u, v, pm, None) {
                     self.remove(id);
                     self.remove(other);
                     self.add(Cell::Quad(quad));
@@ -424,9 +424,11 @@ impl WalkMesh {
     ///
     /// With `target` set, the residual has to contain that boundary edge, which
     /// is how the last triangle is walked onto the boundary.
+    #[allow(clippy::too_many_arguments)]
     fn recombination(
-        &mut self,
+        &self,
         tri: [usize; 3],
+        tri_id: usize,
         quad_id: usize,
         u: usize,
         v: usize,
@@ -462,13 +464,18 @@ impl WalkMesh {
             }
             let sj = quad_min_sj(&self.points, &quad);
             if sj <= 0.0 || sj < self.move_min_sj {
-                self.quality_rejections += 1;
                 continue;
             }
             if let Some(edge) = target {
                 if !cell_has_edge(Cell::Tri(residual), edge) {
                     continue;
                 }
+            }
+            let ignore = [tri_id, quad_id];
+            if !self.valid_new_cell(Cell::Quad(quad), &ignore)
+                || !self.valid_new_cell(Cell::Tri(residual), &ignore)
+            {
+                continue;
             }
             let Some(c) = self.center_of(Cell::Tri(residual)) else {
                 continue;
@@ -590,7 +597,7 @@ impl WalkMesh {
                 continue;
             };
             if let Some((new_quad, residual)) =
-                self.recombination(t, other, u, v, mid, Some(target))
+                self.recombination(t, id, other, u, v, mid, Some(target))
             {
                 self.remove(id);
                 self.remove(other);
@@ -710,6 +717,12 @@ impl WalkMesh {
                     if (pair_area - original_area).abs() > 1.0e-6 * original_area.max(1.0) {
                         continue;
                     }
+                    let ignore = [id, q1_id, q2_id];
+                    if !self.valid_new_cell(Cell::Quad(pair[0]), &ignore)
+                        || !self.valid_new_cell(Cell::Quad(pair[1]), &ignore)
+                    {
+                        continue;
+                    }
                     let score = pair
                         .iter()
                         .map(|quad| quad_min_sj(&self.points, quad))
@@ -752,34 +765,23 @@ impl WalkMesh {
         out
     }
 
-    /// Sun 2015 §5.2.1 M2/M3: swap the shared edge of a degenerate quad with an
-    /// adjacent quad. The shared edge is replaced by the other diagonal of the
-    /// hexagon; the swap is kept only when both new quads are simple and have a
-    /// strictly positive Jacobian, and the pair with the best minimum Jacobian
-    /// wins.
-    fn repair_quad(&mut self, id: usize) -> bool {
-        let Some(q1) = self.quad(id) else {
-            return false;
-        };
+    /// Best valid edge swap between two quads: replace their shared edge by
+    /// the other diagonal of the hexagon. Returns the score (minimum Jacobian
+    /// of the pair), and the two new quads.
+    fn best_swap_between(
+        &self,
+        q1_id: usize,
+        q2_id: usize,
+    ) -> Option<(f64, [usize; 4], [usize; 4])> {
+        let q1 = self.quad(q1_id)?;
+        let q2 = self.quad(q2_id)?;
         let q1 = normalize_quad(&self.points, q1);
-        let mut best: Option<(f64, usize, [usize; 4], [usize; 4])> = None;
+        let q2 = normalize_quad(&self.points, q2);
+        let original_area = quad_area(&self.points, &q1) + quad_area(&self.points, &q2);
+        let mut best: Option<(f64, [usize; 4], [usize; 4])> = None;
         for i in 0..4 {
             let x = q1[i];
             let y = q1[(i + 1) % 4];
-            let edge = (x.min(y), x.max(y));
-            let owners = self.edge_cells(edge);
-            if owners.len() != 2 {
-                continue;
-            }
-            let other = if owners[0] == id {
-                owners[1]
-            } else {
-                owners[0]
-            };
-            let Some(q2) = self.quad(other) else {
-                continue;
-            };
-            let q2 = normalize_quad(&self.points, q2);
             // Q2 has to traverse the shared edge in the opposite direction.
             let Some(j) = (0..4).find(|&j| q2[j] == y && q2[(j + 1) % 4] == x) else {
                 continue;
@@ -788,9 +790,7 @@ impl WalkMesh {
             let q = q1[(i + 3) % 4];
             let r = q2[(j + 2) % 4];
             let s = q2[(j + 3) % 4];
-            let original_area = quad_area(&self.points, &q1) + quad_area(&self.points, &q2);
-            let options = [([p, q, x, r], [p, r, s, y]), ([q, x, r, s], [q, s, y, p])];
-            for (left, right) in options {
+            for (left, right) in [([p, q, x, r], [p, r, s, y]), ([q, x, r, s], [q, s, y, p])] {
                 let left = normalize_quad(&self.points, left);
                 let right = normalize_quad(&self.points, right);
                 if !quad_simple(&self.points, &left) || !quad_simple(&self.points, &right) {
@@ -798,6 +798,12 @@ impl WalkMesh {
                 }
                 let pair_area = quad_area(&self.points, &left) + quad_area(&self.points, &right);
                 if (pair_area - original_area).abs() > 1.0e-6 * original_area.max(1.0) {
+                    continue;
+                }
+                let ignore = [q1_id, q2_id];
+                if !self.valid_new_cell(Cell::Quad(left), &ignore)
+                    || !self.valid_new_cell(Cell::Quad(right), &ignore)
+                {
                     continue;
                 }
                 let sl = quad_min_sj(&self.points, &left);
@@ -810,9 +816,37 @@ impl WalkMesh {
                     continue;
                 }
                 let score = sl.min(sr);
-                if best.as_ref().is_none_or(|(bs, _, _, _)| score > *bs) {
-                    best = Some((score, other, left, right));
+                if best.as_ref().is_none_or(|(bs, _, _)| score > *bs) {
+                    best = Some((score, left, right));
                 }
+            }
+        }
+        best
+    }
+
+    /// Apply the best swap with one neighbour of `id`.
+    fn repair_quad(&mut self, id: usize) -> bool {
+        let Some(q1) = self.quad(id) else {
+            return false;
+        };
+        let q1 = normalize_quad(&self.points, q1);
+        let mut best: Option<(f64, usize, [usize; 4], [usize; 4])> = None;
+        for i in 0..4 {
+            let edge = (q1[i].min(q1[(i + 1) % 4]), q1[i].max(q1[(i + 1) % 4]));
+            let owners = self.edge_cells(edge);
+            if owners.len() != 2 {
+                continue;
+            }
+            let other = if owners[0] == id {
+                owners[1]
+            } else {
+                owners[0]
+            };
+            let Some((score, left, right)) = self.best_swap_between(id, other) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(bs, _, _, _)| score > *bs) {
+                best = Some((score, other, left, right));
             }
         }
         if let Some((_, other, left, right)) = best {
@@ -935,7 +969,11 @@ impl WalkMesh {
             // Q-Morph quad also touches the line. Accept any simple quad here;
             // `try_template_repair` then runs M2/M3 or restores the mesh.
             let simple = quads.iter().all(|quad| quad_simple(&self.points, quad));
-            if !simple {
+            let ignore = [id, q1_id, q2_id];
+            let manifold = quads
+                .iter()
+                .all(|quad| self.valid_new_cell(Cell::Quad(*quad), &ignore));
+            if !simple || !manifold {
                 self.points.pop();
                 continue;
             }
@@ -962,6 +1000,29 @@ impl WalkMesh {
             .iter()
             .copied()
             .find(|&c| c != exclude && self.quad(c).is_some())
+    }
+
+    /// True when adding `cell` keeps the tiling manifold: every edge on its
+    /// boundary belongs to at most one cell that is not being replaced, and no
+    /// such cell shares more than one edge with it. Two cells sharing two edges
+    /// overlap (the l-bracket regression this check was added for).
+    fn valid_new_cell(&self, cell: Cell, ignore: &[usize]) -> bool {
+        let mut per_cell: HashMap<usize, usize> = HashMap::new();
+        for i in 0..cell.n_nodes() {
+            let edge = cell.edge(i);
+            let mut outside = 0usize;
+            for &owner in self.edge_cells(edge) {
+                if ignore.contains(&owner) {
+                    continue;
+                }
+                outside += 1;
+                *per_cell.entry(owner).or_default() += 1;
+            }
+            if outside > 1 {
+                return false;
+            }
+        }
+        per_cell.values().all(|&count| count <= 1)
     }
 
     fn finish_last(&mut self, mut id: usize) -> bool {

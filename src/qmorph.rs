@@ -43,7 +43,7 @@
 //! [`crate::sun::close_residuals`], Sun's residual-triangle walk with the
 //! boundary M2/M3 and M6 operations of Sun 2015 §5. On the six parts it closes
 //! plate-hole 4/2 mm and stepped completely (68→0, 292→0, 382→0) and leaves
-//! 2/1/6 triangles on plate-hole 1 mm, l-bracket and ring (962→2, 78→1,
+//! 2/3/6 triangles on plate-hole 1 mm, l-bracket and ring (962→2, 78→3,
 //! 64→6); those are isolated interior slivers that no pentagon recombination
 //! can move. The module documentation there records the geometric reason.
 //!
