@@ -68,6 +68,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
 use crate::mesh::{Cell, Mesh, Node};
@@ -85,6 +86,30 @@ const MIN_EDGE: f64 = 0.08;
 const FRONT_GAP: f64 = 1.2;
 /// Rounds of rows before the residual closure takes over.
 const MAX_ROW_ROUNDS: usize = 32;
+
+/// Options for the PAVING route.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Options {
+    /// Distance from a sharp corner to the first sampled boundary node, in sizes.
+    pub corner_margin: f64,
+    /// The smallest front edge length a row may produce, in sizes.
+    pub min_edge_fraction: f64,
+    /// New fronts closer than this to another front are refused, in sizes.
+    pub front_gap: f64,
+    /// Rounds of rows before the residual closure takes over.
+    pub max_row_rounds: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            corner_margin: CORNER_MARGIN,
+            min_edge_fraction: MIN_EDGE,
+            front_gap: FRONT_GAP,
+            max_row_rounds: MAX_ROW_ROUNDS,
+        }
+    }
+}
 
 /// How the quads of a run were produced.
 #[derive(Clone, Copy, Debug, Default)]
@@ -140,12 +165,29 @@ impl Paving {
 /// every front. The result is all-quad unless [`Mesh::topology`] reports a
 /// crack, which the tests check.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
-    mesh_with_stats(domain, sizing).map(|(mesh, _)| mesh)
+    mesh_with_options(domain, sizing, &Options::default())
+}
+
+/// Like [`mesh`], but with explicit [`Options`].
+pub fn mesh_with_options(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<Mesh, String> {
+    mesh_with_stats_options(domain, sizing, options).map(|(mesh, _)| mesh)
 }
 
 /// Like [`mesh`], but also reports how much of the mesh came from paving rows
 /// and how much from the residual matching fallback.
 pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats), String> {
+    mesh_with_stats_options(domain, sizing, &Options::default())
+}
+
+fn mesh_with_stats_options(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<(Mesh, Stats), String> {
     if !sizing.size.is_finite() || sizing.size <= 0.0 {
         return Err("the element size must be positive and finite".to_string());
     }
@@ -156,11 +198,11 @@ pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats)
         return Err("the domain has no area".to_string());
     }
     let h = sizing.size;
-    let mut paving = sample(domain, h)?;
+    let mut paving = sample(domain, h, options)?;
 
     // Row loop: advance the smallest front first, as §2.4 asks. A front whose
     // next row would be invalid is left for the residual closure.
-    for _ in 0..MAX_ROW_ROUNDS {
+    for _ in 0..options.max_row_rounds {
         let mut order: Vec<usize> = (0..paving.loops.len()).collect();
         order.sort_by(|&a, &b| {
             front_length(&paving, a)
@@ -172,7 +214,7 @@ pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats)
             if li >= paving.loops.len() {
                 continue;
             }
-            if let Some(row) = next_row(&paving, li, domain, h) {
+            if let Some(row) = next_row(&paving, li, domain, h, options) {
                 commit_row(&mut paving, li, row);
                 advanced = true;
             }
@@ -278,8 +320,13 @@ fn turn_at(points: &[[f64; 2]], i: usize) -> f64 {
 
 /// Sample one closed loop. Every input vertex is kept; extra nodes are placed
 /// at no more than `h` apart, and no extra node is placed within
-/// `CORNER_MARGIN * h` of a sharp corner on a straight segment.
-fn sample_loop(input: &[[f64; 2]], h: f64, ccw: bool) -> Result<Vec<[f64; 2]>, String> {
+/// `options.corner_margin * h` of a sharp corner on a straight segment.
+fn sample_loop(
+    input: &[[f64; 2]],
+    h: f64,
+    ccw: bool,
+    options: &Options,
+) -> Result<Vec<[f64; 2]>, String> {
     let mut loop_points: Vec<[f64; 2]> = Vec::with_capacity(input.len());
     for &p in input {
         if !p[0].is_finite() || !p[1].is_finite() {
@@ -323,9 +370,13 @@ fn sample_loop(input: &[[f64; 2]], h: f64, ccw: bool) -> Result<Vec<[f64; 2]>, S
         let a = loop_points[i];
         let b = loop_points[(i + 1) % n];
         let length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
-        let start = if sharp[i] { CORNER_MARGIN * h } else { 0.0 };
+        let start = if sharp[i] {
+            options.corner_margin * h
+        } else {
+            0.0
+        };
         let end = if sharp[(i + 1) % n] {
-            CORNER_MARGIN * h
+            options.corner_margin * h
         } else {
             0.0
         };
@@ -386,7 +437,7 @@ fn sample_loop(input: &[[f64; 2]], h: f64, ccw: bool) -> Result<Vec<[f64; 2]>, S
     Ok(out)
 }
 
-fn sample(domain: &Domain, h: f64) -> Result<Paving, String> {
+fn sample(domain: &Domain, h: f64, options: &Options) -> Result<Paving, String> {
     let mut paving = Paving {
         points: Vec::new(),
         fixed: Vec::new(),
@@ -397,9 +448,9 @@ fn sample(domain: &Domain, h: f64) -> Result<Paving, String> {
         row_rounds: 0,
     };
     let mut loops: Vec<Vec<[f64; 2]>> = Vec::new();
-    loops.push(sample_loop(&domain.outer, h, true)?);
+    loops.push(sample_loop(&domain.outer, h, true, options)?);
     for hole in &domain.holes {
-        loops.push(sample_loop(hole, h, false)?);
+        loops.push(sample_loop(hole, h, false, options)?);
     }
     for points in loops {
         let mut ids = Vec::with_capacity(points.len());
@@ -559,7 +610,7 @@ fn quad_ok(points: &[Node], quad: [usize; 4]) -> bool {
         .all(|&a| a.is_finite() && a > 5.0 && a < 175.0)
 }
 
-fn next_row(paving: &Paving, li: usize, domain: &Domain, h: f64) -> Option<Row> {
+fn next_row(paving: &Paving, li: usize, domain: &Domain, h: f64, options: &Options) -> Option<Row> {
     let old = paving.loops.get(li)?.clone();
     let n = old.len();
     if n < 6 {
@@ -586,7 +637,7 @@ fn next_row(paving: &Paving, li: usize, domain: &Domain, h: f64) -> Option<Row> 
     for i in 0..n {
         let a = new_points[i];
         let b = new_points[(i + 1) % n];
-        if ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt() < MIN_EDGE * h {
+        if ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt() < options.min_edge_fraction * h {
             return None;
         }
     }
@@ -596,7 +647,7 @@ fn next_row(paving: &Paving, li: usize, domain: &Domain, h: f64) -> Option<Row> 
             continue;
         }
         for p in &new_points {
-            if loop_distance(paving, *p, other) < FRONT_GAP * h {
+            if loop_distance(paving, *p, other) < options.front_gap * h {
                 return None;
             }
         }
@@ -1339,6 +1390,23 @@ mod tests {
         assert!(stats.row_quads > 0);
         assert!(stats.row_rounds > 0);
         assert!(stats.row_share() > 0.0 && stats.row_share() < 100.0);
+    }
+
+    #[test]
+    fn a_non_default_option_set_still_produces_a_valid_mesh() {
+        let domain = Domain::rectangle(10.0, 10.0).unwrap();
+        let sizing = Sizing::uniform(1.0).unwrap();
+        let options = Options {
+            max_row_rounds: 8,
+            ..Options::default()
+        };
+        let mesh = mesh_with_options(&domain, &sizing, &options).unwrap();
+        assert!(all_quads(&mesh), "the square must come out all-quad");
+        let gate = verify::gate(&mesh);
+        assert_eq!(gate.cracks, 0);
+        assert_eq!(gate.triangles, 0);
+        assert!(gate.passes(), "{:?}", gate.reason());
+        assert!(verify::boundary_offset(&domain, &mesh) < 1e-9);
     }
 
     #[test]

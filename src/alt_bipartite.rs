@@ -67,6 +67,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use crate::mesh::{Cell, Mesh, Node};
 use crate::parity;
 use crate::two_d::{Domain, Sizing};
@@ -117,6 +119,34 @@ const STEINER_FRACTION: f64 = 0.25;
 
 /// Repositioning sweeps of the final vertex stencils.
 const REPOSITION_ROUNDS: usize = 8;
+
+/// Tuning of the right-angled + bipartite-labelling route.
+///
+/// The defaults reproduce the constants the route was measured with, so
+/// [`Options::default`] leaves every result unchanged.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Options {
+    /// Upper bound on the right-angle flip sweeps (§4).
+    pub flip_rounds: usize,
+    /// Upper bound on label-smoothing sweeps per call (§5.1/§5.2).
+    pub label_passes: usize,
+    /// Upper bound on monochromatic-triangle repair rounds (§5.1).
+    pub repair_rounds: usize,
+    /// Upper bound on Steiner points, as a fraction of the input triangle
+    /// count (§5.1).
+    pub steiner_fraction: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            flip_rounds: FLIP_ROUNDS,
+            label_passes: LABEL_PASSES,
+            repair_rounds: REPAIR_ROUNDS,
+            steiner_fraction: STEINER_FRACTION,
+        }
+    }
+}
 
 /// Measurements of one [`mesh_with_stats`] run.
 #[derive(Clone, Debug, Default)]
@@ -169,11 +199,29 @@ impl Stats {
 
 /// Mesh the domain with the right-angled + bipartite-labelling route.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
-    mesh_with_stats(domain, sizing).map(|(mesh, _)| mesh)
+    mesh_with_options(domain, sizing, &Options::default())
 }
 
 /// Same as [`mesh`], returning the run's measurements as well.
 pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats), String> {
+    mesh_with_options_and_stats(domain, sizing, &Options::default())
+}
+
+/// Same as [`mesh`], with explicit [`Options`].
+pub fn mesh_with_options(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<Mesh, String> {
+    mesh_with_options_and_stats(domain, sizing, options).map(|(mesh, _)| mesh)
+}
+
+/// Same as [`mesh_with_options`], returning the run's measurements as well.
+pub fn mesh_with_options_and_stats(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<(Mesh, Stats), String> {
     let mut stats = Stats::default();
     // §3 approximation: the paper's frontal, cross-field-guided point placement
     // is not implemented, so the interior is seeded with a field-aligned grid
@@ -208,7 +256,8 @@ pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats)
 
     // §4: push the triangulation towards right angles.
     stats.right_angles_before = count_right_angles(&points, &tris);
-    stats.right_angle_flips = right_angle_flips(&points, &mut tris, FLIP_ROUNDS, sizing.size);
+    stats.right_angle_flips =
+        right_angle_flips(&points, &mut tris, options.flip_rounds, sizing.size);
     stats.right_angles_after = count_right_angles(&points, &tris);
 
     let Some(loops) = boundary_loops(&tris) else {
@@ -223,7 +272,7 @@ pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats)
 
     // §5.1: alternate the labels along the boundary, then choose the interior.
     let (mut colour, mut fixed) = label(&points, &tris, &loops, &owners);
-    stats.label_flips = smooth_labels(&mut colour, &fixed, &points, &tris, &owners);
+    stats.label_flips = smooth_labels(&mut colour, &fixed, &points, &tris, &owners, options);
     stats.mono_initial = count_mono(&tris, &colour);
 
     // Build the quads, then try to repair the labelling locally if the pairing
@@ -235,6 +284,7 @@ pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats)
         &mut fixed,
         sizing.size,
         domain,
+        options,
     );
     let mut retry_flips = 0usize;
     if assembled.inverted > 0 || assembled.overlaps > 0 {
@@ -259,6 +309,7 @@ pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats)
                 &mut trial_fixed,
                 sizing.size,
                 domain,
+                options,
             );
             if attempt.inverted == 0 && attempt.overlaps == 0 {
                 let better = best
@@ -348,8 +399,9 @@ fn assemble(
     fixed: &mut Vec<bool>,
     size: f64,
     domain: &Domain,
+    options: &Options,
 ) -> Assembled {
-    let (steiner, repair_flips) = repair_monochromatic(points, tris, colour, fixed);
+    let (steiner, repair_flips) = repair_monochromatic(points, tris, colour, fixed, options);
     let owners = edge_owners(tris);
     let (mut quads, mut leftover, _) = pair_triangles(points, tris, colour, &owners);
     let merged = merge_doublets(points, &mut quads);
@@ -1110,11 +1162,12 @@ fn smooth_labels(
     points: &[Node],
     tris: &[[usize; 3]],
     owners: &HashMap<Edge, Vec<usize>>,
+    options: &Options,
 ) -> usize {
     let labeller = Labeller::new(points, tris, owners, fixed);
     let n = colour.len();
     let mut flips = 0usize;
-    for _ in 0..LABEL_PASSES {
+    for _ in 0..options.label_passes {
         let mut changed = 0usize;
         for v in 0..n {
             if labeller.fixed.get(v).copied().unwrap_or(false) {
@@ -1268,11 +1321,12 @@ fn repair_monochromatic(
     tris: &mut Vec<[usize; 3]>,
     colour: &mut Vec<u8>,
     fixed: &mut Vec<bool>,
+    options: &Options,
 ) -> (usize, usize) {
-    let split_cap = 32 + (tris.len() as f64 * STEINER_FRACTION) as usize;
+    let split_cap = 32 + (tris.len() as f64 * options.steiner_fraction) as usize;
     let mut steiner = 0usize;
     let mut label_flips = 0usize;
-    for _ in 0..REPAIR_ROUNDS {
+    for _ in 0..options.repair_rounds {
         let owners = edge_owners(tris);
         let mono: Vec<usize> = (0..tris.len())
             .filter(|&id| {
@@ -1335,7 +1389,7 @@ fn repair_monochromatic(
         }
         *tris = rebuilt;
         let owners = edge_owners(tris);
-        label_flips += smooth_labels(colour, fixed, points, tris, &owners);
+        label_flips += smooth_labels(colour, fixed, points, tris, &owners, options);
     }
     (steiner, label_flips)
 }
@@ -2069,5 +2123,31 @@ mod tests {
         assert!((stats.paired_fraction() - 1.0).abs() < 1.0e-12);
         assert_eq!(stats.mono_left, 0);
         assert_eq!(stats.inverted_left, 0);
+    }
+
+    #[test]
+    fn non_default_options_produce_a_valid_mesh() {
+        // A reduced budget must still return a valid mesh: a few triangles may
+        // be left unpaired, but there are no cracks and the boundary is intact.
+        let options = Options {
+            flip_rounds: 10,
+            label_passes: 8,
+            repair_rounds: 20,
+            steiner_fraction: 0.05,
+        };
+        let domain = square();
+        let sizing = Sizing::uniform(5.0).unwrap();
+        let (mesh, _) = mesh_with_options_and_stats(&domain, &sizing, &options).unwrap();
+        assert!(!mesh.cells.is_empty());
+        assert!(mesh.cells.iter().all(|cell| matches!(
+            cell.kind,
+            crate::mesh::Kind::Quad4 | crate::mesh::Kind::Tri3
+        )));
+        let gate = verify::gate(&mesh);
+        assert_eq!(gate.cracks, 0, "{gate:?}");
+        assert!(
+            verify::boundary_offset(&domain, &mesh) < 1.0e-9,
+            "boundary moved"
+        );
     }
 }

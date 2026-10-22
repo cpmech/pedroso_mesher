@@ -72,6 +72,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use crate::mesh::{Cell, Mesh, Node};
 use crate::two_d::{Domain, Sizing};
 
@@ -115,11 +117,43 @@ const MAX_SPLITS: usize = 32;
 /// of one flat polygon vertex per sampling point.
 const SMOOTH_TURN_DEG: f64 = 25.0;
 
+/// Options for the quadtree route.
+///
+/// [`Options::default`] uses the constants the route was tuned with, so the
+/// default output is the measured table of `examples/alt_quadtree.rs`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Options {
+    /// Grid-density factor: every leaf diagonal is at most
+    /// `cell_factor * sizing.size`.  `1.0` is the paper's density and larger
+    /// values coarsen the mesh; must lie in `[0.25, 4]`.
+    pub cell_factor: f64,
+    /// How many deterministic grid alignments are tried per attempt before the
+    /// mesh with the best measured gate score is accepted.  Must be at least 1.
+    pub alignments: usize,
+    /// Repelling distance as a fraction of the local square side; `0.0` turns
+    /// repelling off around a grid corner.
+    pub delta_fraction: f64,
+    /// How many times the whole grid is rebuilt at half the spacing before the
+    /// route fails.  Must lie in `[1, 32]`.
+    pub max_attempts: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            cell_factor: DEFAULT_CELL_FACTOR,
+            alignments: ALIGNMENTS,
+            delta_fraction: DELTA_FRACTION,
+            max_attempts: MAX_ATTEMPTS,
+        }
+    }
+}
+
 /// Mesh a planar domain with the cleanup-free quadtree route.
 ///
-/// Uses [`DEFAULT_CELL_FACTOR`].
+/// Uses [`Options::default`].
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
-    mesh_with_cell_factor(domain, sizing, DEFAULT_CELL_FACTOR)
+    mesh_with_options(domain, sizing, &Options::default())
 }
 
 /// Mesh with an explicit grid-density factor: every leaf diagonal is at most
@@ -131,8 +165,31 @@ pub fn mesh_with_cell_factor(
     sizing: &Sizing,
     cell_factor: f64,
 ) -> Result<Mesh, String> {
-    if !cell_factor.is_finite() || !(0.25..=4.0).contains(&cell_factor) {
+    mesh_with_options(
+        domain,
+        sizing,
+        &Options {
+            cell_factor,
+            ..Options::default()
+        },
+    )
+}
+
+/// Mesh a planar domain with the cleanup-free quadtree route, using explicit
+/// [`Options`].
+pub fn mesh_with_options(
+    domain: &Domain,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<Mesh, String> {
+    if !options.cell_factor.is_finite() || !(0.25..=4.0).contains(&options.cell_factor) {
         return Err("the cell factor must be in [0.25, 4]".to_string());
+    }
+    if options.alignments == 0 {
+        return Err("at least one grid alignment is required".to_string());
+    }
+    if !(1..=32).contains(&options.max_attempts) {
+        return Err("the number of attempts must be in [1, 32]".to_string());
     }
     if !sizing.size.is_finite() || sizing.size <= 0.0 {
         return Err("the element size must be positive and finite".to_string());
@@ -158,12 +215,21 @@ pub fn mesh_with_cell_factor(
     // line produces a thin sliver.  Try a few deterministic alignments and
     // keep the best mesh; refine the whole grid only if every alignment fails
     // to assemble a conforming mesh.
-    for level in 0..MAX_ATTEMPTS {
-        let target = cell_factor * sizing.size / std::f64::consts::SQRT_2 / (1u32 << level) as f64;
+    for level in 0..options.max_attempts {
+        let target =
+            options.cell_factor * sizing.size / std::f64::consts::SQRT_2 / (1u32 << level) as f64;
         let mut best: Option<(f64, Mesh)> = None;
-        for variant in 0..ALIGNMENTS {
-            let variant = level * ALIGNMENTS + variant;
-            match build(domain, target, &bbox, &axis_vertices, &vertices, variant) {
+        for variant in 0..options.alignments {
+            let variant = level * options.alignments + variant;
+            match build(
+                domain,
+                target,
+                &bbox,
+                &axis_vertices,
+                &vertices,
+                options,
+                variant,
+            ) {
                 Ok(candidate) => {
                     let score = mesh_score(&candidate);
                     if best.as_ref().is_none_or(|(s, _)| score > *s) {
@@ -308,6 +374,7 @@ fn build(
     bbox: &[f64; 4],
     axis_vertices: &[[f64; 2]],
     vertices: &[[f64; 2]],
+    options: &Options,
     variant: usize,
 ) -> Result<Mesh, String> {
     if target <= 0.0 || !target.is_finite() {
@@ -348,7 +415,7 @@ fn build(
             [xs[i], ys[j]]
         })
         .collect();
-    let pos = repel(domain, &xs, &ys, &grid_xy, nx, ny)?;
+    let pos = repel(domain, &xs, &ys, &grid_xy, nx, ny, options)?;
 
     let mut points = Vec::with_capacity(n_nodes);
     let mut pool = HashMap::with_capacity(n_nodes * 2);
@@ -564,13 +631,14 @@ fn repel(
     grid_xy: &[[f64; 2]],
     nx: usize,
     ny: usize,
+    options: &Options,
 ) -> Result<Vec<[f64; 2]>, String> {
     let mut delta = vec![0.0f64; grid_xy.len()];
     for j in 0..ny {
         for i in 0..nx {
             let w = xs[i + 1] - xs[i];
             let h = ys[j + 1] - ys[j];
-            let local = DELTA_FRACTION * w.min(h);
+            let local = options.delta_fraction * w.min(h);
             for &(di, dj) in &[(0, 0), (1, 0), (0, 1), (1, 1)] {
                 let id = (j + dj) * (nx + 1) + i + di;
                 delta[id] = if delta[id] <= 0.0 {
@@ -2258,6 +2326,24 @@ mod tests {
         assert!(verify::boundary_offset(&domain, &coarse) < 1.0e-6);
         assert!(mesh_with_cell_factor(&domain, &sizing, 0.0).is_err());
         assert!(mesh_with_cell_factor(&domain, &sizing, 5.0).is_err());
+    }
+
+    #[test]
+    fn non_default_options_still_produce_a_valid_mesh() {
+        let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
+        let sizing = Sizing::uniform(4.0).unwrap();
+        let options = Options {
+            cell_factor: 2.0,
+            alignments: 1,
+            ..Options::default()
+        };
+        let mesh = mesh_with_options(&domain, &sizing, &options).unwrap();
+        assert_eq!(quad_count(&mesh), mesh.cells.len());
+        let gate = verify::gate(&mesh);
+        assert_eq!(gate.triangles, 0);
+        assert_eq!(gate.cracks, 0, "{gate:?}");
+        assert!(verify::boundary_offset(&domain, &mesh) < 1.0e-6);
+        assert!(gate.passes(), "{gate:?} {:?}", gate.reason());
     }
 
     #[test]
