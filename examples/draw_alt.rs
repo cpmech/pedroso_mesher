@@ -123,12 +123,18 @@ fn main() {
     let quadtree = pedroso_mesher::alt_quadtree::mesh(&domain, &sizing).ok();
     // bipartite (right-angled + labelling)
     let bipartite = pedroso_mesher::alt_bipartite::mesh(&domain, &sizing).ok();
+    // L-infinity frontal Delaunay (best quality, 2 triangles on some parts)
+    let l1 = pedroso_mesher::alt_l1::mesh(&domain, &sizing).ok();
+    // decomposition + templates (structured blocks; acute corners on plates)
+    let decompose = pedroso_mesher::alt_decompose::mesh(&domain, &sizing).ok();
 
     for (label, mesh) in [
         ("product", product),
         ("paving", paving),
         ("quadtree", quadtree),
         ("bipartite", bipartite),
+        ("l1", l1),
+        ("decompose", decompose),
     ] {
         let Some(mut mesh) = mesh else {
             println!("{label}: no mesh");
