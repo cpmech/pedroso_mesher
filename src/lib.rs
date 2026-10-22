@@ -22,6 +22,7 @@ pub mod io;
 pub mod mesh;
 pub mod msh;
 pub mod quality;
+pub mod recovery;
 pub mod two_d;
 
 pub use bench::{Part, PARTS};
