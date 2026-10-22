@@ -1,0 +1,151 @@
+//! Draw the two leading routes side by side on one part.
+//!
+//! `cargo run --release --offline --example draw_alt -- plate-hole-2mm`
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use pedroso_mesher::draw::{self, MeshDrawOptions};
+use pedroso_mesher::mesh::{Cell, Mesh};
+use pedroso_mesher::quad::{self, QuadError};
+use pedroso_mesher::sun;
+use pedroso_mesher::two_d::{smooth_mesh, Domain, Sizing};
+use pedroso_mesher::verify;
+
+fn quad_cells(mesh: &Mesh) -> Vec<[usize; 4]> {
+    mesh.cells
+        .iter()
+        .filter(|c| c.nodes.len() == 4)
+        .map(|c| [c.nodes[0], c.nodes[1], c.nodes[2], c.nodes[3]])
+        .collect()
+}
+
+fn tri_cells(mesh: &Mesh) -> Vec<[usize; 3]> {
+    mesh.cells
+        .iter()
+        .filter(|c| c.nodes.len() == 3)
+        .map(|c| [c.nodes[0], c.nodes[1], c.nodes[2]])
+        .collect()
+}
+
+fn cells_of(quads: &[[usize; 4]], tris: &[[usize; 3]]) -> Vec<Cell> {
+    let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
+    cells.extend(tris.iter().map(|t| Cell::tri3(*t)));
+    cells
+}
+
+/// The same post-pass the agents measure with (W2 smoothing, angle swaps,
+/// boundary-aware perturbation), so the figures show what the gate sees.
+fn post_pass(domain: &Domain, mesh: &mut Mesh, size: f64) {
+    smooth_mesh(mesh, domain, 80, size);
+    let (p, q, t, _) = sun::improve_quality(&mesh.points, &quad_cells(mesh), &tri_cells(mesh), 12);
+    *mesh = Mesh::new(p, cells_of(&q, &t));
+    let (p, q, t, _) = sun::perturb_low_quads(
+        &mesh.points,
+        &quad_cells(mesh),
+        &tri_cells(mesh),
+        size,
+        200,
+        Some(domain),
+    );
+    *mesh = Mesh::new(p, cells_of(&q, &t));
+}
+
+fn part(name: &str) -> (Domain, f64) {
+    match name {
+        "plate-hole-4mm" => (Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap(), 4.0),
+        "plate-hole-2mm" => (Domain::plate_with_hole(100.0, 60.0, 10.0, 24).unwrap(), 2.0),
+        "plate-hole-1mm" => (Domain::plate_with_hole(100.0, 60.0, 10.0, 48).unwrap(), 1.0),
+        "l-bracket" => (
+            Domain::new(
+                vec![
+                    [0.0, 0.0],
+                    [80.0, 0.0],
+                    [80.0, 20.0],
+                    [20.0, 20.0],
+                    [20.0, 60.0],
+                    [0.0, 60.0],
+                ],
+                vec![],
+            )
+            .unwrap(),
+            2.0,
+        ),
+        "stepped" => (
+            Domain::new(
+                vec![
+                    [0.0, 0.0],
+                    [60.0, 0.0],
+                    [60.0, 40.0],
+                    [30.0, 40.0],
+                    [30.0, 30.0],
+                    [20.0, 30.0],
+                    [20.0, 40.0],
+                    [0.0, 40.0],
+                ],
+                vec![],
+            )
+            .unwrap(),
+            1.0,
+        ),
+        _ => (Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap(), 4.0),
+    }
+}
+
+fn main() {
+    let name = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "plate-hole-2mm".to_string());
+    let (domain, size) = part(&name);
+    let sizing = Sizing::uniform(size).unwrap();
+    std::fs::create_dir_all("figures/alts").unwrap();
+
+    // current product (Q-Morph; the failing mesh is carried by the error)
+    let product = match quad::mesh_quads(&domain, &sizing) {
+        Ok(q) => Some(q.mesh),
+        Err(QuadError::Unsupported(u)) => Some(u.mesh),
+        Err(_) => None,
+    };
+    // paving
+    let paving = pedroso_mesher::alt_paving::mesh(&domain, &sizing).ok();
+    // quadtree (grid-like all-quad)
+    let quadtree = pedroso_mesher::alt_quadtree::mesh(&domain, &sizing).ok();
+    // bipartite (right-angled + labelling)
+    let bipartite = pedroso_mesher::alt_bipartite::mesh(&domain, &sizing).ok();
+
+    for (label, mesh) in [
+        ("product", product),
+        ("paving", paving),
+        ("quadtree", quadtree),
+        ("bipartite", bipartite),
+    ] {
+        let Some(mut mesh) = mesh else {
+            println!("{label}: no mesh");
+            continue;
+        };
+        post_pass(&domain, &mut mesh, size);
+        let gate = verify::gate(&mesh);
+        let title = format!(
+            "{name} — {label}: {} quads, {} tri, SJ {:.3}, {:.1}°, off {:.1e}",
+            gate.quads,
+            gate.triangles,
+            gate.min_scaled_jacobian,
+            gate.min_corner_angle_deg,
+            verify::boundary_offset(&domain, &mesh)
+        );
+        let opts = MeshDrawOptions {
+            title,
+            color_by_gate_margin: true,
+            mark_nodes: false,
+            figure_inches: (9.0, 6.0),
+        };
+        let path = format!("figures/alts/{name}-{label}.png");
+        draw::draw_domain_with_mesh(&domain, &mesh, &path, &opts).unwrap();
+        println!(
+            "{label:8} q {:5} tri {:3} SJ {:.3} ang {:.1} {} -> {path}",
+            gate.quads,
+            gate.triangles,
+            gate.min_scaled_jacobian,
+            gate.min_corner_angle_deg,
+            if gate.passes() { "PASS" } else { "FAIL" }
+        );
+    }
+}

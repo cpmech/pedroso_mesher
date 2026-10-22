@@ -47,3 +47,7 @@ pub mod alt_paving;
 pub mod alt_hybrid;
 
 pub mod alt_untangle;
+
+pub mod alt_quadtree;
+
+pub mod alt_bipartite;
