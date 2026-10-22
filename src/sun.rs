@@ -773,7 +773,38 @@ impl WalkMesh {
         false
     }
 
-    /// The boundary cycle of a connected region of cells, or `None` when the
+    /// Drop a boundary vertex that lies on a straight domain boundary between
+    /// its two loop neighbours. No outside cell uses those two boundary edges,
+    /// so merging them into one straight edge stays conforming and removes the
+    /// collinear nodes that make the cavity DP degenerate.
+    fn simplify_boundary_loop(&self, loopv: &mut Vec<usize>) {
+        loop {
+            let n = loopv.len();
+            if n <= 4 {
+                return;
+            }
+            let mut removed = false;
+            for i in 0..n {
+                let a = loopv[(i + n - 1) % n];
+                let b = loopv[i];
+                let c = loopv[(i + 1) % n];
+                let ab = (a.min(b), a.max(b));
+                let bc = (b.min(c), b.max(c));
+                if self.is_boundary_edge(ab)
+                    && self.is_boundary_edge(bc)
+                    && collinear(self.p(a), self.p(b), self.p(c))
+                {
+                    loopv.remove(i);
+                    removed = true;
+                    break;
+                }
+            }
+            if !removed {
+                return;
+            }
+        }
+    }
+
     /// region is not simply connected (a hole or several loops).
     fn region_boundary(&self, region: &HashSet<usize>) -> Option<Vec<usize>> {
         let mut counts: HashMap<(usize, usize), usize> = HashMap::new();
@@ -861,29 +892,54 @@ impl WalkMesh {
     /// residuals are used as seeds when available, so the cavity boundary has
     /// even parity; a lone residual grows until the cavity touches a domain
     /// boundary edge, which is split with one point (the non-local Fig. 6).
-    fn cavity_one(&mut self) -> bool {
+    fn cavity_one(&mut self, size: f64) -> bool {
         let ids = self.tri_ids();
         for id in ids {
-            if self.cavity_close(id) {
+            if self.cavity_close(id, size) {
                 return true;
             }
         }
         false
     }
 
-    fn cavity_close(&mut self, seed: usize) -> bool {
+    fn cavity_close(&mut self, seed: usize, size: f64) -> bool {
+        // 0. Compact region grown by Euclidean radius. A one-cell corridor is
+        // often too thin to quadrangulate; a disk around the residual is not.
+        if size > 0.0 {
+            for factor in [
+                2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0, 30.0, 40.0,
+            ] {
+                let region = self.compact_region(seed, factor * size);
+                if region.len() > 1 && self.try_cavity_region(&region) {
+                    return true;
+                }
+            }
+        }
         // 1. Corridor to another residual: the pair gives an even boundary and
         // the DP is not forced to quadrangulate the sliver alone.
         if let Some(partner) = self.nearest_tris(seed).into_iter().next() {
             if partner != seed {
-                if let Some(mut region) = self.path_region(seed, partner, 30) {
+                if let Some(mut region) = self.path_region(seed, partner, 120) {
                     for _ in 0..4 {
                         if self.try_cavity_region(&region) {
                             return true;
                         }
-                        if !self.expand_region(&mut region, 60) {
+                        if !self.expand_region(&mut region, 200) {
                             break;
                         }
+                    }
+                }
+            }
+        }
+        // 1b. Compact region around both residuals (no hole between them).
+        if let Some(partner) = self.nearest_tris(seed).into_iter().next() {
+            if partner != seed && size > 0.0 {
+                for factor in [
+                    2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0, 30.0, 40.0,
+                ] {
+                    let region = self.compact_region_both(seed, partner, factor * size);
+                    if region.len() > 2 && self.try_cavity_region(&region) {
+                        return true;
                     }
                 }
             }
@@ -892,12 +948,12 @@ impl WalkMesh {
         // the boundary edge is split before the quadrangulation.
         if let Some(target) = self.nearest_boundary_cell(seed) {
             if target != seed {
-                if let Some(mut region) = self.path_region(seed, target, 40) {
+                if let Some(mut region) = self.path_region(seed, target, 160) {
                     for _ in 0..4 {
                         if self.try_cavity_region(&region) {
                             return true;
                         }
-                        if !self.expand_region(&mut region, 60) {
+                        if !self.expand_region(&mut region, 200) {
                             break;
                         }
                     }
@@ -918,6 +974,85 @@ impl WalkMesh {
             }
         }
         false
+    }
+
+    /// Connected quads within `radius` of the seed's centre, plus the seed.
+    fn compact_region(&self, seed: usize, radius: f64) -> HashSet<usize> {
+        let Some(center) = self.center(seed) else {
+            return HashSet::from([seed]);
+        };
+        let mut region: HashSet<usize> = HashSet::from([seed]);
+        loop {
+            let mut candidates = Vec::new();
+            for &id in region.iter() {
+                let Some(cell) = self.cell(id) else {
+                    continue;
+                };
+                for i in 0..cell.n_nodes() {
+                    for &other in self.edge_cells(cell.edge(i)) {
+                        if region.contains(&other) || self.quad(other).is_none() {
+                            continue;
+                        }
+                        let Some(c) = self.center(other) else {
+                            continue;
+                        };
+                        if (c[0] - center[0]).hypot(c[1] - center[1]) <= radius {
+                            candidates.push(other);
+                        }
+                    }
+                }
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+            if candidates.is_empty() {
+                break;
+            }
+            for other in candidates {
+                region.insert(other);
+            }
+        }
+        region
+    }
+
+    /// Connected quads within `radius` of the midpoint of two residuals, with
+    /// both residuals included. This avoids a hole in the region when the two
+    /// residuals are close enough to cover together.
+    fn compact_region_both(&self, a: usize, b: usize, radius: f64) -> HashSet<usize> {
+        let (Some(ca), Some(cb)) = (self.center(a), self.center(b)) else {
+            return HashSet::from([a, b]);
+        };
+        let center = [(ca[0] + cb[0]) * 0.5, (ca[1] + cb[1]) * 0.5];
+        let mut region: HashSet<usize> = HashSet::from([a, b]);
+        loop {
+            let mut candidates = Vec::new();
+            for &id in region.iter() {
+                let Some(cell) = self.cell(id) else {
+                    continue;
+                };
+                for i in 0..cell.n_nodes() {
+                    for &other in self.edge_cells(cell.edge(i)) {
+                        if region.contains(&other) || self.quad(other).is_none() {
+                            continue;
+                        }
+                        let Some(c) = self.center(other) else {
+                            continue;
+                        };
+                        if (c[0] - center[0]).hypot(c[1] - center[1]) <= radius {
+                            candidates.push(other);
+                        }
+                    }
+                }
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+            if candidates.is_empty() {
+                break;
+            }
+            for other in candidates {
+                region.insert(other);
+            }
+        }
+        region
     }
 
     /// Shortest path from `start` to `target` through quad cells (the end
@@ -1032,6 +1167,7 @@ impl WalkMesh {
                 return false;
             }
         };
+        self.simplify_boundary_loop(&mut loopv);
         let mut inserted = None;
         if loopv.len() % 2 == 1 {
             // Split a domain boundary edge so the polygon becomes even.
@@ -1835,11 +1971,12 @@ pub fn close_by_cavity(
     points: &[Node],
     quads: &[[usize; 4]],
     tris: &[[usize; 3]],
+    size: f64,
 ) -> (Vec<Node>, Vec<[usize; 4]>, Vec<[usize; 3]>, usize) {
     let mut mesh = WalkMesh::new(points, quads, tris);
     let mut closed = 0usize;
     for _ in 0..64 {
-        if !mesh.cavity_one() {
+        if !mesh.cavity_one(size) {
             break;
         }
         closed += 1;

@@ -201,7 +201,7 @@ fn run(name: &str, d: &Domain, size: f64) {
         }
         let before = tri_cells(&mesh).len();
         let (points, quads, tris, closed) =
-            sun::close_by_cavity(&mesh.points, &quad_cells(&mesh), &tri_cells(&mesh));
+            sun::close_by_cavity(&mesh.points, &quad_cells(&mesh), &tri_cells(&mesh), size);
         cavity_closed += closed;
         let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
         cells.extend(tris.iter().map(|t| Cell::tri3(*t)));
