@@ -26,6 +26,15 @@
 //!    the integer solve of eq. (5.1), and Coons-meshes every tile. This path
 //!    needs no cross field: the tiling is built from the size function.
 //!    Otherwise, or when it fails, the next steps run.
+//!
+//!    A second, opt-in graded route goes through Chapter 5 instead:
+//!    [`Options::seeded`] runs the cross field, injects the Section 5.1.4
+//!    valence-3/5 pairs ([`crate::simons_seeded`]), builds the seeded
+//!    motorcycle graph and simple tiles, meshes their Coons patches and
+//!    stitches the result. Its measured numbers are in "The graded path and
+//!    its measured numbers" below: it does **not** beat the metric tile grid
+//!    on the two task cases, so the metric route stays the default.
+//!
 //! 4. **Cross field (Section 3.3, Algorithm 1).**
 //!    [`crate::simons_godf::solve_with_options`] with `accurate: true` (the
 //!    curvature-aware GODF Appendix D integrals) and `holomorphic: 0` (the
@@ -92,6 +101,38 @@
 //! gives `1.878`; `K = 8` collapses (every column ideal count is below 0.5),
 //! which is the stepwise-count trend behind the derived `K = 4`.
 //!
+//! ## The seeded Section 5.1.4 field path (measured, opt-in)
+//!
+//! [`Options::seeded`] runs GODF with `accurate = true` and
+//! [`crate::simons_godf::BoundaryMode::Tangent`], injects
+//! `pairs = 3` valence-3/5 pairs along the size gradient
+//! ([`crate::simons_seeded::pair_positions`]), and builds the QGP tiles and the
+//! stitch from the seeded field. Measured on the 10x10 square with
+//! `sigma = 1 + 0.5 x`, `base_size = 1`:
+//!
+//! * the seeded field detects `(5, 5)` singularities and the motorcycle graph
+//!   keeps 4 tiles (19 collapsed); the interior is 7 quads covering 25.9 % of
+//!   the area with `worst = 1.557`. The pipeline rejects the attempt at the
+//!   coverage guard (`< 98 %`) instead of stitching a mesh with holes; even
+//!   bypassing the guard, the stitch fails for 1-4 pairs (every carve radius
+//!   between `1.4 sigma` and `3.6 sigma` removes every quad, or the QGP solve
+//!   collapses every tile);
+//! * the 2D case `sigma = 1 + 0.3 x + 0.3 y` is the same (1 tile, 2 quads,
+//!   21.4 % coverage, `worst = 1.410`).
+//!
+//! The reason is structural: at the target density (~17 quads over 10x10) the
+//! sparse pair set cuts the domain into tiles that are still larger than the
+//! local size, so most of them collapse (Section 5.1.6) and only a quarter of
+//! the area is meshed. The one-tile
+//! §5.1.4 relaxation cannot fix it either: for the whole-domain ideals
+//! `[3.6, 1.7, 3.6, 10]`, a pair that relieves the vertical discrepancy
+//! `10 - 1.7` also unbalances the horizontal pair by the same amount, so the
+//! redirection penalty keeps the strict (collapsed) counts
+//! ([`crate::simons_seeded::relaxed_counts`] returns `k = 0`). The pairs only
+//! pay off after the motorcycle graph has already cut the domain into tiles
+//! whose ideals are nearly consistent. Therefore `seeded = false` is the
+//! default and [`SOURCE_GRADED`] remains the shipped graded route.
+//!
 //! When the graded path is not applicable or fails, the cross-field QGP +
 //! stitch route runs exactly as before. When that route fails on a graded
 //! rectangle, the channel fallback is still uniform (its first size is the
@@ -125,6 +166,7 @@ use crate::quality;
 use crate::simons_godf;
 use crate::simons_graded;
 use crate::simons_regions;
+use crate::simons_seeded;
 use crate::simons_smooth;
 use crate::two_d::{self, Domain, Sizing};
 use crate::verify;
@@ -150,6 +192,9 @@ pub const SOURCE_QGP: &str = "qgp+stitch";
 
 /// The graded tile-grid QGP route of [`crate::simons_graded`].
 pub const SOURCE_GRADED: &str = "graded-qgp";
+
+/// The Chapter 5 seeded-field route of [`crate::simons_seeded`].
+pub const SOURCE_SEEDED: &str = "seeded-qgp";
 
 /// The Chapter 2 channel fallback route.
 pub const SOURCE_CHANNEL: &str = "channel";
@@ -192,6 +237,16 @@ pub struct Options {
     /// It runs after the thesis angle + stretch smoothing and is kept only if
     /// the gate survives (see [`crate::smooth::smooth_with_targets`]).
     pub size_weight: f64,
+
+    /// Prefer the Chapter 5 seeded-field route ([`SOURCE_SEEDED`]) on a graded
+    /// rectangle: GODF with the accurate integrals and a tangent boundary, the
+    /// Section 5.1.4 valence-3/5 pairs of [`crate::simons_seeded`], the seeded
+    /// QGP tiles and the stitch. The default, `false`, keeps the metric tile
+    /// grid. The seeded route falls back to the metric grid (or, when that is
+    /// disabled, to the ordinary QGP/stitch and channel routes) when it cannot
+    /// produce a domain-covering mesh. Measured: it does not beat the metric
+    /// grid on the task cases (see the module documentation).
+    pub seeded: bool,
 }
 
 impl Default for Options {
@@ -203,6 +258,7 @@ impl Default for Options {
             tiles: (0, 0),
             graded: true,
             size_weight: 1.0,
+            seeded: false,
         }
     }
 }
@@ -229,6 +285,18 @@ pub struct Trace {
     pub graded: Option<simons_graded::Info>,
     /// Why the graded path was not used, when it was requested and failed.
     pub graded_error: Option<String>,
+    /// Number of Section 5.1.4 pairs placed by the seeded-field attempt.
+    pub seeded_pairs: usize,
+    /// `(valence-3, valence-5)` singularities the seeded field detected.
+    pub seeded_detected: (usize, usize),
+    /// Simple tiles of the seeded motorcycle graph.
+    pub seeded_tiles: usize,
+    /// Quads of the seeded interior mesh (before the stitch).
+    pub seeded_interior_quads: usize,
+    /// Fraction of the domain area covered by the seeded interior mesh.
+    pub seeded_coverage: f64,
+    /// Why the seeded-field path was not used or did not produce a mesh.
+    pub seeded_error: Option<String>,
     /// The sampled size variation `sigma_max / sigma_min`.
     pub size_variation: f64,
     /// The QGP failure that forced the channel fallback, if any.
@@ -354,6 +422,19 @@ pub fn demo() -> Result<Report, String> {
     if let Some(error) = &trace.graded_error {
         println!("  graded path failed: {error}");
     }
+    if trace.seeded_pairs > 0 || trace.seeded_error.is_some() {
+        println!(
+            "  seeded path: pairs={} detected={:?} tiles={} interior={} coverage={:.3}",
+            trace.seeded_pairs,
+            trace.seeded_detected,
+            trace.seeded_tiles,
+            trace.seeded_interior_quads,
+            trace.seeded_coverage,
+        );
+    }
+    if let Some(error) = &trace.seeded_error {
+        println!("  seeded path failed: {error}");
+    }
     if let Some(error) = &trace.qgp_error {
         println!("  QGP path failed: {error}");
     }
@@ -408,26 +489,23 @@ where
         ..Trace::default()
     };
 
-    // The graded tile-grid path first: it needs no cross field (the tiling is
-    // built from the size function directly). When it is not applicable or
-    // fails, the original Chapter 3-5 route runs unchanged.
-    let graded_requested = options.graded
-        && variation > GRADED_VARIATION_THRESHOLD
-        && simons_graded::shape(domain).is_some();
-    let (mesh, source, singularities) = if graded_requested {
-        let graded_options = simons_graded::Options {
-            tiles: options.tiles,
-        };
-        match simons_graded::mesh(domain, &graded_options, sigma) {
-            Ok((mesh, info)) => {
-                trace.graded = Some(info);
-                (mesh, SOURCE_GRADED, (0usize, 0usize))
-            }
+    // The graded paths: the metric tile grid (the shipped default) needs no
+    // cross field, and the opt-in Section 5.1.4 seeded field goes through the
+    // Chapter 3-5 chain. When neither is applicable or either fails, the
+    // original Chapter 3-5 route (or the channel fallback) runs unchanged.
+    let graded_shape = simons_graded::shape(domain).is_some();
+    let graded_requested = options.graded && variation > GRADED_VARIATION_THRESHOLD && graded_shape;
+    let seeded_requested = options.seeded && variation > GRADED_VARIATION_THRESHOLD && graded_shape;
+    let (mesh, source, singularities) = if seeded_requested {
+        match seeded_field_path(domain, &points, &tris, sigma, &size, &mut trace) {
+            Ok((mesh, singularities)) => (mesh, SOURCE_SEEDED, singularities),
             Err(error) => {
-                trace.graded_error = Some(error);
-                qgp_or_channel(domain, &points, &tris, sigma, &size, &mut trace)?
+                trace.seeded_error = Some(error);
+                metric_or_qgp(domain, &points, &tris, sigma, &size, options, &mut trace)?
             }
         }
+    } else if graded_requested {
+        metric_or_qgp(domain, &points, &tris, sigma, &size, options, &mut trace)?
     } else {
         qgp_or_channel(domain, &points, &tris, sigma, &size, &mut trace)?
     };
@@ -508,6 +586,159 @@ where
             Ok((mesh, SOURCE_CHANNEL, singularities))
         }
     }
+}
+
+/// The metric tile grid when it is enabled and applicable, otherwise the
+/// ordinary QGP/stitch + channel route.
+fn metric_or_qgp<F>(
+    domain: &Domain,
+    points: &[Node],
+    tris: &[[usize; 3]],
+    sigma: &F,
+    size: &[f64],
+    options: &Options,
+    trace: &mut Trace,
+) -> Result<(Mesh, &'static str, (usize, usize)), String>
+where
+    F: Fn(f64, f64) -> f64,
+{
+    if options.graded && simons_graded::shape(domain).is_some() {
+        let graded_options = simons_graded::Options {
+            tiles: options.tiles,
+        };
+        match simons_graded::mesh(domain, &graded_options, sigma) {
+            Ok((mesh, info)) => {
+                trace.graded = Some(info);
+                Ok((mesh, SOURCE_GRADED, (0usize, 0usize)))
+            }
+            Err(error) => {
+                trace.graded_error = Some(error);
+                qgp_or_channel(domain, points, tris, sigma, size, trace)
+            }
+        }
+    } else {
+        qgp_or_channel(domain, points, tris, sigma, size, trace)
+    }
+}
+
+/// The number of Section 5.1.4 pairs for a sampled size variation.
+///
+/// One pair per doubling of the size gives roughly one chord redirection per
+/// scale, which is what the grading needs; the result is clamped to
+/// `1..=4` so a very aggressive range does not turn the field into noise.
+fn seeded_pair_count(variation: f64) -> usize {
+    if !variation.is_finite() || variation <= 1.0 {
+        return 1;
+    }
+    let count = variation.log2().round();
+    if !count.is_finite() {
+        return 1;
+    }
+    (count.max(1.0) as usize).min(4)
+}
+
+/// The Chapter 5 seeded-field path: GODF with the accurate integrals and a
+/// tangent boundary, the Section 5.1.4 pairs, the seeded QGP tiles, the stitch
+/// and (by the caller) the target-area smoothing.
+///
+/// It returns an error, and the caller falls back to the metric path, when the
+/// seeded field cannot produce a domain-covering stitched mesh. The trace
+/// always records what the attempt measured, including on failure.
+fn seeded_field_path<F>(
+    domain: &Domain,
+    points: &[Node],
+    tris: &[[usize; 3]],
+    sigma: &F,
+    size: &[f64],
+    trace: &mut Trace,
+) -> Result<(Mesh, (usize, usize)), String>
+where
+    F: Fn(f64, f64) -> f64,
+{
+    // Chapter 3 with the thesis' Dirichlet energy, accurate Appendix D
+    // integrals and the tangent boundary the field path asks for.
+    let field_options = simons_godf::Options {
+        accurate: true,
+        holomorphic: 0.0,
+        boundary: simons_godf::BoundaryMode::Tangent,
+        ..simons_godf::Options::default()
+    };
+    let alpha =
+        simons_godf::solve_with_options(points, tris, size, &field_options, GODF_ITERATIONS)
+            .map_err(|error| format!("the cross-field solve failed: {error}"))?;
+
+    // Section 5.1.4: place the neutral-holonomy pairs and seed the field.
+    let requested = seeded_pair_count(trace.size_variation);
+    let pairs = simons_seeded::pair_positions(domain, sigma, requested)
+        .map_err(|error| format!("the pair placement failed: {error}"))?;
+    trace.seeded_pairs = pairs.len();
+    if pairs.is_empty() {
+        return Err(format!(
+            "no valence-3/5 pair fits inside the domain (requested {requested})"
+        ));
+    }
+    let seeded = simons_seeded::seed_field(points, &alpha, &pairs)
+        .map_err(|error| format!("the field seeding failed: {error}"))?;
+    trace.seeded_detected = simons_godf::count_singularities(&seeded, tris);
+
+    // The seeded motorcycle graph and simple tiles. Its interior numbers are
+    // recorded even when the stitch later fails.
+    let regions = simons_regions::build(points, tris, &seeded, size)
+        .map_err(|error| format!("the seeded QGP regions failed: {error}"))?;
+    trace.seeded_tiles = regions.tiles.len();
+    let interior = regions
+        .mesh()
+        .map_err(|error| format!("the seeded QGP tile mesh failed: {error}"))?;
+    trace.seeded_interior_quads = interior.cells.len();
+    let interior_area = mesh_area(&interior);
+    let domain_area = domain.area();
+    trace.seeded_coverage = if domain_area > 0.0 {
+        interior_area / domain_area
+    } else {
+        0.0
+    };
+    if trace.seeded_coverage < 0.98 {
+        return Err(format!(
+            "the seeded QGP tiles cover {:.1} % of the domain (need 98 %)",
+            100.0 * trace.seeded_coverage
+        ));
+    }
+
+    // Stitch the seeded tiles to the boundary with the Chapter 2 channel
+    // (Section 5.1.8.2).
+    let mesh = simons_regions::stitch(points, tris, &seeded, size)
+        .map_err(|error| format!("the seeded stitch failed: {error}"))?;
+    mesh.validate()
+        .map_err(|error| format!("the stitched seeded mesh is invalid: {error}"))?;
+    let coverage = if domain_area > 0.0 {
+        mesh_area(&mesh) / domain_area
+    } else {
+        0.0
+    };
+    if !(0.98..=1.02).contains(&coverage) {
+        return Err(format!(
+            "the stitched seeded mesh covers {:.1} % of the domain (need 98-102 %)",
+            100.0 * coverage
+        ));
+    }
+    let gate = verify::gate(&mesh);
+    if gate.triangles != 0 || gate.inverted != 0 || gate.overlapping != 0 || gate.cracks != 0 {
+        return Err(format!(
+            "the stitched seeded mesh failed the topology gate: {}",
+            gate.reason()
+                .unwrap_or_else(|| "unknown reason".to_string())
+        ));
+    }
+    Ok((mesh, trace.seeded_detected))
+}
+
+/// The area of the `Quad4` cells of a planar mesh.
+fn mesh_area(mesh: &Mesh) -> f64 {
+    mesh.cells
+        .iter()
+        .filter(|cell| cell.kind == Kind::Quad4)
+        .map(|cell| quality::volume(cell, &mesh.points).abs())
+        .sum()
 }
 
 /// Validate the options before doing any work.
@@ -1231,6 +1462,73 @@ mod tests {
         assert_eq!(report.cracks, 0);
         let gate = verify::gate(&report.mesh);
         assert!(gate.passes(), "gate failed: {:?}", gate.reason());
+    }
+
+    #[test]
+    fn the_seeded_pair_count_follows_the_size_variation() {
+        assert_eq!(seeded_pair_count(1.0), 1);
+        assert_eq!(seeded_pair_count(2.0), 1);
+        assert_eq!(seeded_pair_count(6.0), 3);
+        assert_eq!(seeded_pair_count(16.0), 4);
+        assert_eq!(seeded_pair_count(f64::NAN), 1);
+        assert_eq!(seeded_pair_count(0.5), 1);
+    }
+
+    #[test]
+    fn the_seeded_field_path_is_opt_in_and_measured() {
+        assert!(!Options::default().seeded, "the metric path is the default");
+        let domain = Domain::rectangle(10.0, 10.0).unwrap();
+        let cases: [(&str, Box<dyn Fn(f64, f64) -> f64>); 2] = [
+            ("linear-x", Box::new(|x: f64, _y: f64| 1.0 + 0.5 * x)),
+            (
+                "2d-gradient",
+                Box::new(|x: f64, y: f64| 1.0 + 0.3 * x + 0.3 * y),
+            ),
+        ];
+        for (name, sigma) in cases {
+            let options = Options {
+                base_size: 1.0,
+                smooth: true,
+                seeded: true,
+                ..Options::default()
+            };
+            let (report, trace) = run(&domain, &options, &sigma).expect("the pipeline ran");
+            println!(
+                "seeded {name}: source={} quads={} triangles={} cracks={} \
+                 mean={:.3} worst={:.3} seeded_pairs={} detected={:?} tiles={} \
+                 interior={} coverage={:.3} error={:?}",
+                report.source,
+                report.quads,
+                report.triangles,
+                report.cracks,
+                report.size_ratio_mean,
+                report.size_ratio_worst,
+                trace.seeded_pairs,
+                trace.seeded_detected,
+                trace.seeded_tiles,
+                trace.seeded_interior_quads,
+                trace.seeded_coverage,
+                trace.seeded_error,
+            );
+            // The seeded attempt must be recorded, and when it did not win the
+            // reason must be reported. It must never silently ship a mesh that
+            // does not cover the domain: the metric path is the fallback and
+            // it covers it with the measured 1.494 / 1.392.
+            assert!(trace.seeded_pairs > 0, "no pair was placed");
+            if report.source == SOURCE_SEEDED {
+                assert!(trace.seeded_error.is_none());
+                assert_eq!(report.triangles, 0);
+                assert_eq!(report.cracks, 0);
+            } else {
+                assert!(
+                    trace.seeded_error.is_some(),
+                    "the seeded path was not selected but reported no error"
+                );
+                assert_eq!(report.source, SOURCE_GRADED);
+                let gate = verify::gate(&report.mesh);
+                assert!(gate.passes(), "the fallback failed: {:?}", gate.reason());
+            }
+        }
     }
 
     #[test]

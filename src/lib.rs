@@ -92,6 +92,8 @@ pub mod simons_smooth;
 
 pub mod simons_regions;
 
+pub mod simons_seeded;
+
 pub mod simons_features;
 
 pub mod simons_limit;
