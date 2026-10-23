@@ -355,6 +355,10 @@ pub struct Tile {
     /// True for a *bent* tile: four field lines, but a corner polygon that is
     /// not counter-clockwise (the annular/nautilus case of Section 5.1.4).
     pub bent: bool,
+    /// True for a *triangular* tile: a face with three corners, two shared seps
+    /// and one free boundary arc, meshed by the three-kite fan
+    /// ([`triangle_fan_quads`]). Its counts come from the two seps.
+    pub triangular: bool,
 }
 
 impl Tile {
@@ -628,7 +632,34 @@ impl Regions {
                     "regions: tile {index} has a zero subdivision count ({n_u} x {n_v})"
                 ));
             }
-            let tile_mesh = if tile.bent {
+            let tile_mesh = if tile.triangular {
+                let mut sides = [&tile.curves.right[..], &tile.curves.bottom[..]];
+                sides[0] = &tile.curves.right;
+                // The fan wants (sep from the base end to the apex, the other
+                // sep from the base start to the apex, the base arc).
+                let mut other: Vec<[f64; 2]> = tile.curves.top.clone();
+                other.reverse();
+                let (quads, boundary) =
+                    triangle_fan_quads(&tile.curves.right, &other, &tile.curves.bottom, n_u)
+                        .map_err(|error| format!("regions: triangular tile {index}: {error}"))?;
+                if boundary != 3 * n_u {
+                    return Err(format!(
+                        "regions: triangular tile {index}: boundary {boundary} != 3 * {n_u}"
+                    ));
+                }
+                let _ = sides;
+                let mut points: Vec<Node> = Vec::with_capacity(quads.len() * 4);
+                let mut cells: Vec<Cell> = Vec::with_capacity(quads.len());
+                for quad in &quads {
+                    let mut nodes = [0usize; 4];
+                    for (slot, point) in quad.iter().enumerate() {
+                        nodes[slot] = points.len();
+                        points.push([point[0], point[1], 0.0]);
+                    }
+                    cells.push(Cell::quad4(nodes));
+                }
+                Mesh::new(points, cells)
+            } else if tile.bent {
                 let quads = bent_coons_quads(&tile.curves, n_u, n_v)
                     .map_err(|error| format!("regions: bent tile {index}: {error}"))?;
                 let mut points: Vec<Node> = Vec::with_capacity(quads.len() * 4);
@@ -2323,6 +2354,84 @@ impl<'a> Builder<'a> {
                     corners.push(index);
                 }
             }
+            if corners.len() == 3 {
+                let mut tri_sides: [Vec<usize>; 3] = Default::default();
+                let mut tri_lines: [Vec<[f64; 2]>; 3] = Default::default();
+                let mut tri_failed = false;
+                for side in 0..3 {
+                    let from = corners[side];
+                    let to = corners[(side + 1) % 3];
+                    let mut half_edges: Vec<usize> = Vec::new();
+                    let mut index = from;
+                    loop {
+                        half_edges.push(face[index]);
+                        index = (index + 1) % count;
+                        if index == to {
+                            break;
+                        }
+                    }
+                    if half_edges.is_empty() {
+                        tri_failed = true;
+                        break;
+                    }
+                    for &half in &half_edges {
+                        tri_sides[side].push(half / 2);
+                    }
+                    tri_lines[side] = match self.concatenate(&half_edges) {
+                        Some(found) => found,
+                        None => {
+                            tri_failed = true;
+                            break;
+                        }
+                    };
+                }
+                let free_side = (0..3).find(|&side| {
+                    !tri_sides[side].is_empty()
+                        && tri_sides[side].iter().all(|&edge| {
+                            self.graph
+                                .edges
+                                .get(edge)
+                                .map(|found| found.kind == EdgeKind::Boundary)
+                                .unwrap_or(false)
+                        })
+                });
+                let usable = convex && !tri_failed && tri_lines.iter().all(|line| line.len() >= 2);
+                if let (true, Some(free_side)) = (usable, free_side) {
+                    let mut sides: [Vec<usize>; 4] = Default::default();
+                    let mut lines: [Vec<[f64; 2]>; 4] = Default::default();
+                    let mut corner_points = [[0.0f64; 2]; 4];
+                    let mut corner_nodes = [0usize; 4];
+                    for slot in 0..3 {
+                        let source = (free_side + slot) % 3;
+                        sides[slot] = tri_sides[source].clone();
+                        lines[slot] = tri_lines[source].clone();
+                        corner_points[slot] = tri_lines[source][0];
+                        corner_nodes[slot] = self.half_start(face[corners[source]]).unwrap_or(0);
+                    }
+                    corner_points[3] = corner_points[0];
+                    corner_nodes[3] = corner_nodes[0];
+                    let curves = BoundaryCurves {
+                        bottom: lines[0].clone(),
+                        right: lines[1].clone(),
+                        top: lines[2].clone(),
+                        left: Vec::new(),
+                    };
+                    tiles.push(Tile {
+                        nodes: corner_nodes[..3].to_vec(),
+                        sides,
+                        corners: corner_points,
+                        corner_nodes,
+                        curves,
+                        counts: [0; 4],
+                        area,
+                        bent: false,
+                        triangular: true,
+                    });
+                    continue;
+                }
+                degenerate += 1;
+                continue;
+            }
             if corners.len() != 4 || !convex {
                 degenerate += 1;
                 continue;
@@ -2397,6 +2506,7 @@ impl<'a> Builder<'a> {
                 counts: [0; 4],
                 area,
                 bent,
+                triangular: false,
             });
         }
         Ok((tiles, degenerate))
@@ -2464,6 +2574,7 @@ pub fn build(
     let ideals = builder.ideal_counts()?;
     let regions: Vec<Region> = tiles
         .iter()
+        .filter(|tile| !tile.triangular)
         .map(|tile| Region::new(tile.sides.clone()))
         .collect();
     let counts = simons_qgp::solve_counts(&regions, &ideals)?;
@@ -2471,6 +2582,28 @@ pub fn build(
     let mut kept: Vec<Tile> = Vec::with_capacity(tiles.len());
     let mut collapsed = 0usize;
     for (index, mut tile) in tiles.into_iter().enumerate() {
+        if tile.triangular {
+            let mut left = 0usize;
+            for &edge in &tile.sides[1] {
+                left = left.saturating_add(counts.get(edge).copied().unwrap_or(0));
+            }
+            let mut right = 0usize;
+            for &edge in &tile.sides[2] {
+                right = right.saturating_add(counts.get(edge).copied().unwrap_or(0));
+            }
+            eprintln!(
+                "DEBUG triangular tile {index}: seps {left} vs {right} ({} sides)",
+                tile.sides[1].len() + tile.sides[2].len()
+            );
+            // The three-kite fan needs an even side of at least four segments.
+            if left == 0 || left != right || !left.is_multiple_of(2) || left < 4 {
+                collapsed += 1;
+                continue;
+            }
+            tile.counts = [left, left, left, left];
+            kept.push(tile);
+            continue;
+        }
         let mut row = [0usize; 4];
         for (side, slot) in row.iter_mut().enumerate() {
             let mut sum = 0usize;
@@ -2743,6 +2876,171 @@ fn triangle_patch_quads(
     }
     let boundary = edges.values().filter(|&&count| count == 1).count();
     Ok((out, boundary))
+}
+
+/// Coons grid of a patch whose four sides are the given polylines (plain arc
+/// length sampling, eq. 5.2); every quad must have positive area.
+fn coons_patch_quads(
+    bottom: &[[f64; 2]],
+    right: &[[f64; 2]],
+    top: &[[f64; 2]],
+    left: &[[f64; 2]],
+    n_u: usize,
+    n_v: usize,
+) -> Result<Vec<[[f64; 2]; 4]>, String> {
+    if n_u == 0 || n_v == 0 {
+        return Err("coons patch: zero subdivision".to_string());
+    }
+    let bottom = resample_open(bottom, n_u);
+    let right = resample_open(right, n_v);
+    let top = resample_open(top, n_u);
+    let left = resample_open(left, n_v);
+    if bottom.len() != n_u + 1
+        || right.len() != n_v + 1
+        || top.len() != n_u + 1
+        || left.len() != n_v + 1
+    {
+        return Err("coons patch: a side has zero length".to_string());
+    }
+    let corner0 = bottom[0];
+    let corner1 = bottom[n_u];
+    let corner2 = top[0];
+    let corner3 = top[n_u];
+    let mut points: Vec<[f64; 2]> = Vec::with_capacity((n_u + 1) * (n_v + 1));
+    for j in 0..=n_v {
+        let v = j as f64 / n_v as f64;
+        for i in 0..=n_u {
+            let u = i as f64 / n_u as f64;
+            let top_point = top[n_u - i];
+            let left_point = left[n_v - j];
+            let blend_bottom_top = add(scale(bottom[i], 1.0 - v), scale(top_point, v));
+            let blend_left_right = add(scale(right[j], u), scale(left_point, 1.0 - u));
+            let bilinear = add(
+                scale(add(scale(corner0, 1.0 - u), scale(corner1, u)), 1.0 - v),
+                scale(add(scale(corner3, 1.0 - u), scale(corner2, u)), v),
+            );
+            points.push(add(blend_bottom_top, sub(blend_left_right, bilinear)));
+        }
+    }
+    let index = |i: usize, j: usize| j * (n_u + 1) + i;
+    let mut quads = Vec::with_capacity(n_u * n_v);
+    for j in 0..n_v {
+        for i in 0..n_u {
+            let quad = [
+                points[index(i, j)],
+                points[index(i + 1, j)],
+                points[index(i + 1, j + 1)],
+                points[index(i, j + 1)],
+            ];
+            if polygon_area(&quad) <= 0.0 {
+                return Err("coons patch: a quad is inverted".to_string());
+            }
+            quads.push(quad);
+        }
+    }
+    Ok(quads)
+}
+
+/// Quadrangulate a triangle as a **three-kite fan**: the triangle is split by
+/// its three side midpoints and its centroid into three kites, each meshed with
+/// a 3x3 Coons grid, so every side gets `6` subdivisions (the shared seps keep
+/// their QGP counts) and the free arc is partitioned into 6.
+///
+/// This avoids the thin-apex fan that folds on the hole-adjacent faces: the
+/// kites are convex and their Coons grids are positive. Returns the quads and
+/// the boundary edge count (which must be `3 * 6`).
+pub fn triangle_fan_quads(
+    sep_left: &[[f64; 2]],
+    sep_right: &[[f64; 2]],
+    base: &[[f64; 2]],
+    side_segments: usize,
+) -> Result<(Vec<[[f64; 2]; 4]>, usize), String> {
+    if !side_segments.is_multiple_of(2) || side_segments < 4 {
+        return Err("triangle fan: an even side with at least four segments".to_string());
+    }
+    let half = side_segments / 2;
+    let base_nodes = resample_open(base, side_segments);
+    let left_nodes = resample_open(sep_left, side_segments);
+    let right_nodes = resample_open(sep_right, side_segments);
+    if base_nodes.len() != side_segments + 1
+        || left_nodes.len() != side_segments + 1
+        || right_nodes.len() != side_segments + 1
+    {
+        return Err("triangle fan: a side has zero length".to_string());
+    }
+    let c0 = base_nodes[0];
+    let c1 = base_nodes[side_segments];
+    let apex = match (left_nodes.last(), right_nodes.last()) {
+        (Some(a), Some(b)) => add(scale(*a, 0.5), scale(*b, 0.5)),
+        _ => return Err("triangle fan: no apex".to_string()),
+    };
+    let m0 = base_nodes[half];
+    let m1 = *left_nodes.get(half).unwrap_or(&apex);
+    let m2 = *right_nodes.get(half).unwrap_or(&apex);
+    let _ = (c0, c1, apex);
+    // The fan centre is the average of the three side midpoints: it keeps the
+    // three kites similar in shape, which is what stops the Coons grids from
+    // folding on a thin triangle.
+    let centre = scale(add(add(m0, m1), m2), 1.0 / 3.0);
+    let chain = |nodes: &[[f64; 2]], from: usize, to: usize| -> Vec<[f64; 2]> {
+        if from <= to {
+            nodes[from..=to].to_vec()
+        } else {
+            let mut out = nodes[to..=from].to_vec();
+            out.reverse();
+            out
+        }
+    };
+    let mut quads = Vec::with_capacity(3 * half * half);
+    // Kite 0: base's second half, the sep-left first half, the two spokes.
+    quads.extend(
+        coons_patch_quads(
+            &chain(&base_nodes, half, side_segments),
+            &chain(&left_nodes, 0, half),
+            &[m1, centre],
+            &[centre, m0],
+            half,
+            half,
+        )
+        .map_err(|error| format!("kite 0: {error}"))?,
+    );
+    // Kite 1: the sep-left second half, the sep-right second half.
+    quads.extend(
+        coons_patch_quads(
+            &chain(&left_nodes, half, side_segments),
+            &chain(&right_nodes, side_segments, half),
+            &[m2, centre],
+            &[centre, m1],
+            half,
+            half,
+        )
+        .map_err(|error| format!("kite 1: {error}"))?,
+    );
+    // Kite 2: the sep-right first half, the base's first half.
+    quads.extend(
+        coons_patch_quads(
+            &chain(&right_nodes, half, 0),
+            &chain(&base_nodes, 0, half),
+            &[m0, centre],
+            &[centre, m2],
+            half,
+            half,
+        )
+        .map_err(|error| format!("kite 2: {error}"))?,
+    );
+    // Boundary count of the union.
+    let mut edges: HashMap<((i64, i64), (i64, i64)), usize> = HashMap::new();
+    let key = |p: [f64; 2]| ((p[0] * 1e6).round() as i64, (p[1] * 1e6).round() as i64);
+    for quad in &quads {
+        for slot in 0..4 {
+            let a = key(quad[slot]);
+            let b = key(quad[(slot + 1) % 4]);
+            let edge = if a < b { (a, b) } else { (b, a) };
+            *edges.entry(edge).or_insert(0) += 1;
+        }
+    }
+    let boundary = edges.values().filter(|&&count| count == 1).count();
+    Ok((quads, boundary))
 }
 
 // ---------------------------------------------------------------------------
@@ -4392,7 +4690,12 @@ mod tests {
             assert!(tile.counts[0] > 0 && tile.counts[1] > 0);
             assert_eq!(tile.counts[0], tile.counts[2]);
             assert_eq!(tile.counts[1], tile.counts[3]);
-            total += tile.counts[0] * tile.counts[1];
+            total += if tile.triangular {
+                // Three kites of (n/2)^2 quads each.
+                3 * (tile.counts[0] / 2) * (tile.counts[0] / 2)
+            } else {
+                tile.counts[0] * tile.counts[1]
+            };
         }
         let mesh = regions.mesh()?;
         assert_eq!(mesh.cells.len(), total);
@@ -4692,6 +4995,43 @@ mod tests {
             ));
         }
         Ok(boundary)
+    }
+
+    #[test]
+    fn triangle_fan_patch_is_positive() -> Result<(), String> {
+        let sep_left: Vec<[f64; 2]> = (0..=12)
+            .map(|k| {
+                let t = k as f64 / 12.0;
+                [-1.0 + t, t]
+            })
+            .collect();
+        let sep_right: Vec<[f64; 2]> = (0..=12)
+            .map(|k| {
+                let t = k as f64 / 12.0;
+                [1.0 - t, t]
+            })
+            .collect();
+        let base: Vec<[f64; 2]> = (0..=24)
+            .map(|k| {
+                let s = k as f64 / 24.0;
+                [-1.0 + 2.0 * s, -0.25 * (s * std::f64::consts::PI).sin()]
+            })
+            .collect();
+        let (quads, boundary) = triangle_fan_quads(&sep_right, &sep_left, &base, 6)?;
+        assert_eq!(quads.len(), 27, "three kites of 3 x 3");
+        assert_eq!(boundary, 18, "6 + 6 + 6 boundary segments");
+        for (index, quad) in quads.iter().enumerate() {
+            assert!(polygon_area(quad) > 0.0, "quad {index} is not positive");
+        }
+        println!(
+            "triangle fan: {} quads, boundary {boundary}, min area {:.3e}",
+            quads.len(),
+            quads
+                .iter()
+                .map(|q| polygon_area(q))
+                .fold(f64::INFINITY, f64::min)
+        );
+        Ok(())
     }
 
     #[test]
