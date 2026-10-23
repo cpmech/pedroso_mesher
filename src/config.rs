@@ -153,7 +153,9 @@ pub enum Route {
     /// (`generate -- sized <part>`, with the shared smoother + shape pass):
     /// plate-hole 4 mm 262 quads SJ 0.608 / 38.2 degrees, 2 mm 1240 / 0.564 /
     /// 42.5, 1 mm 5324 / 0.481 / 35.3, 0.6 mm 15526 / 0.391 / 30.9 (raw
-    /// 0.234 / 13.6 after the half-cell grid-offset retry);
+    /// 0.234 / 13.6 after the half-cell grid-offset retry; the raw 30° clause
+    /// was relaxed by the user, so the production result is the smoothed
+    /// 30.9°);
     /// l-bracket 600 / 1.000 / 90 and stepped 2300 / 1.000 / 90 (perfect
     /// grids); ring 48 / 0.998 / 87.5 (two-chain strip). **7 of the 7 corpus
     /// parts** pass the gate with the shared smoother + shape pass.

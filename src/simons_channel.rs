@@ -81,7 +81,12 @@
 //!   half-cell grid offset `(0, 0.5)` chosen by the guarded offset retry
 //!   described below. Raw min SJ 0.2344, angles 13.55°–165.71°; after the
 //!   shared smoother and shape pass SJ 0.391 / 30.9°, which is the integrated
-//!   7/7 result. The default `(0,0)` placement is still 0.0874 / 5.01°.
+//!   7/7 result. The default `(0,0)` placement is still 0.0874 / 5.01°. The
+//!   **raw 30° angle target was relaxed by the user** (2026-10-23): the culled
+//!   grid loop has 150 vertices against the 64-gon hole's 128 nodes, the 22
+//!   extra vertices sit at the radial steps, and seven constructions measured
+//!   no better than 13.55° raw (see the placement note below). The production
+//!   result is the smoothed 30.9°.
 //! * **Corpus ring section** (quarter annulus, R20/R10, size 1): 48 quads,
 //!   min SJ 0.9979, angles 87.50°–93.75°, aspect 7.66, cracks 0, boundary
 //!   offset 4.4e-16, verdict Acceptable (PASS), produced by the **two-chain
@@ -189,12 +194,16 @@
 //!   `(0.5,0)` 0.0960 / 5.51°, `(0,0.5)` **0.2344 / 13.55°**, `(0.5,0.5)`
 //!   0.1827 / 10.53°; quarter-cell offsets were swept and none did better. The
 //!   plate is now built at `(0, 0.5)` with **15 526 quads**, raw min SJ
-//!   **0.2344** (target ≥ 0.2 met) and min angle **13.55°** (target ≥ 30° not
-//!   met — a residual tangency at the right of the hole, where a radial grid
-//!   step and the radial cross edge are still nearly parallel). After the
-//!   shared smoother and shape pass: SJ **0.391**, angles **30.9°–165.6°**,
-//!   Sized 7/7 PASS. Every other corpus part keeps its default placement bit
-//!   for bit.
+//!   **0.2344** (target ≥ 0.2 met) and min angle **13.55°** (the raw ≥ 30°
+//!   clause was relaxed by the user; a residual tangency at the right of the
+//!   hole, where a radial grid step and the radial cross edge are still nearly
+//!   parallel, is structural: 150 staircase vertices against 128 hole nodes,
+//!   and seven constructions measured no better — 2-refinement 4.99/5.15°,
+//!   angular warp 12.31°, 45° lattice 8–11°, angular fans 8.27°, best local
+//!   fan 34.2° at SJ 0.058, corner bisector 11.77°, arc-length 4.4°). After
+//!   the shared smoother and shape pass: SJ **0.391**, angles
+//!   **30.9°–165.6°**, Sized 7/7 PASS — the production result. Every other
+//!   corpus part keeps its default placement bit for bit.
 //!
 //! * **Covering (§2.2.7–2.2.9)**: the greedy cover is the fallback (the
 //!   widest-path cycle cover above is tried first). Patches are scored and
