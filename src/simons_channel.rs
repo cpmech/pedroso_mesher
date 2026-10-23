@@ -121,6 +121,12 @@
 //!   fixed δ = 1.4h, but it is what lets the corpus L and stepped sections
 //!   pass while preserving the thesis-default results on the square and plate
 //!   family.
+//! * **Dense equal-count ribbon** (`channel_between_dense`): for the Chapter 5
+//!   stitch, this variant keeps **every** inner-loop id instead of collapsing
+//!   collinear nodes to corners. The outer boundary is resampled to the same
+//!   node count with its corners preserved (radial- and nearest-point
+//!   projections are fallbacks), 1–4 rows are tried, and every inner edge is
+//!   used exactly once so welding to the interior mesh leaves no T-junctions.
 //! * **Projection row strip**: when a band's fixed grid loop is a staircase
 //!   (the perf plate's grid hole loop) and neither the ribbon nor the cyclic
 //!   row strip can match it to a free domain loop, each fixed-loop vertex is
@@ -163,6 +169,8 @@
 //! sig_simons_channel::channel_between(domain, outer, inner, inner_ids, points, size)
 //!                                                -> Result<Vec<[usize;4]>, String>
 //! sig_simons_channel::channel_between_hole(domain, hole, inner, inner_ids, points, size)
+//!                                                -> Result<Vec<[usize;4]>, String>
+//! sig_simons_channel::channel_between_dense(domain, outer, inner, inner_ids, points, size)
 //!                                                -> Result<Vec<[usize;4]>, String>
 //! sig_simons_channel::demo()                      -> Result<DemoNumbers, String>
 //! ```
@@ -626,7 +634,278 @@ pub fn channel_between_hole(
     )
 }
 
-/// Run the three demo cases and return their numbers./// Run the three demo cases and return their numbers.
+/// Equal-count ribbon that uses **every** inner-loop node id.
+///
+/// This is the stitch's variant of [`channel_between`]. Instead of collapsing
+/// collinear inner nodes to corners, the inner loop keeps all its ids and the
+/// outer boundary is resampled to the same node count, preserving its corners.
+/// Each inner node is paired with an outer point:
+/// * the corner-preserving resampled ring, trying every rotation/direction;
+/// * a radial projection of the inner node from the band centroid onto the
+///   outer polyline;
+/// * a nearest-point projection as the last resort.
+///
+/// One to four interpolated rows are tried; every returned quad uses one inner
+/// edge exactly once, so welding it to the interior mesh leaves no T-junctions.
+pub fn channel_between_dense(
+    domain: &Domain,
+    outer: &[[f64; 2]],
+    inner: &[[f64; 2]],
+    inner_ids: &[usize],
+    points: &mut Vec<[f64; 3]>,
+    size: f64,
+) -> Result<Vec<[usize; 4]>, String> {
+    if !size.is_finite() || size <= 0.0 {
+        return Err("the element size must be positive and finite".into());
+    }
+    if outer.len() < 4 || inner.len() < 4 || inner_ids.len() < 4 {
+        return Err("both channel loops need at least four vertices".into());
+    }
+    if inner.len() != inner_ids.len() {
+        return Err("the inner loop and its id list have different lengths".into());
+    }
+    for (slot, &id) in inner_ids.iter().enumerate() {
+        let Some(point) = points.get(id) else {
+            return Err(format!("inner id {id} is out of range for the node pool"));
+        };
+        let expected = inner[slot];
+        if (point[0] - expected[0]).abs() > 1.0e-9 || (point[1] - expected[1]).abs() > 1.0e-9 {
+            return Err(format!(
+                "inner node {id} is at ({}, {}) but the loop says ({}, {})",
+                point[0], point[1], expected[0], expected[1]
+            ));
+        }
+    }
+    let (inner_clean, inner_clean_ids) = clean_loop_with_ids(inner, inner_ids)?;
+    if inner_clean.len() != inner_ids.len() {
+        return Err("the inner loop changed length while cleaning; ids would be misaligned".into());
+    }
+    let outer_clean = clean_loop_points(outer)?;
+    let k = inner_clean.len();
+    if !k.is_multiple_of(2) {
+        return Err("the inner loop has an odd number of edges".into());
+    }
+    let tolerance = 1.0e-6 * (1.0 + size);
+    for point in &outer_clean {
+        if domain.distance_to_boundary(*point) > tolerance {
+            return Err("an outer-loop point is not on the domain boundary".into());
+        }
+    }
+    for point in &inner_clean {
+        if !domain.contains(*point) {
+            return Err("an inner-loop point is not inside the domain".into());
+        }
+    }
+
+    // Keep the caller's inner orientation. The strip quads traverse each inner
+    // edge backwards relative to this row, which is exactly opposite to the
+    // interior cells on the other side, so the welded mesh is consistent.
+    let inner_row: Vec<[f64; 2]> = inner_clean.clone();
+    let inner_row_ids: Vec<usize> = inner_clean_ids.clone();
+    let inner_area = polygon_area_points(&inner_row).abs();
+    if inner_area <= EPS {
+        return Err("the inner loop has no area".into());
+    }
+
+    // Outer-row candidates.
+    let mut outer_rows: Vec<(Vec<[f64; 2]>, bool)> = Vec::new();
+    let corners = corner_indices(&outer_clean);
+    if corners.len() >= 4 && corners.len().is_multiple_of(2) && k >= corners.len() {
+        let corner_polygon: Vec<[f64; 2]> = corners.iter().map(|&i| outer_clean[i]).collect();
+        let original_area = polygon_area_points(&outer_clean).abs();
+        let corner_area = polygon_area_points(&corner_polygon).abs();
+        if (original_area - corner_area).abs() <= 1.0e-6 * original_area.max(1.0) {
+            if let Ok(mut ring) = resample_polyline(&corner_polygon, k) {
+                if polygon_area_points(&ring) < 0.0 {
+                    ring.reverse();
+                }
+                outer_rows.push((ring, true));
+            }
+        }
+    }
+    if outer_rows.is_empty() && k >= outer_clean.len() {
+        if let Ok(mut ring) = resample_polyline(&outer_clean, k) {
+            if polygon_area_points(&ring) < 0.0 {
+                ring.reverse();
+            }
+            outer_rows.push((ring, false));
+        }
+    }
+    let center = match polygon_centroid(&inner_clean) {
+        Some(center) => center,
+        None => return Err("the inner loop has no centroid".into()),
+    };
+    let radial: Vec<[f64; 2]> = inner_clean
+        .iter()
+        .map(|&point| {
+            ray_on_loop(center, point, &outer_clean)
+                .unwrap_or_else(|| closest_on_loop(point, &outer_clean).0)
+        })
+        .collect();
+    let nearest: Vec<[f64; 2]> = inner_clean
+        .iter()
+        .map(|&point| closest_on_loop(point, &outer_clean).0)
+        .collect();
+    outer_rows.push((radial, false));
+    outer_rows.push((nearest, false));
+
+    let stride = if k > 128 { k / 64 + 1 } else { 1 };
+    let mut best: Option<(bool, bool, f64, f64, usize, usize, Vec<[f64; 2]>)> = None;
+    for (outer_row, corner_preserved) in &outer_rows {
+        if outer_row.len() != k {
+            continue;
+        }
+        let outer_area = polygon_area_points(outer_row).abs();
+        if outer_area <= inner_area {
+            continue;
+        }
+        let expected = outer_area - inner_area;
+        {
+            let direction = 1i64;
+            for offset in (0..k).step_by(stride) {
+                for rows in 1..=4usize {
+                    let column_index = |column: usize| -> usize {
+                        (offset as i64 + direction * column as i64).rem_euclid(k as i64) as usize
+                    };
+                    let mut local: Vec<[f64; 2]> = Vec::with_capacity((rows + 1) * k);
+                    for r in 0..=rows {
+                        let t = r as f64 / rows as f64;
+                        for column in 0..k {
+                            let a = outer_row[column];
+                            let b = inner_row[column_index(column)];
+                            local.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+                        }
+                    }
+                    let mut total = 0.0f64;
+                    let mut worst = f64::INFINITY;
+                    let mut aspect: f64 = 0.0;
+                    let mut valid = true;
+                    for r in 0..rows {
+                        for column in 0..k {
+                            let a = r * k + column;
+                            let b = r * k + (column + 1) % k;
+                            let c = (r + 1) * k + (column + 1) % k;
+                            let d = (r + 1) * k + column;
+                            let corners = [local[a], local[b], local[c], local[d]];
+                            let area = quad_area(corners);
+                            if area <= 1.0e-14 {
+                                valid = false;
+                                break;
+                            }
+                            let Some(rank) = quad_angle_rank(corners) else {
+                                valid = false;
+                                break;
+                            };
+                            worst = worst.min(rank);
+                            aspect = aspect.max(quad_aspect(corners));
+                            total += area;
+                        }
+                        if !valid {
+                            break;
+                        }
+                    }
+                    if !valid || (total - expected).abs() > 1.0e-3 * expected.max(1.0) {
+                        continue;
+                    }
+                    let good_aspect = aspect <= 10.0;
+                    let better = match &best {
+                        None => true,
+                        Some((current_corner, current_good, current_rank, _, _, _, _)) => {
+                            if *corner_preserved != *current_corner {
+                                *corner_preserved
+                            } else if good_aspect != *current_good {
+                                good_aspect
+                            } else {
+                                worst > *current_rank
+                            }
+                        }
+                    };
+                    if better {
+                        best = Some((
+                            *corner_preserved,
+                            good_aspect,
+                            worst,
+                            expected,
+                            offset,
+                            rows,
+                            local,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let (_corner, _good, rank, expected, offset, rows, local) = match best {
+        Some(found) => found,
+        None => {
+            return Err(
+                "channel_between_dense found no equal-count ribbon using all inner ids".into(),
+            )
+        }
+    };
+    let _ = expected;
+
+    // Commit the chosen rows: the inner row keeps the caller's ids, the outer
+    // and interior rows are appended to the shared pool.
+    let mut outer_ids: Vec<usize> = Vec::with_capacity(k);
+    // Row 0 of the chosen candidate is its outer row.
+    for column in 0..k {
+        outer_ids.push(points.len());
+        points.push([local[column][0], local[column][1], 0.0]);
+    }
+    let mut row_ids: Vec<Vec<usize>> = Vec::with_capacity(rows + 1);
+    row_ids.push(outer_ids);
+    for r in 1..rows {
+        let mut ids = Vec::with_capacity(k);
+        for column in 0..k {
+            ids.push(points.len());
+            points.push([local[r * k + column][0], local[r * k + column][1], 0.0]);
+        }
+        row_ids.push(ids);
+    }
+    let mut permuted_inner_ids: Vec<usize> = Vec::with_capacity(k);
+    for column in 0..k {
+        permuted_inner_ids.push(inner_row_ids[(offset + column) % k]);
+    }
+    row_ids.push(permuted_inner_ids);
+    let mut quads: Vec<[usize; 4]> = Vec::with_capacity(rows * k);
+    for r in 0..rows {
+        for column in 0..k {
+            let next = (column + 1) % k;
+            quads.push([
+                row_ids[r][column],
+                row_ids[r][next],
+                row_ids[r + 1][next],
+                row_ids[r + 1][column],
+            ]);
+        }
+    }
+    // Every inner edge must be used exactly once.
+    let mut inner_edges: HashMap<(usize, usize), usize> = HashMap::new();
+    for i in 0..k {
+        let a = inner_row_ids[i];
+        let b = inner_row_ids[(i + 1) % k];
+        *inner_edges.entry(edge_key(a, b)).or_insert(0) += 1;
+    }
+    let mut used_edges: HashMap<(usize, usize), usize> = HashMap::new();
+    for quad in &quads {
+        for j in 0..4 {
+            *used_edges
+                .entry(edge_key(quad[j], quad[(j + 1) % 4]))
+                .or_insert(0) += 1;
+        }
+    }
+    for (edge, expected_count) in inner_edges {
+        if used_edges.get(&edge).copied().unwrap_or(0) != expected_count {
+            return Err("channel_between_dense lost an inner edge".into());
+        }
+    }
+    let _ = offset;
+    let _ = rank;
+    Ok(quads)
+}
+
+/// Run the three demo cases and return their numbers.
 ///
 /// The square and the L-bracket are the working cases. The square with a
 /// square hole is attempted and its error is reported rather than panicking.
@@ -4819,6 +5098,187 @@ mod tests {
             area,
             report.min_scaled_jacobian
         );
+    }
+
+    fn inner_edge_use(quads: &[[usize; 4]], inner_ids: &[usize]) -> HashMap<(usize, usize), usize> {
+        let mut counts: HashMap<(usize, usize), usize> = HashMap::new();
+        for quad in quads {
+            for k in 0..4 {
+                *counts
+                    .entry(edge_key(quad[k], quad[(k + 1) % 4]))
+                    .or_insert(0) += 1;
+            }
+        }
+        let mut out: HashMap<(usize, usize), usize> = HashMap::new();
+        for i in 0..inner_ids.len() {
+            let a = inner_ids[i];
+            let b = inner_ids[(i + 1) % inner_ids.len()];
+            out.insert(
+                edge_key(a, b),
+                counts.get(&edge_key(a, b)).copied().unwrap_or(0),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn channel_between_dense_all_ids() {
+        // (a) 10x10 outer, 6x6 inner: four ids, four quads, weld to one quad.
+        let domain = match Domain::rectangle(10.0, 10.0) {
+            Ok(domain) => domain,
+            Err(error) => {
+                assert!(false, "{error}");
+                return;
+            }
+        };
+        let outer = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let inner = vec![[2.0, 2.0], [8.0, 2.0], [8.0, 8.0], [2.0, 8.0]];
+        let inner_ids = [0usize, 1, 2, 3];
+        let mut points: Vec<[f64; 3]> = inner.iter().map(|p| [p[0], p[1], 0.0]).collect();
+        let quads =
+            match channel_between_dense(&domain, &outer, &inner, &inner_ids, &mut points, 1.0) {
+                Ok(quads) => quads,
+                Err(error) => {
+                    assert!(false, "dense 6x6 failed: {error}");
+                    return;
+                }
+            };
+        assert_eq!(quads.len(), 4);
+        let used: BTreeSet<usize> = quads
+            .iter()
+            .flat_map(|quad| quad.iter().copied())
+            .filter(|&id| id < 4)
+            .collect();
+        assert_eq!(used, BTreeSet::from([0usize, 1, 2, 3]));
+        for (edge, count) in inner_edge_use(&quads, &inner_ids) {
+            assert_eq!(count, 1, "inner edge {edge:?}");
+        }
+        let mut welded = points.clone();
+        let mut cells: Vec<Cell> = quads.iter().map(|&q| Cell::quad4(q)).collect();
+        // The interior quad uses the inner loop counter-clockwise; the channel
+        // uses it clockwise, so the shared edges are consistent.
+        cells.push(Cell::quad4([
+            inner_ids[0],
+            inner_ids[1],
+            inner_ids[2],
+            inner_ids[3],
+        ]));
+        let mesh = Mesh::new(welded.clone(), cells);
+        let topology = mesh.topology();
+        assert_eq!(topology.cracks, 0, "welded cracks");
+        assert_eq!(topology.inconsistent, 0, "welded orientation");
+        assert_eq!(topology.non_manifold, 0, "welded non-manifold");
+        println!(
+            "channel_between_dense 6x6: {} channel quads, cracks {}, inconsistent {}",
+            quads.len(),
+            topology.cracks,
+            topology.inconsistent
+        );
+        welded.clear();
+
+        // (c) 2x1 outer, 44-node collinear inset: all 44 ids must be used.
+        let domain_rect = match Domain::rectangle(2.0, 1.0) {
+            Ok(domain) => domain,
+            Err(error) => {
+                assert!(false, "{error}");
+                return;
+            }
+        };
+        let outer_rect = vec![[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]];
+        let dense = dense_rectangle([[0.5, 0.25], [1.5, 0.25], [1.5, 0.75], [0.5, 0.75]], 11);
+        assert_eq!(dense.len(), 44);
+        let dense_ids: Vec<usize> = (0..dense.len()).collect();
+        let mut pool: Vec<[f64; 3]> = dense.iter().map(|p| [p[0], p[1], 0.0]).collect();
+        let quads = match channel_between_dense(
+            &domain_rect,
+            &outer_rect,
+            &dense,
+            &dense_ids,
+            &mut pool,
+            1.0,
+        ) {
+            Ok(quads) => quads,
+            Err(error) => {
+                assert!(false, "dense 44 collinear failed: {error}");
+                return;
+            }
+        };
+        let used: BTreeSet<usize> = quads
+            .iter()
+            .flat_map(|quad| quad.iter().copied())
+            .filter(|&id| id < dense.len())
+            .collect();
+        assert_eq!(used.len(), dense.len(), "all 44 inner ids used");
+        for (edge, count) in inner_edge_use(&quads, &dense_ids) {
+            assert_eq!(count, 1, "inner edge {edge:?}");
+        }
+        let mesh = ribbon_mesh(&pool, &quads);
+        assert_eq!(mesh.topology().cracks, 0, "dense 44 cracks");
+        println!(
+            "channel_between_dense dense 44: {} quads, {} nodes, min SJ {:.4}",
+            quads.len(),
+            pool.len(),
+            quality::report(&mesh).min_scaled_jacobian
+        );
+    }
+
+    #[test]
+    fn channel_between_dense_staircase() {
+        let domain = match Domain::rectangle(10.0, 10.0) {
+            Ok(domain) => domain,
+            Err(error) => {
+                assert!(false, "{error}");
+                return;
+            }
+        };
+        let outer = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let corners = [[2.0, 2.0], [8.0, 2.0], [8.0, 8.0], [2.0, 8.0]];
+        let mut staircase: Vec<[f64; 2]> = Vec::new();
+        for side in 0..4 {
+            let a = corners[side];
+            let b = corners[(side + 1) % 4];
+            let edge: [f64; 2] = [b[0] - a[0], b[1] - a[1]];
+            let length = (edge[0] * edge[0] + edge[1] * edge[1]).sqrt();
+            let inward = [-edge[1] / length, edge[0] / length];
+            for k in 0..11 {
+                let t = k as f64 / 11.0;
+                let offset = if k % 2 == 0 { 0.0 } else { 0.3 };
+                staircase.push([
+                    a[0] + t * edge[0] + offset * inward[0],
+                    a[1] + t * edge[1] + offset * inward[1],
+                ]);
+            }
+        }
+        assert_eq!(staircase.len(), 44);
+        let ids: Vec<usize> = (0..44).collect();
+        let mut points: Vec<[f64; 3]> = staircase.iter().map(|p| [p[0], p[1], 0.0]).collect();
+        match channel_between_dense(&domain, &outer, &staircase, &ids, &mut points, 1.0) {
+            Ok(quads) => {
+                let used: BTreeSet<usize> = quads
+                    .iter()
+                    .flat_map(|quad| quad.iter().copied())
+                    .filter(|&id| id < 44)
+                    .collect();
+                assert_eq!(used.len(), 44, "all 44 staircase ids used");
+                for (edge, count) in inner_edge_use(&quads, &ids) {
+                    assert_eq!(count, 1, "staircase inner edge {edge:?}");
+                }
+                let mesh = ribbon_mesh(&points, &quads);
+                let topology = mesh.topology();
+                assert_eq!(topology.cracks, 0, "staircase channel cracks");
+                assert_eq!(topology.inconsistent, 0, "staircase orientation");
+                println!(
+                    "channel_between_dense staircase: {} quads, {} nodes, min SJ {:.4}, cracks {}",
+                    quads.len(),
+                    points.len(),
+                    quality::report(&mesh).min_scaled_jacobian,
+                    topology.cracks
+                );
+            }
+            Err(error) => {
+                assert!(false, "channel_between_dense staircase failed: {error}");
+            }
+        }
     }
 
     #[test]
