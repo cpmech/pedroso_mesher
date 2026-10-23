@@ -671,7 +671,7 @@ mod tests {
         assert!(a.after.aspect_ratio.p95 <= b.after.aspect_ratio.p95 + 1.0e-9);
         // The boundary is fixed in both runs.
         for (v, p) in mesh.points.iter().enumerate() {
-            if v % 7 == 0 || v % 7 == 6 || v < 7 || v >= 42 {
+            if v % 7 == 0 || v % 7 == 6 || !(7..42).contains(&v) {
                 assert!((a.smoothed.points[v][0] - p[0]).abs() < 1.0e-12);
                 assert!((a.smoothed.points[v][1] - p[1]).abs() < 1.0e-12);
             }
