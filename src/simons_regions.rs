@@ -161,7 +161,16 @@
 //!   singularity pairs and chord redirection of Section 5.1.4, not a Coons
 //!   patch; (c) after carving both rings no edge-connected component has a
 //!   hole loop that encloses the hole, so the two-band `ring_bands` path has
-//!   nothing to attach to. `kept_interior` therefore stays 0 for the annulus
+//!   nothing to attach to. A phase sweep (`annulus_ring_phase_sweep`, 0-35
+//!   degrees, outer carve 1.4 sigma and hole side only 0.3 sigma so the ring
+//!   can stay connected) confirms it: **no phase gives a ring**, and at phase 0
+//!   the carved interior is three blobs of 11, 10 and 4 quads, each with a
+//!   single boundary loop and no hole loop. The ring has to come from the
+//!   2.93-area horseshoe itself, which is an *annular* tile: meshing it needs
+//!   its two long sides (8.767 and 6.067) re-parametrized by a common angular
+//!   coordinate about the hole and the ring cut by the valence-3/5 pair at the
+//!   seam, because an arc-length Coons patch twists (the arcs differ in length
+//!   and have no point correspondence). `kept_interior` therefore stays 0 for the annulus
 //!   and the collar fallback remains the only gate-passing construction. Two channel bands are therefore built on a **collar loop offset from
 //!   the hole polygon** by `1.4 sigma` (100 nodes): the outer band (100 quads)
 //!   between the domain boundary and the collar, and the hole band (100 quads)
@@ -2640,6 +2649,86 @@ fn split_pinched_boundary(mesh: &Mesh) -> Result<(Mesh, usize), String> {
     Ok((Mesh::new(points, cells), created))
 }
 
+/// Edge-connected components of a quad mesh, largest first.
+#[cfg(test)]
+fn split_components(mesh: &Mesh) -> Vec<Mesh> {
+    if mesh.cells.is_empty() {
+        return Vec::new();
+    }
+    let mut parent: Vec<usize> = (0..mesh.cells.len()).collect();
+    fn root(parent: &mut [usize], mut node: usize) -> usize {
+        while parent.get(node).copied().unwrap_or(node) != node {
+            let next = parent.get(node).copied().unwrap_or(node);
+            let grandparent = parent.get(next).copied().unwrap_or(next);
+            if let Some(slot) = parent.get_mut(node) {
+                *slot = grandparent;
+            }
+            node = next;
+        }
+        node
+    }
+    let mut owner: HashMap<(usize, usize), usize> = HashMap::new();
+    for (index, cell) in mesh.cells.iter().enumerate() {
+        if cell.nodes.len() != 4 {
+            continue;
+        }
+        for slot in 0..4 {
+            let a = cell.nodes[slot];
+            let b = cell.nodes[(slot + 1) % 4];
+            let key = if a < b { (a, b) } else { (b, a) };
+            match owner.get(&key) {
+                Some(&other) => {
+                    let left = root(&mut parent, index);
+                    let right = root(&mut parent, other);
+                    if left != right {
+                        if let Some(slot) = parent.get_mut(left) {
+                            *slot = right;
+                        }
+                    }
+                }
+                None => {
+                    owner.insert(key, index);
+                }
+            }
+        }
+    }
+    let mut buckets: HashMap<usize, Vec<usize>> = HashMap::new();
+    for index in 0..mesh.cells.len() {
+        let root = root(&mut parent, index);
+        buckets.entry(root).or_default().push(index);
+    }
+    let mut groups: Vec<Vec<usize>> = buckets.into_values().collect();
+    groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
+    let mut components = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut points: Vec<Node> = Vec::new();
+        let mut cells: Vec<Cell> = Vec::new();
+        let mut remap: HashMap<usize, usize> = HashMap::new();
+        for &index in &group {
+            let cell = match mesh.cells.get(index) {
+                Some(found) if found.nodes.len() == 4 => found,
+                _ => continue,
+            };
+            let mut mapped = [0usize; 4];
+            for (slot, &node) in cell.nodes.iter().enumerate() {
+                let id = match remap.get(&node) {
+                    Some(&found) => found,
+                    None => {
+                        let id = points.len();
+                        points.push(mesh.points.get(node).copied().unwrap_or([0.0; 3]));
+                        remap.insert(node, id);
+                        id
+                    }
+                };
+                mapped[slot] = id;
+            }
+            cells.push(Cell::quad4(mapped));
+        }
+        components.push(Mesh::new(points, cells));
+    }
+    components
+}
+
 /// Remove the quads closer than `radius_factor * sigma` to any of the given
 /// boundary loops (the outer boundary and the holes).
 fn carve_rings(
@@ -2647,6 +2736,19 @@ fn carve_rings(
     field: &Field,
     loops: &[Vec<[f64; 2]>],
     radius_factor: f64,
+) -> (Mesh, usize) {
+    carve_rings_two(mesh, field, loops, radius_factor, radius_factor)
+}
+
+/// Like [`carve_rings`] but with a separate factor for the first loop (the
+/// outer boundary) and the rest (the holes): the ring has to stay connected,
+/// so the hole side is only detached, not cleared at the full channel width.
+fn carve_rings_two(
+    mesh: &Mesh,
+    field: &Field,
+    loops: &[Vec<[f64; 2]>],
+    outer_factor: f64,
+    hole_factor: f64,
 ) -> (Mesh, usize) {
     let mut points: Vec<Node> = Vec::new();
     let mut cells: Vec<Cell> = Vec::new();
@@ -2667,11 +2769,16 @@ fn carve_rings(
             0.25 * (corners[0][1] + corners[1][1] + corners[2][1] + corners[3][1]),
         ];
         let sigma = field.sigma_at(centroid);
-        let nearest = loops
+        let nearest_outer = loops
+            .first()
+            .map(|loop_points| distance_to_loop(centroid, loop_points))
+            .unwrap_or(f64::INFINITY);
+        let nearest_hole = loops
             .iter()
+            .skip(1)
             .map(|loop_points| distance_to_loop(centroid, loop_points))
             .fold(f64::INFINITY, f64::min);
-        if nearest <= radius_factor * sigma {
+        if nearest_outer <= outer_factor * sigma || nearest_hole <= hole_factor * sigma {
             carved += 1;
             continue;
         }
@@ -3361,7 +3468,19 @@ fn complex_div(a: [f64; 2], b: [f64; 2]) -> Option<[f64; 2]> {
 /// circumferential); the rational factor adds the two valence-3 and two
 /// valence-5 singularities without changing the side of the annulus the field
 /// lines leave through.
+/// Rotation of the annulus cross field, in radians. The motorcycle graph (and
+/// therefore whether the QGP interior forms a ring) depends on this phase
+/// (Section 5.1.8: "the structure of the motorcycle graph is dependent on the
+/// phase of the cross field").
+const ANNULUS_PHASE: f64 = 0.0;
+
 fn annulus_fixture() -> Result<(Vec<[f64; 3]>, Vec<[usize; 3]>, Vec<f64>, Vec<f64>), String> {
+    annulus_fixture_with_phase(ANNULUS_PHASE)
+}
+
+fn annulus_fixture_with_phase(
+    phase: f64,
+) -> Result<(Vec<[f64; 3]>, Vec<[usize; 3]>, Vec<f64>, Vec<f64>), String> {
     const N_THETA: usize = 100;
     const N_RADIAL: usize = 10;
     const INNER: f64 = 0.4;
@@ -3399,8 +3518,7 @@ fn annulus_fixture() -> Result<(Vec<[f64; 3]>, Vec<[usize; 3]>, Vec<f64>, Vec<f6
             let z4 = [z2[0] * z2[0] - z2[1] * z2[1], 2.0 * z2[0] * z2[1]];
             // The O-grid field, rotated by `SPIRAL` so its field lines spiral
             // across the annulus instead of closing on themselves.
-            const SPIRAL: f64 = 0.0;
-            let (spiral_sin, spiral_cos) = (4.0 * SPIRAL).sin_cos();
+            let (spiral_sin, spiral_cos) = (4.0 * phase).sin_cos();
             let base = [z4[0] / (radius2 * radius2), z4[1] / (radius2 * radius2)];
             let prefactor = [
                 base[0] * spiral_cos - base[1] * spiral_sin,
@@ -3878,6 +3996,83 @@ mod tests {
             loops[0].len()
         );
         Ok(())
+    }
+
+    #[test]
+    fn annulus_ring_phase_sweep() -> Result<(), String> {
+        let mut best: Option<(f64, usize, usize)> = None;
+        for step in 0..8 {
+            let phase = step as f64 * 5.0 * std::f64::consts::PI / 180.0;
+            let (points, tris, alpha, size) = annulus_fixture_with_phase(phase)?;
+            let field = Field::new(&points, &tris, &alpha, &size)?;
+            let regions = build(&points, &tris, &alpha, &size)?;
+            let interior = regions.mesh()?;
+            let outer = field.boundary_points.clone();
+            let mut order: Vec<usize> = (0..outer.len()).collect();
+            order.sort_by_key(|&index| {
+                std::cmp::Reverse((loop_area(&outer[index]).abs() * 1e9) as i64)
+            });
+            let sorted: Vec<Vec<[f64; 2]>> = order.iter().map(|&i| outer[i].clone()).collect();
+            let hole = sorted[1].clone();
+            let hole_area = loop_area(&hole).abs();
+            let mut centre = [0.0f64; 2];
+            for point in &hole {
+                centre[0] += point[0] / hole.len() as f64;
+                centre[1] += point[1] / hole.len() as f64;
+            }
+            let mut ring_components = 0usize;
+            let mut ring_quads = 0usize;
+            for radius in [1.4f64, 1.6] {
+                let (carved, _) = carve_rings_two(&interior, &field, &sorted, radius, 0.3);
+                let (carved, _) = split_pinched_boundary(&carved)?;
+                for component in split_components(&carved) {
+                    let loops = match mesh_boundary_loops(&component) {
+                        Ok(found) => found,
+                        Err(_) => continue,
+                    };
+                    let mut has_inner = false;
+                    let mut has_outer = false;
+                    for ids in &loops {
+                        let pts = loop_points(&component, ids);
+                        let area = loop_area(&pts);
+                        let off = pts.iter().all(|&p| domain_distance(&sorted, p) > 1e-9);
+                        if !off {
+                            continue;
+                        }
+                        if area > 0.0 {
+                            has_outer = true;
+                        } else if area.abs() > hole_area && loop_contains(&pts, centre) {
+                            has_inner = true;
+                        }
+                    }
+                    if has_inner && has_outer {
+                        ring_components += 1;
+                        ring_quads = ring_quads.max(component.cells.len());
+                    }
+                }
+            }
+            println!(
+                "phase {:5.1} deg: tiles={} degenerate={} interior={} ring_components={} ring_quads={}",
+                phase.to_degrees(),
+                regions.tiles.len(),
+                regions.degenerate_tiles,
+                interior.cells.len(),
+                ring_components,
+                ring_quads
+            );
+            if ring_components > 0 && best.map(|(_, q, _)| ring_quads > q).unwrap_or(true) {
+                best = Some((phase, ring_quads, ring_components));
+            }
+        }
+        println!("best phase: {:?}", best);
+        Ok(())
+    }
+
+    fn domain_distance(loops: &[Vec<[f64; 2]>], p: [f64; 2]) -> f64 {
+        loops
+            .iter()
+            .map(|loop_points| distance_to_loop(p, loop_points))
+            .fold(f64::INFINITY, f64::min)
     }
 
     #[test]

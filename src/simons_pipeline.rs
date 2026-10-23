@@ -323,6 +323,7 @@ where
     let field_options = simons_godf::Options {
         accurate: true,
         holomorphic: 0.0,
+        ..simons_godf::Options::default()
     };
     let alpha =
         simons_godf::solve_with_options(&points, &tris, &size, &field_options, GODF_ITERATIONS)

@@ -87,6 +87,76 @@
 //! implements the soft-penalty form requested for it. The guidance weight is
 //! unrelated to the holomorphic parameter `s` of Eq. 18.
 //!
+//! # Boundary constraints (Section 3.3 and feature boundaries)
+//!
+//! The unconstrained problem uses the homogeneous Neumann condition of Section
+//! 3.3 (`du/dn = 0`), which is what [`BoundaryMode::None`] (the default)
+//! implements. [`BoundaryMode::Tangent`] adds an inhomogeneous Dirichlet
+//! condition at every boundary vertex: `u_i = G_i` with
+//! `G_i = exp(4 i theta_i)` and `theta_i` the average of the tangents of the
+//! incident boundary edges, averaged in the fourth-power representation (so the
+//! two perpendicular tangents of a square corner are identical). The interior
+//! minimises the same Dirichlet energy subject to that data. Because the data
+//! is inhomogeneous, the generalized eigenproblem becomes a linear
+//! energy-minimisation problem; it is solved by eliminating the boundary
+//! unknowns exactly (their columns move to the right-hand side and their rows
+//! become the identity). [`BoundaryMode::Weak`]`(w)` is the penalty version:
+//! `w M_ii (u_i - G_i)` is added at each boundary vertex, i.e. `w M_ii` on the
+//! diagonal and `w M_ii G_i` on the right-hand side. `Weak(0)` is exactly
+//! `None`; large `w` approaches `Tangent` (measured max difference
+//! `1.8e-5 rad` at `w = 1e6`). Guidance may be combined with either mode: the
+//! boundary rows win on the boundary, and the soft guidance term acts on the
+//! interior. An error is returned when a boundary mode is requested on a mesh
+//! with no boundary edges.
+//!
+//! # Anisotropy (Section 4.10)
+//!
+//! [`Options::anisotropy`] is the ratio `a = sigma/tau` and
+//! [`Options::anisotropy_angle`] is the direction `phi` of the `sigma` axis.
+//! The field is aligned by the soft energy
+//!
+//! ```text
+//! E_aniso(u) = w(a) ||u - exp(4 i phi)||_M^2,
+//! w(a)       = (a + 1/a - 2)^2.
+//! ```
+//!
+//! The bracket is the inner term of Eq. 4.7 with `k = 1`; the weight is a
+//! modelling choice. It is added to the same normal equations as guidance, so
+//! `a = 1` gives `w = 0` and exactly the historical field, while `a = 4` adds
+//! `w ~ 5.06`. Because the alignment term is inhomogeneous the solve is a
+//! single linear system, not an eigenproblem.
+//!
+//! *Deviation.* Chapter 4's anisotropy is an *output* measure of a cross field,
+//! not an input to the Chapter 3 solve. I derived the Levi-Civita connection
+//! for the anisotropic metric `g = diag(sigma^2, sigma^2/a^2)`; in the
+//! principal frame its transport generalises Eq. 3.5 to
+//! `dVy = a^2 uy Sx - ux Sy` (reducing exactly to Eq. 3.5 at `a = 1`). That
+//! extension is **not** used. A constant anisotropic metric has zero Dirichlet
+//! energy for every constant cross field, so transport alone cannot break the
+//! global-phase degeneracy, and on the coarse stretched-rectangle test the
+//! `a^2` term produced strong boundary-layer distortion. The transport is
+//! therefore exactly the thesis's Eq. 3.5, and anisotropy enters only through
+//! the alignment energy above.
+//!
+//! # Adaptive background refinement (Sections 3.2.5.1 and 3.4.2)
+//!
+//! [`Options::adaptive`]` = theta_max` enables one round. After the first
+//! solve, a triangle is flagged when the maximum 4-RoSy angle difference over
+//! its three vertices exceeds `theta_max`. All edges of flagged triangles are
+//! split (red-green: 1, 2 or 3 split edges give 2, 3 or 4 children), the size
+//! is linearly interpolated at the midpoints, guidance targets are interpolated
+//! in the fourth-power representation, and the field is re-solved on the
+//! refined mesh. Original vertices keep their indices, so the returned values
+//! at them are the refined solution evaluated there (no further interpolation
+//! is needed).
+//!
+//! *Simplification.* The thesis's predicate is a bound on the rotation that a
+//! pair of vertices would induce (from the size gradient) during background
+//! mesh generation, plus a curvature estimate. Here the variation of the
+//! *solved* field over each triangle is used (as requested), and only a single
+//! refinement round is performed. The refined mesh is not fed back into the
+//! downstream QGP extraction.
+//!
 //! # Accurate mass and Dirichlet integrals
 //!
 //! The flat-triangle limits quoted by the thesis are
@@ -158,9 +228,22 @@
 //!   before the shift), which is the smooth constant field; the shift makes
 //!   that eigenvalue `1e-8` rather than exactly zero, so the returned
 //!   eigenpair is the smallest of the shifted pencil, as in Algorithm 1.
-//! * **Guided iteration budget.** The guided problem is a single linear solve,
-//!   not an eigen-iteration. `iterations` still has to be positive; the
+//! * **Guided / constrained iteration budget.** Guidance, anisotropy and weak
+//!   boundary penalties make the problem a single linear solve, not an
+//!   eigen-iteration. `iterations` still has to be positive; the
 //!   conjugate-gradient cap is `max(400 + 8|V|, iterations)`, bounded by 6000.
+//! * **Boundary Dirichlet solve.** `Tangent` eliminates the boundary unknowns
+//!   instead of adding a finite penalty. The result is the exact minimiser of
+//!   the Dirichlet energy with the prescribed tangent data, not the smallest
+//!   eigenpair of the original pencil (which is not defined for inhomogeneous
+//!   data). Singularities are then counted exactly as for every other solve.
+//! * **Anisotropy.** The thesis does not feed anisotropy into the field solve,
+//!   and its conformal transport cannot choose a global phase. A soft alignment
+//!   energy is used instead; the anisotropic transport formula is documented
+//!   above but not applied. This is the main deviation of this module.
+//! * **Adaptive predicate.** The refinement test uses the solved field's
+//!   variation over a triangle, not the size-gradient rotation bound of Section
+//!   3.2.5.1; only one round is performed.
 //! * **Accurate integral evaluation.** The closed forms lose precision near
 //!   `Omega = 0`; a Taylor series (terms through `Omega^8`) is used for
 //!   `|Omega| < 0.1`, which is far below the accuracy of the double-precision
@@ -173,9 +256,11 @@
 //!
 //! # Not implemented
 //!
-//! Anisotropic sizing (Chapter 4), adaptive background-mesh refinement,
-//! singularity placement, boundary constraints, and the extraction of a quad
-//! mesh. The input is assumed planar: `z` is ignored and only `x, y` are used.
+//! Iterative multi-round adaptive refinement, the anisotropic transport derived
+//! above, singularity placement, the extraction of a quad mesh, and the
+//! compatibility analysis of Chapter 4 (the `sigma`/`tau` fields implied by a
+//! cross field). The input is assumed planar: `z` is ignored and only `x, y`
+//! are used.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -191,8 +276,33 @@ const INNER_TOLERANCE: f64 = 1e-9;
 /// Below this holonomy the helper integrals are evaluated by Taylor series.
 const INTEGRAL_SERIES_THRESHOLD: f64 = 0.1;
 
+/// How the field is constrained on the mesh boundary.
+///
+/// The thesis uses homogeneous Neumann conditions for the unconstrained
+/// Helmholtz problem (Section 3.3). When a boundary is a *feature* (a plate
+/// edge, a hole), the field should instead have one of its four axes along the
+/// boundary tangent; this enum selects that constraint.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum BoundaryMode {
+    /// No boundary constraint: the historical homogeneous-Neumann field.
+    #[default]
+    None,
+    /// Fix every boundary vertex to the boundary tangent (a Dirichlet
+    /// constraint). The field at a boundary vertex is `exp(4 i theta)` with
+    /// `theta` the tangent angle, taken modulo `pi/2`. The interior is the
+    /// minimum-energy extension of that data.
+    Tangent,
+    /// Penalty form: add `weight * diag(M)` to the energy diagonal on boundary
+    /// vertices and `weight * diag(M) * G` to the right-hand side, with `G` the
+    /// tangent target. Large weight approaches [`BoundaryMode::Tangent`];
+    /// `weight = 0` is the same as [`BoundaryMode::None`]. The penalty is
+    /// relative to the (lumped) mass matrix, so it has the same scale as the
+    /// Dirichlet energy on meshes of any element size.
+    Weak(f64),
+}
+
 /// Options for [`solve_with_options`].
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Options {
     /// Use the curvature-aware `MassIJ`/`DirichletIJ` integrals of GODF
     /// Appendix D (quoted by the thesis as Eqs. 17-18) instead of their
@@ -206,6 +316,44 @@ pub struct Options {
     /// singularities); `s = -1` is the anti-holomorphic energy. Values outside
     /// `[-1, 1]` and non-finite values are rejected by the solvers.
     pub holomorphic: f64,
+    /// Anisotropy ratio `sigma / tau` (Section 4.10 of the thesis; `a >= 1`
+    /// means the `sigma` axis is longer). The default, `1`, is the isotropic
+    /// metric of Chapter 3 and reproduces the historical field.
+    ///
+    /// The ratio adds a soft alignment energy toward the frame rotated by
+    /// [`Options::anisotropy_angle`], with weight `(a + 1/a - 2)^2`; the exact
+    /// formula is in the module documentation. `a = 1` is exactly isotropic
+    /// and reproduces the historical field. The anisotropic transport formula
+    /// is documented there too, but it is not applied (see the deviation).
+    /// Non-finite and non-positive values are rejected.
+    pub anisotropy: f64,
+    /// Direction (radians, counter-clockwise from `+x`) of the `sigma` axis of
+    /// the anisotropic metric. The default, `0`, is the `+x` axis. Ignored
+    /// when [`Options::anisotropy`] is `1`. Non-finite values are rejected.
+    pub anisotropy_angle: f64,
+    /// Boundary constraint (the thesis's homogeneous Neumann condition is the
+    /// default).
+    pub boundary: BoundaryMode,
+    /// Field-variation threshold (radians of cross-field angle) for one round
+    /// of adaptive background refinement (Sections 3.2.5.1 and 3.4.2). A
+    /// triangle is refined (red-green) when the maximum 4-RoSy angle
+    /// difference over its three vertices exceeds this value; the field is
+    /// then re-solved on the refined mesh. `0` (the default) disables
+    /// refinement. Non-finite and negative values are rejected.
+    pub adaptive: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            accurate: false,
+            holomorphic: 0.0,
+            anisotropy: 1.0,
+            anisotropy_angle: 0.0,
+            boundary: BoundaryMode::None,
+            adaptive: 0.0,
+        }
+    }
 }
 
 /// A per-vertex target cross field for [`solve_with_guidance`].
@@ -639,6 +787,317 @@ fn validate_guidance(vertices: usize, guidance: &Guidance) -> Result<(), String>
     Ok(())
 }
 
+/// Validates the new options.
+fn validate_options(options: &Options) -> Result<(), String> {
+    if !options.holomorphic.is_finite() || !(-1.0..=1.0).contains(&options.holomorphic) {
+        return Err(format!(
+            "the holomorphic parameter s = {} is not finite and in [-1, 1]",
+            options.holomorphic
+        ));
+    }
+    if !options.anisotropy.is_finite() || options.anisotropy <= 0.0 {
+        return Err(format!(
+            "the anisotropy ratio a = {} is not finite and positive",
+            options.anisotropy
+        ));
+    }
+    if !options.anisotropy_angle.is_finite() {
+        return Err(format!(
+            "the anisotropy direction {} is not finite",
+            options.anisotropy_angle
+        ));
+    }
+    if !options.adaptive.is_finite() || options.adaptive < 0.0 {
+        return Err(format!(
+            "the adaptive threshold {} is not finite and non-negative",
+            options.adaptive
+        ));
+    }
+    match options.boundary {
+        BoundaryMode::None | BoundaryMode::Tangent => {}
+        BoundaryMode::Weak(weight) => {
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(format!(
+                    "the weak boundary weight {weight} is not finite and non-negative"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Soft alignment weight of the anisotropic metric (Section 4.10).
+///
+/// Chapter 4 measures anisotropy by `(sigma/tau + tau/sigma - 2)^(2k)` (Eq.
+/// 4.7). With `k = 1` the bracket is `a + 1/a - 2`, and this implementation
+/// uses its square `(a + 1/a - 2)^2` as the soft weight in the mass inner
+/// product. That makes `a = 1` exactly isotropic (weight zero) and gives
+/// `a = 4` a weight of about `5.06`, strong enough to overcome the smoothing
+/// energy on the test rectangle. The weight is a modelling choice, documented
+/// as a deviation because the thesis does not feed anisotropy back into the
+/// field solve.
+fn anisotropy_alignment_weight(anisotropy: f64) -> f64 {
+    if anisotropy == 1.0 {
+        return 0.0;
+    }
+    let measure = anisotropy + anisotropy.recip() - 2.0;
+    measure * measure
+}
+
+/// Boundary vertices and their complex tangent targets `exp(4 i theta)`.
+///
+/// An edge is a boundary edge when it belongs to exactly one triangle. The
+/// tangent thetas of all boundary edges incident to a vertex are averaged in
+/// the fourth-power representation, which is exactly the average that a
+/// 4-RoSy field is invariant under (a square corner's two tangents are
+/// perpendicular, hence identical after taking the fourth power).
+fn boundary_targets(
+    points: &[[f64; 3]],
+    tris: &[[usize; 3]],
+    vertices: usize,
+) -> Result<(Vec<bool>, Vec<Complex>), String> {
+    let mut counts: HashMap<(usize, usize), usize> = HashMap::new();
+    for triangle in tris {
+        for (u, v) in [
+            (triangle[0], triangle[1]),
+            (triangle[1], triangle[2]),
+            (triangle[2], triangle[0]),
+        ] {
+            let key = if u < v { (u, v) } else { (v, u) };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let mut is_boundary = vec![false; vertices];
+    let mut sum = vec![Complex::ZERO; vertices];
+    let mut first = vec![Complex::ONE; vertices];
+    let mut has_first = vec![false; vertices];
+    let mut edges = 0usize;
+    for triangle in tris {
+        for (u, v) in [
+            (triangle[0], triangle[1]),
+            (triangle[1], triangle[2]),
+            (triangle[2], triangle[0]),
+        ] {
+            let key = if u < v { (u, v) } else { (v, u) };
+            if counts.get(&key).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            edges += 1;
+            let tangent = (points[v][1] - points[u][1]).atan2(points[v][0] - points[u][0]);
+            let value = Complex::from_angle(FIELD_SYMMETRY * tangent);
+            for vertex in [u, v] {
+                is_boundary[vertex] = true;
+                sum[vertex] = sum[vertex].add(value);
+                if !has_first[vertex] {
+                    has_first[vertex] = true;
+                    first[vertex] = value;
+                }
+            }
+        }
+    }
+    if edges == 0 {
+        return Err("the mesh has no boundary edges".into());
+    }
+    let mut targets = vec![Complex::ZERO; vertices];
+    for vertex in 0..vertices {
+        if !is_boundary[vertex] {
+            continue;
+        }
+        let norm = (sum[vertex].re * sum[vertex].re + sum[vertex].im * sum[vertex].im).sqrt();
+        targets[vertex] = if norm.is_finite() && norm > 1e-12 {
+            sum[vertex].scale(norm.recip())
+        } else {
+            first[vertex]
+        };
+    }
+    Ok((is_boundary, targets))
+}
+
+/// Fixes the rows of a Hermitian matrix for an exact Dirichlet condition.
+///
+/// Off-diagonal entries incident to a boundary vertex are dropped (their
+/// contribution to the interior rows is moved to the right-hand side by the
+/// caller) and the boundary diagonal is set to one, so the corresponding
+/// unknown is exactly its prescribed value.
+fn dirichlet_rows(mut matrix: Hermitian, is_boundary: &[bool]) -> Hermitian {
+    for edge in 0..matrix.off_diagonal.len() {
+        if is_boundary[matrix.edge_a[edge]] || is_boundary[matrix.edge_b[edge]] {
+            matrix.off_diagonal[edge] = Complex::ZERO;
+        }
+    }
+    for (vertex, boundary) in is_boundary.iter().enumerate() {
+        if *boundary {
+            matrix.diagonal[vertex] = 1.0;
+        }
+    }
+    matrix
+}
+
+/// Maximum 4-RoSy angle difference over the vertices of a triangle.
+fn triangle_field_variation(alpha: &[f64], triangle: &[usize; 3]) -> f64 {
+    let mut variation = 0.0f64;
+    for (u, v) in [
+        (triangle[0], triangle[1]),
+        (triangle[1], triangle[2]),
+        (triangle[2], triangle[0]),
+    ] {
+        let a = alpha[u];
+        let b = alpha[v];
+        let d = (a - b).rem_euclid(std::f64::consts::FRAC_PI_2);
+        variation = variation.max(d.min(std::f64::consts::FRAC_PI_2 - d));
+    }
+    variation
+}
+
+/// One round of red-green refinement on the triangles whose field variation
+/// exceeds `threshold`.
+///
+/// Returns the refined mesh, the extended size values, the number of flagged
+/// (parent) triangles, and the ordered edge list `(a, b)` of the midpoints (so
+/// that a guidance field can be interpolated on the new vertices). The
+/// original vertices keep their indices, so the solution on the refined mesh
+/// can be read back at them directly (there is nothing to interpolate at an
+/// original vertex). A midpoint inherits the average of its edge's endpoint
+/// sizes, which is the exact piecewise-linear interpolation.
+fn refine_once(
+    points: &[[f64; 3]],
+    tris: &[[usize; 3]],
+    size: &[f64],
+    alpha: &[f64],
+    threshold: f64,
+) -> (
+    Vec<[f64; 3]>,
+    Vec<[usize; 3]>,
+    Vec<f64>,
+    usize,
+    Vec<(usize, usize)>,
+) {
+    let mut split_edge: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut edge_order: Vec<(usize, usize)> = Vec::new();
+    let mut flagged = 0usize;
+    for triangle in tris {
+        if triangle_field_variation(alpha, triangle) <= threshold {
+            continue;
+        }
+        flagged += 1;
+        for (u, v) in [
+            (triangle[0], triangle[1]),
+            (triangle[1], triangle[2]),
+            (triangle[2], triangle[0]),
+        ] {
+            let key = if u < v { (u, v) } else { (v, u) };
+            if let Entry::Vacant(entry) = split_edge.entry(key) {
+                entry.insert(usize::MAX);
+                edge_order.push(key);
+            }
+        }
+    }
+
+    let mut refined_points = points.to_vec();
+    let mut refined_size = size.to_vec();
+    for key in &edge_order {
+        let index = refined_points.len();
+        split_edge.insert(*key, index);
+        refined_points.push([
+            0.5 * (points[key.0][0] + points[key.1][0]),
+            0.5 * (points[key.0][1] + points[key.1][1]),
+            0.0,
+        ]);
+        refined_size.push(0.5 * (size[key.0] + size[key.1]));
+    }
+
+    let midpoint = |u: usize, v: usize| -> Option<usize> {
+        let key = if u < v { (u, v) } else { (v, u) };
+        split_edge
+            .get(&key)
+            .copied()
+            .filter(|&index| index != usize::MAX)
+    };
+
+    let mut refined_tris: Vec<[usize; 3]> = Vec::with_capacity(tris.len() * 2);
+    for triangle in tris {
+        let [a, b, c] = *triangle;
+        let m_ab = midpoint(a, b);
+        let m_bc = midpoint(b, c);
+        let m_ca = midpoint(c, a);
+        match (m_ab, m_bc, m_ca) {
+            (None, None, None) => refined_tris.push([a, b, c]),
+            (Some(p), None, None) => {
+                refined_tris.push([a, p, c]);
+                refined_tris.push([p, b, c]);
+            }
+            (None, Some(q), None) => {
+                refined_tris.push([a, b, q]);
+                refined_tris.push([a, q, c]);
+            }
+            (None, None, Some(r)) => {
+                refined_tris.push([a, b, r]);
+                refined_tris.push([r, b, c]);
+            }
+            (Some(p), Some(q), None) => {
+                // Marked edges meet at `b`.
+                refined_tris.push([b, p, q]);
+                refined_tris.push([p, a, c]);
+                refined_tris.push([p, c, q]);
+            }
+            (None, Some(q), Some(r)) => {
+                // Marked edges meet at `c`.
+                refined_tris.push([c, q, r]);
+                refined_tris.push([q, b, a]);
+                refined_tris.push([q, a, r]);
+            }
+            (Some(p), None, Some(r)) => {
+                // Marked edges meet at `a`.
+                refined_tris.push([a, p, r]);
+                refined_tris.push([p, b, c]);
+                refined_tris.push([p, c, r]);
+            }
+            (Some(p), Some(q), Some(r)) => {
+                refined_tris.push([a, p, r]);
+                refined_tris.push([p, b, q]);
+                refined_tris.push([r, q, c]);
+                refined_tris.push([p, q, r]);
+            }
+        }
+    }
+    (
+        refined_points,
+        refined_tris,
+        refined_size,
+        flagged,
+        edge_order,
+    )
+}
+
+/// Extends a guided target field to the vertices added by [`refine_once`].
+///
+/// New vertices are edge midpoints, so their target is the circular mean of
+/// the two endpoint targets in the fourth-power representation. The original
+/// vertices keep their targets (the first `guidance.angle.len()` entries).
+fn extend_guidance(
+    guidance: &Guidance,
+    edge_order: &[(usize, usize)],
+    refined_vertices: usize,
+) -> Guidance {
+    let mut angle = Vec::with_capacity(refined_vertices);
+    angle.extend_from_slice(&guidance.angle);
+    for &(a, b) in edge_order {
+        let first = Complex::from_angle(FIELD_SYMMETRY * guidance.angle[a]);
+        let second = Complex::from_angle(FIELD_SYMMETRY * guidance.angle[b]);
+        let sum = first.add(second);
+        let norm = (sum.re * sum.re + sum.im * sum.im).sqrt();
+        angle.push(if norm.is_finite() && norm > 1e-12 {
+            cross_angle(sum)
+        } else {
+            guidance.angle[a]
+        });
+    }
+    Guidance {
+        weight: guidance.weight,
+        angle,
+    }
+}
+
 /// Jacobi-preconditioned conjugate gradients for the Hermitian system `matrix x = rhs`.
 ///
 /// Returns the iterate and the number of iterations actually performed.
@@ -760,7 +1219,7 @@ fn angles_from(values: &[Complex]) -> Result<Vec<f64>, String> {
 }
 
 /// Shared implementation of the unguided and guided solves.
-fn solve_impl(
+fn solve_mesh(
     points: &[[f64; 3]],
     tris: &[[usize; 3]],
     size: &[f64],
@@ -769,12 +1228,7 @@ fn solve_impl(
     iterations: usize,
 ) -> Result<Vec<f64>, String> {
     let n = validate(points, tris, size, iterations)?;
-    if !options.holomorphic.is_finite() || !(-1.0..=1.0).contains(&options.holomorphic) {
-        return Err(format!(
-            "the holomorphic parameter s = {} is not finite and in [-1, 1]",
-            options.holomorphic
-        ));
-    }
+    validate_options(options)?;
     if let Some(guidance) = guidance {
         validate_guidance(n, guidance)?;
     }
@@ -975,7 +1429,14 @@ fn solve_impl(
     // Algorithm 1, line 33, made scale-relative; see the module documentation.
     let shift = ENERGY_SHIFT * energy_trace / mass_trace;
 
-    // Guided solve: `(A + s M) u = s M G`, a single Hermitian linear solve.
+    // Algorithm 1, line 33: the shifted energy pencil.
+    let shifted_energy = energy.shifted(shift, &mass)?;
+
+    // Soft terms of the normal equations: the guidance penalty of
+    // `solve_with_guidance` and the anisotropy alignment of Section 4.10.
+    // Each term contributes `w M` to the energy and `w M G` to the right-hand
+    // side, i.e. the linear system `(A + shift M + sum w M) u = sum w M G`.
+    let mut soft: Vec<(f64, Vec<Complex>)> = Vec::new();
     if let Some(guidance) = guidance {
         if guidance.weight > 0.0 {
             let target: Vec<Complex> = guidance
@@ -983,20 +1444,111 @@ fn solve_impl(
                 .iter()
                 .map(|&angle| Complex::from_angle(FIELD_SYMMETRY * angle))
                 .collect();
-            let rhs: Vec<Complex> = mass
-                .apply(&target)
-                .iter()
-                .map(|value| value.scale(guidance.weight))
+            soft.push((guidance.weight, target));
+        }
+    }
+    let anisotropy_weight = anisotropy_alignment_weight(options.anisotropy);
+    if anisotropy_weight > 0.0 {
+        soft.push((
+            anisotropy_weight,
+            vec![Complex::from_angle(FIELD_SYMMETRY * options.anisotropy_angle); n],
+        ));
+    }
+
+    let weak_weight = match options.boundary {
+        BoundaryMode::Weak(weight) => weight,
+        BoundaryMode::None | BoundaryMode::Tangent => 0.0,
+    };
+    let constrained = matches!(options.boundary, BoundaryMode::Tangent) || weak_weight > 0.0;
+    if constrained {
+        let (is_boundary, targets) = boundary_targets(points, tris, n)?;
+        let max_iterations = (400 + 8 * n).max(iterations).min(6000);
+        if options.boundary == BoundaryMode::Tangent {
+            // Exact Dirichlet elimination: the boundary unknowns are known, so
+            // their columns move to the right-hand side and their rows become
+            // the identity. The interior then minimises the same energy.
+            let boundary_data: Vec<Complex> = (0..n)
+                .map(|i| {
+                    if is_boundary[i] {
+                        targets[i]
+                    } else {
+                        Complex::ZERO
+                    }
+                })
                 .collect();
-            let system = energy.shifted(shift + guidance.weight, &mass)?;
-            let max_iterations = (400 + 8 * n).max(iterations).min(6000);
+            let coupling = shifted_energy.apply(&boundary_data);
+            let mut system = shifted_energy;
+            let mut rhs = vec![Complex::ZERO; n];
+            for (weight, target) in &soft {
+                let interior: Vec<Complex> = target
+                    .iter()
+                    .enumerate()
+                    .map(|(i, value)| {
+                        if is_boundary[i] {
+                            Complex::ZERO
+                        } else {
+                            *value
+                        }
+                    })
+                    .collect();
+                let applied = mass.apply(&interior);
+                for i in 0..n {
+                    if !is_boundary[i] {
+                        rhs[i] = rhs[i].add(applied[i].scale(*weight));
+                    }
+                }
+                system = system.shifted(*weight, &mass)?;
+            }
+            for i in 0..n {
+                if is_boundary[i] {
+                    rhs[i] = targets[i];
+                } else {
+                    rhs[i] = rhs[i].sub(coupling[i]);
+                }
+            }
+            let system = dirichlet_rows(system, &is_boundary);
             let (solution, _) = conjugate_gradient(&system, &rhs, INNER_TOLERANCE, max_iterations)?;
             return angles_from(&solution);
         }
+        // Weak penalty, lumped to the mass diagonal: `+ w M_ii u_i = w M_ii G_i`
+        // at boundary vertices.
+        let mut system = shifted_energy;
+        let mut rhs = vec![Complex::ZERO; n];
+        for i in 0..n {
+            if is_boundary[i] {
+                let penalty = weak_weight * mass.diagonal[i];
+                system.diagonal[i] += penalty;
+                rhs[i] = targets[i].scale(penalty);
+            }
+        }
+        for (weight, target) in &soft {
+            let applied = mass.apply(target);
+            for i in 0..n {
+                rhs[i] = rhs[i].add(applied[i].scale(*weight));
+            }
+            system = system.shifted(*weight, &mass)?;
+        }
+        let (solution, _) = conjugate_gradient(&system, &rhs, INNER_TOLERANCE, max_iterations)?;
+        return angles_from(&solution);
+    }
+
+    if !soft.is_empty() {
+        let mut system = shifted_energy;
+        let mut rhs = vec![Complex::ZERO; n];
+        for (weight, target) in &soft {
+            let applied = mass.apply(target);
+            for i in 0..n {
+                rhs[i] = rhs[i].add(applied[i].scale(*weight));
+            }
+            system = system.shifted(*weight, &mass)?;
+        }
+        let max_iterations = (400 + 8 * n).max(iterations).min(6000);
+        let (solution, _) = conjugate_gradient(&system, &rhs, INNER_TOLERANCE, max_iterations)?;
+        return angles_from(&solution);
     }
 
     // Unguided solve: smallest eigenpair of the shifted pencil.
-    let shifted = energy.shifted(shift, &mass)?;
+    let shifted = shifted_energy;
     let average_diagonal = energy_trace / n as f64;
 
     // Deterministic start: a constant direction plus a small complex ramp over
@@ -1071,6 +1623,58 @@ fn solve_impl(
     angles_from(&x)
 }
 
+/// Shared implementation: validate, solve, and optionally refine once.
+fn solve_impl(
+    points: &[[f64; 3]],
+    tris: &[[usize; 3]],
+    size: &[f64],
+    options: &Options,
+    guidance: Option<&Guidance>,
+    iterations: usize,
+) -> Result<Vec<f64>, String> {
+    let n = validate(points, tris, size, iterations)?;
+    validate_options(options)?;
+    if let Some(guidance) = guidance {
+        validate_guidance(n, guidance)?;
+    }
+    let alpha = solve_mesh(points, tris, size, options, guidance, iterations)?;
+    if options.adaptive <= 0.0 {
+        return Ok(alpha);
+    }
+
+    // One refinement round on the field's own variation (Sections 3.2.5.1 and
+    // 3.4.2), then a re-solve on the refined background mesh. The original
+    // vertices keep their indices, so reading their new values is the
+    // interpolation back to the original mesh.
+    let (refined_points, refined_tris, refined_size, flagged, edge_order) =
+        refine_once(points, tris, size, &alpha, options.adaptive);
+    if flagged == 0 {
+        return Ok(alpha);
+    }
+    let mut inner = *options;
+    inner.adaptive = 0.0;
+    let extended;
+    let refined_guidance = match guidance {
+        Some(guidance) if guidance.weight > 0.0 => {
+            extended = extend_guidance(guidance, &edge_order, refined_points.len());
+            Some(&extended)
+        }
+        _ => None,
+    };
+    let refined_alpha = solve_mesh(
+        &refined_points,
+        &refined_tris,
+        &refined_size,
+        &inner,
+        refined_guidance,
+        iterations,
+    )?;
+    if refined_alpha.len() < n {
+        return Err("internal error: the refined field lost original vertices".into());
+    }
+    Ok(refined_alpha[..n].to_vec())
+}
+
 /// Computes a size-aware cross field on a planar triangle mesh.
 ///
 /// `points` are the mesh vertices (`z` is ignored), `tris` the triangles
@@ -1111,13 +1715,20 @@ pub fn solve(
 ///
 /// With `options.accurate == true` the curvature-aware `MassIJ` and
 /// `DirichletIJ` integrals of GODF Appendix D replace the flat limits. The
-/// `s = 0` eigenproblem and the returned angles are otherwise identical to
+/// other fields enable the holomorphic energy ([`Options::holomorphic`]),
+/// boundary tangent constraints ([`Options::boundary`]), the anisotropic
+/// alignment of Section 4.10 ([`Options::anisotropy`] and
+/// [`Options::anisotropy_angle`]) and one round of adaptive refinement
+/// ([`Options::adaptive`]). With all defaults the result is identical to
 /// [`solve`].
 ///
 /// # Example
 ///
 /// ```no_run
-/// let options = pedroso_mesher::simons_godf::Options { accurate: true, holomorphic: 0.0 };
+/// let options = pedroso_mesher::simons_godf::Options {
+///     accurate: true,
+///     ..pedroso_mesher::simons_godf::Options::default()
+/// };
 /// let alpha = pedroso_mesher::simons_godf::solve_with_options(
 ///     &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
 ///     &[[0, 1, 2]],
@@ -1144,7 +1755,9 @@ pub fn solve_with_options(
 /// `G_i = exp(4 i guidance.angle[i])`, and `A`, `M` the Dirichlet energy and
 /// mass matrices. `guidance.weight == 0` returns exactly the unguided field of
 /// [`solve`]; larger weights favour the target. The returned angles have the
-/// same representation and `[0, pi/2)` range as [`solve`].
+/// same representation and `[0, pi/2)` range as [`solve`]. This entry point
+/// uses [`Options::default`]; use [`solve_with_guidance_and_options`] for
+/// boundary, anisotropy and adaptive options.
 ///
 /// Returns an error when the mesh is invalid, when `guidance.weight` is
 /// negative or non-finite, or when `guidance.angle` does not have one finite
@@ -1185,8 +1798,11 @@ pub fn solve_with_guidance(
 
 /// Computes a guided cross field with explicit [`Options`].
 ///
-/// Combines the accurate-integral switch of [`solve_with_options`] with the
-/// soft alignment of [`solve_with_guidance`].
+/// Combines the soft alignment of [`solve_with_guidance`] with every option of
+/// [`solve_with_options`] (accurate integrals, holomorphic energy, boundary
+/// constraints, anisotropy and adaptive refinement). When a boundary
+/// constraint is active, the boundary tangent wins over `guidance` on the
+/// boundary vertices.
 pub fn solve_with_guidance_and_options(
     points: &[[f64; 3]],
     tris: &[[usize; 3]],
@@ -1312,6 +1928,190 @@ fn demo_square_mesh(n: usize) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
     (points, tris)
 }
 
+/// Counter-clockwise triangulation of an `nx` by `ny` rectangle.
+fn demo_grid_mesh(
+    nx: usize,
+    ny: usize,
+    width: f64,
+    height: f64,
+) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
+    let nx = nx.max(1);
+    let ny = ny.max(1);
+    let mut points = Vec::with_capacity((nx + 1) * (ny + 1));
+    for j in 0..=ny {
+        for i in 0..=nx {
+            points.push([
+                width * i as f64 / nx as f64,
+                height * j as f64 / ny as f64,
+                0.0,
+            ]);
+        }
+    }
+    let mut tris = Vec::with_capacity(2 * nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            let a = j * (nx + 1) + i;
+            let b = a + 1;
+            let c = a + nx + 2;
+            let d = a + nx + 1;
+            tris.push([a, b, c]);
+            tris.push([a, c, d]);
+        }
+    }
+    (points, tris)
+}
+
+/// An annular plate with a circular hole.
+///
+/// The inner ring is a circle of radius `0.35` and the outer ring a concentric
+/// circle of radius `1.0`; both are genuine circles, so a field that follows
+/// the hole can also be tangent to the outer boundary without singularities.
+/// Used by [`demo_boundary`].
+fn demo_plate_with_hole(radial: usize, angular: usize) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
+    let radial = radial.max(1);
+    let angular = angular.max(4);
+    let inner = 0.35f64;
+    let mut points = Vec::with_capacity((radial + 1) * angular);
+    for ring in 0..=radial {
+        let fraction = ring as f64 / radial as f64;
+        for sector in 0..angular {
+            let phi = std::f64::consts::TAU * sector as f64 / angular as f64;
+            let (sin, cos) = phi.sin_cos();
+            let radius = inner + (1.0 - inner) * fraction;
+            points.push([radius * cos, radius * sin, 0.0]);
+        }
+    }
+    let mut tris = Vec::with_capacity(2 * radial * angular);
+    for ring in 0..radial {
+        for sector in 0..angular {
+            let next = (sector + 1) % angular;
+            let a = ring * angular + sector;
+            let b = (ring + 1) * angular + sector;
+            let c = (ring + 1) * angular + next;
+            let d = ring * angular + next;
+            tris.push([a, b, c]);
+            tris.push([a, c, d]);
+        }
+    }
+    (points, tris)
+}
+
+/// Unique edges that belong to exactly one triangle (the mesh boundary).
+fn boundary_edges(tris: &[[usize; 3]]) -> Vec<(usize, usize)> {
+    let mut counts: HashMap<(usize, usize), usize> = HashMap::new();
+    for triangle in tris {
+        for (u, v) in [
+            (triangle[0], triangle[1]),
+            (triangle[1], triangle[2]),
+            (triangle[2], triangle[0]),
+        ] {
+            let key = if u < v { (u, v) } else { (v, u) };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let mut edges = Vec::new();
+    for triangle in tris {
+        for (u, v) in [
+            (triangle[0], triangle[1]),
+            (triangle[1], triangle[2]),
+            (triangle[2], triangle[0]),
+        ] {
+            let key = if u < v { (u, v) } else { (v, u) };
+            if counts.get(&key).copied().unwrap_or(0) == 1 {
+                edges.push((u, v));
+            }
+        }
+    }
+    edges
+}
+
+/// 4-RoSy distance between two cross-field angles.
+fn cross_angle_distance(a: f64, b: f64) -> f64 {
+    let d = (a - b).rem_euclid(std::f64::consts::FRAC_PI_2);
+    d.min(std::f64::consts::FRAC_PI_2 - d)
+}
+
+/// Circular mean of a cross field, in `[0, pi/2)`.
+fn mean_cross_angle(alpha: &[f64]) -> f64 {
+    let mut sum = Complex::ZERO;
+    for &angle in alpha {
+        sum = sum.add(Complex::from_angle(FIELD_SYMMETRY * angle));
+    }
+    cross_angle(sum)
+}
+
+/// Mean and maximum 4-RoSy distance to the boundary tangent over the vertices
+/// in a band of width `band`.
+///
+/// The tangent at a boundary vertex is the average (in the fourth-power
+/// representation) of the tangents of its incident boundary edges, exactly the
+/// target used by [`BoundaryMode::Tangent`]; this matters on a smooth boundary,
+/// where a single edge's chord direction is offset by half a sector. A vertex
+/// is in the band when its distance to the nearest boundary vertex is at most
+/// `band`. When `radius_limit` is given, only vertices whose distance to the
+/// origin is at most that value are considered; this isolates the inner
+/// boundary of the plate-with-hole demo. Returns `(mean, maximum, count)`; an
+/// empty band gives `(0, 0, 0)`.
+fn boundary_band_measure(
+    points: &[[f64; 3]],
+    tris: &[[usize; 3]],
+    alpha: &[f64],
+    band: f64,
+    radius_limit: Option<f64>,
+) -> (f64, f64, usize) {
+    let edges = boundary_edges(tris);
+    let mut sum = vec![Complex::ZERO; points.len()];
+    let mut is_boundary = vec![false; points.len()];
+    for (u, v) in edges {
+        let tangent = (points[v][1] - points[u][1]).atan2(points[v][0] - points[u][0]);
+        let value = Complex::from_angle(FIELD_SYMMETRY * tangent);
+        for vertex in [u, v] {
+            is_boundary[vertex] = true;
+            sum[vertex] = sum[vertex].add(value);
+        }
+    }
+    let boundary: Vec<(usize, f64)> = (0..points.len())
+        .filter(|&vertex| is_boundary[vertex])
+        .map(|vertex| (vertex, cross_angle(sum[vertex])))
+        .collect();
+
+    let mut total = 0.0f64;
+    let mut maximum = 0.0f64;
+    let mut count = 0usize;
+    for (vertex, point) in points.iter().enumerate() {
+        if vertex >= alpha.len() {
+            continue;
+        }
+        if let Some(limit) = radius_limit {
+            if (point[0] * point[0] + point[1] * point[1]).sqrt() > limit {
+                continue;
+            }
+        }
+        let mut nearest = f64::INFINITY;
+        let mut target = 0.0f64;
+        for &(boundary_vertex, boundary_angle) in &boundary {
+            let dx = point[0] - points[boundary_vertex][0];
+            let dy = point[1] - points[boundary_vertex][1];
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance < nearest {
+                nearest = distance;
+                target = boundary_angle;
+            }
+        }
+        if nearest <= band {
+            let d = cross_angle_distance(alpha[vertex], target);
+            total += d;
+            maximum = maximum.max(d);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        (0.0, 0.0, 0)
+    } else {
+        (total / count as f64, maximum, count)
+    }
+}
+
 /// Measurements of the holomorphic parameter `s` on a guided, graded square.
 ///
 /// The case is a `10 x 10` unit square with the graded size `sigma = 1 + x/2`,
@@ -1339,6 +2139,7 @@ pub fn demo_holomorphic() -> Result<Vec<(f64, f64, f64)>, String> {
         &Options {
             accurate: true,
             holomorphic: 0.0,
+            ..Options::default()
         },
         100,
     )?;
@@ -1352,6 +2153,7 @@ pub fn demo_holomorphic() -> Result<Vec<(f64, f64, f64)>, String> {
             &Options {
                 accurate: true,
                 holomorphic: s,
+                ..Options::default()
             },
             100,
         )?;
@@ -1367,6 +2169,284 @@ pub fn demo_holomorphic() -> Result<Vec<(f64, f64, f64)>, String> {
         out.push((s, mean, maximum));
     }
     Ok(out)
+}
+
+/// Measurements of [`BoundaryMode`] on the square and the plate-with-hole.
+#[derive(Clone, Debug, Default)]
+pub struct BoundaryReport {
+    /// Mean 4-RoSy distance to the boundary tangent in the square band, before.
+    pub square_before_mean: f64,
+    /// Mean 4-RoSy distance to the boundary tangent in the square band, after.
+    pub square_after_mean: f64,
+    /// Maximum distance in the square band, before.
+    pub square_before_max: f64,
+    /// Maximum distance in the square band, after.
+    pub square_after_max: f64,
+    /// Number of vertices in the square band.
+    pub square_band_vertices: usize,
+    /// `(valence-3, valence-5)` singularities on the square, before.
+    pub square_singularities_before: (usize, usize),
+    /// `(valence-3, valence-5)` singularities on the square, after.
+    pub square_singularities_after: (usize, usize),
+    /// Mean 4-RoSy distance to the circular-hole tangent, before.
+    pub hole_before_mean: f64,
+    /// Mean 4-RoSy distance to the circular-hole tangent, after.
+    pub hole_after_mean: f64,
+    /// Maximum distance in the hole band, before.
+    pub hole_before_max: f64,
+    /// Maximum distance in the hole band, after.
+    pub hole_after_max: f64,
+    /// Number of vertices in the hole band.
+    pub hole_band_vertices: usize,
+    /// `(valence-3, valence-5)` singularities on the annular plate, before.
+    pub hole_singularities_before: (usize, usize),
+    /// `(valence-3, valence-5)` singularities on the annular plate, after.
+    pub hole_singularities_after: (usize, usize),
+}
+
+/// Measures the boundary-tangent constraint on a `10 x 10` graded square and on
+/// an annular plate with a circular hole.
+///
+/// The square uses `sigma = 1 + x/2`, so its unconstrained field rotates with
+/// `x`; the annular plate uses a constant size. "Before" is
+/// [`BoundaryMode::None`], "after" is [`BoundaryMode::Tangent`]. The plate's
+/// annulus is topologically compatible with a smooth tangent field, so both
+/// solves have zero singularities.
+///
+/// Returns an error only if one of the solves fails.
+pub fn demo_boundary() -> Result<BoundaryReport, String> {
+    let (square_points, square_tris) = demo_square_mesh(10);
+    let square_size: Vec<f64> = square_points
+        .iter()
+        .map(|point| 1.0 + 0.5 * point[0])
+        .collect();
+    let square_before = solve_with_options(
+        &square_points,
+        &square_tris,
+        &square_size,
+        &Options::default(),
+        100,
+    )?;
+    let square_after = solve_with_options(
+        &square_points,
+        &square_tris,
+        &square_size,
+        &Options {
+            boundary: BoundaryMode::Tangent,
+            ..Options::default()
+        },
+        100,
+    )?;
+    let (square_before_mean, square_before_max, square_band_vertices) =
+        boundary_band_measure(&square_points, &square_tris, &square_before, 0.15, None);
+    let (square_after_mean, square_after_max, _) =
+        boundary_band_measure(&square_points, &square_tris, &square_after, 0.15, None);
+
+    let (plate_points, plate_tris) = demo_plate_with_hole(4, 48);
+    let plate_size = vec![1.0; plate_points.len()];
+    let plate_before = solve_with_options(
+        &plate_points,
+        &plate_tris,
+        &plate_size,
+        &Options::default(),
+        100,
+    )?;
+    let plate_after = solve_with_options(
+        &plate_points,
+        &plate_tris,
+        &plate_size,
+        &Options {
+            boundary: BoundaryMode::Tangent,
+            ..Options::default()
+        },
+        100,
+    )?;
+    let hole_limit = 0.55;
+    let (hole_before_mean, hole_before_max, hole_band_vertices) = boundary_band_measure(
+        &plate_points,
+        &plate_tris,
+        &plate_before,
+        0.2,
+        Some(hole_limit),
+    );
+    let (hole_after_mean, hole_after_max, _) = boundary_band_measure(
+        &plate_points,
+        &plate_tris,
+        &plate_after,
+        0.2,
+        Some(hole_limit),
+    );
+
+    Ok(BoundaryReport {
+        square_before_mean,
+        square_after_mean,
+        square_before_max,
+        square_after_max,
+        square_band_vertices,
+        square_singularities_before: count_singularities(&square_before, &square_tris),
+        square_singularities_after: count_singularities(&square_after, &square_tris),
+        hole_before_mean,
+        hole_after_mean,
+        hole_before_max,
+        hole_after_max,
+        hole_band_vertices,
+        hole_singularities_before: count_singularities(&plate_before, &plate_tris),
+        hole_singularities_after: count_singularities(&plate_after, &plate_tris),
+    })
+}
+
+/// Measurements of the anisotropy option on a stretched rectangle.
+#[derive(Clone, Debug, Default)]
+pub struct AnisotropyReport {
+    /// Direction of the `sigma` axis, in radians.
+    pub frame_angle: f64,
+    /// One row per tested ratio: `(a, mean distance to the frame, mean angle,
+    /// maximum adjacent angle step)`, in radians.
+    pub rows: Vec<(f64, f64, f64, f64)>,
+}
+
+/// Measures `a = 1, 2, 4` on a `2 x 1` rectangle with `sigma = 1 + x/2` and
+/// anisotropy direction `0.4 rad`.
+///
+/// A `a = 1` row is the isotropic (historical) field, which has an arbitrary
+/// global phase. Larger ratios add the alignment energy described in the
+/// module documentation and should bring the mean angle close to the frame.
+///
+/// Returns an error only if one of the solves fails.
+pub fn demo_anisotropy() -> Result<AnisotropyReport, String> {
+    let (points, tris) = demo_grid_mesh(16, 8, 2.0, 1.0);
+    let size: Vec<f64> = points.iter().map(|point| 1.0 + 0.5 * point[0]).collect();
+    let frame_angle = 0.4f64;
+    // The guidance (`0.0 rad`, weight 1) anchors the global phase so that the
+    // before/after angles are comparable; the anisotropy term then rotates the
+    // field toward the frame.
+    let guidance = Guidance {
+        weight: 1.0,
+        angle: vec![0.0; points.len()],
+    };
+    let mut rows = Vec::new();
+    for anisotropy in [1.0, 2.0, 4.0] {
+        let alpha = solve_with_guidance_and_options(
+            &points,
+            &tris,
+            &size,
+            &guidance,
+            &Options {
+                anisotropy,
+                anisotropy_angle: frame_angle,
+                ..Options::default()
+            },
+            100,
+        )?;
+        let mean_distance = alpha
+            .iter()
+            .map(|&angle| cross_angle_distance(angle, frame_angle))
+            .sum::<f64>()
+            / alpha.len() as f64;
+        let mut max_step = 0.0f64;
+        for triangle in &tris {
+            for (u, v) in [
+                (triangle[0], triangle[1]),
+                (triangle[1], triangle[2]),
+                (triangle[2], triangle[0]),
+            ] {
+                max_step = max_step.max(cross_angle_distance(alpha[u], alpha[v]));
+            }
+        }
+        rows.push((
+            anisotropy,
+            mean_distance,
+            mean_cross_angle(&alpha),
+            max_step,
+        ));
+    }
+    Ok(AnisotropyReport { frame_angle, rows })
+}
+
+/// Measurements of one round of adaptive background refinement.
+#[derive(Clone, Debug, Default)]
+pub struct AdaptiveReport {
+    /// Variation threshold in radians of cross-field angle.
+    pub threshold: f64,
+    /// Number of parent triangles whose variation exceeded the threshold.
+    pub flagged_triangles: usize,
+    /// Number of triangles before refinement.
+    pub original_triangles: usize,
+    /// Number of triangles after red-green refinement.
+    pub refined_triangles: usize,
+    /// Number of vertices before refinement.
+    pub original_vertices: usize,
+    /// Number of vertices after refinement (original vertices included).
+    pub refined_vertices: usize,
+    /// Mean 4-RoSy difference at the original vertices, before vs after.
+    pub mean_field_difference: f64,
+    /// Maximum 4-RoSy difference at the original vertices.
+    pub max_field_difference: f64,
+    /// `(valence-3, valence-5)` singularities on the original mesh.
+    pub singularities_before: (usize, usize),
+    /// `(valence-3, valence-5)` singularities on the refined mesh.
+    pub singularities_after: (usize, usize),
+}
+
+/// Measures one round of adaptive refinement on a guided, graded `10 x 10`
+/// square.
+///
+/// The guidance (`0.3 rad`, weight `1`) fixes the otherwise free global phase
+/// so that the before/after angles are directly comparable. The refinement
+/// threshold is `0.08 rad`; the refined field is solved with the same options
+/// and the original vertices are read back directly (their indices are kept).
+///
+/// Returns an error only if one of the solves fails.
+pub fn demo_adaptive() -> Result<AdaptiveReport, String> {
+    let (points, tris) = demo_square_mesh(10);
+    let size: Vec<f64> = points.iter().map(|point| 1.0 + point[0]).collect();
+    let guidance = Guidance {
+        weight: 1.0,
+        angle: vec![0.3; points.len()],
+    };
+    let base = solve_with_guidance(&points, &tris, &size, &guidance, 100)?;
+    let threshold = 0.08f64;
+    let (refined_points, refined_tris, refined_size, flagged, edge_order) =
+        refine_once(&points, &tris, &size, &base, threshold);
+    if flagged == 0 {
+        return Ok(AdaptiveReport {
+            threshold,
+            original_triangles: tris.len(),
+            original_vertices: points.len(),
+            refined_triangles: tris.len(),
+            refined_vertices: points.len(),
+            singularities_before: count_singularities(&base, &tris),
+            ..AdaptiveReport::default()
+        });
+    }
+    let extended = extend_guidance(&guidance, &edge_order, refined_points.len());
+    let refined = solve_with_guidance(
+        &refined_points,
+        &refined_tris,
+        &refined_size,
+        &extended,
+        100,
+    )?;
+    let mut mean = 0.0f64;
+    let mut maximum = 0.0f64;
+    for (before, after) in base.iter().zip(refined.iter()) {
+        let d = cross_angle_distance(*before, *after);
+        mean += d;
+        maximum = maximum.max(d);
+    }
+    mean /= base.len() as f64;
+    Ok(AdaptiveReport {
+        threshold,
+        flagged_triangles: flagged,
+        original_triangles: tris.len(),
+        refined_triangles: refined_tris.len(),
+        original_vertices: points.len(),
+        refined_vertices: refined_points.len(),
+        mean_field_difference: mean,
+        max_field_difference: maximum,
+        singularities_before: count_singularities(&base, &tris),
+        singularities_after: count_singularities(&refined, &refined_tris),
+    })
 }
 
 #[cfg(test)]
@@ -1523,6 +2603,7 @@ mod tests {
             &Options {
                 accurate: true,
                 holomorphic: 0.0,
+                ..Options::default()
             },
             100,
         )?;
@@ -1588,6 +2669,7 @@ mod tests {
             &Options {
                 accurate: true,
                 holomorphic: 0.0,
+                ..Options::default()
             },
             100,
         )?;
@@ -1818,7 +2900,8 @@ mod tests {
             &size,
             &Options {
                 accurate: true,
-                holomorphic: 0.0
+                holomorphic: 0.0,
+                ..Options::default()
             },
             0
         )
@@ -1857,7 +2940,8 @@ mod tests {
             },
             &Options {
                 accurate: true,
-                holomorphic: 0.0
+                holomorphic: 0.0,
+                ..Options::default()
             },
             0,
         )
@@ -1880,6 +2964,7 @@ mod tests {
             &Options {
                 accurate: false,
                 holomorphic: 0.0,
+                ..Options::default()
             },
             100,
         )?;
@@ -1943,10 +3028,318 @@ mod tests {
             let options = Options {
                 accurate: false,
                 holomorphic: s,
+                ..Options::default()
             };
             assert!(
                 solve_with_options(&points, &tris, &size, &options, 10).is_err(),
                 "s = {s} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_tangent_aligns_the_square_and_the_hole() -> Result<(), String> {
+        let report = demo_boundary()?;
+        println!(
+            "boundary tangent, 10x10 graded square: band vertices={}, \
+             mean distance before={:.6e} rad, after={:.6e} rad, \
+             max before={:.6e} rad, after={:.6e} rad, \
+             singularities before={:?}, after={:?}",
+            report.square_band_vertices,
+            report.square_before_mean,
+            report.square_after_mean,
+            report.square_before_max,
+            report.square_after_max,
+            report.square_singularities_before,
+            report.square_singularities_after
+        );
+        println!(
+            "boundary tangent, annular plate with a circular hole: band vertices={}, \
+             mean distance before={:.6e} rad, after={:.6e} rad, \
+             max before={:.6e} rad, after={:.6e} rad, \
+             singularities before={:?}, after={:?}",
+            report.hole_band_vertices,
+            report.hole_before_mean,
+            report.hole_after_mean,
+            report.hole_before_max,
+            report.hole_after_max,
+            report.hole_singularities_before,
+            report.hole_singularities_after
+        );
+        assert!(report.square_band_vertices > 10);
+        assert!(
+            report.square_before_mean > 0.05,
+            "the graded square is already boundary aligned ({})",
+            report.square_before_mean
+        );
+        assert!(
+            report.square_after_mean < 0.02,
+            "square boundary not aligned after Tangent ({})",
+            report.square_after_mean
+        );
+        assert!(report.square_after_mean < 0.1 * report.square_before_mean);
+        assert!(report.hole_band_vertices > 10);
+        assert!(
+            report.hole_before_mean > 0.1,
+            "the plate is already hole aligned ({})",
+            report.hole_before_mean
+        );
+        assert!(
+            report.hole_after_mean < 1e-6,
+            "hole boundary not aligned after Tangent ({})",
+            report.hole_after_mean
+        );
+        assert!(
+            report.hole_after_mean < 0.01 * report.hole_before_mean,
+            "the hole band improved only from {} to {}",
+            report.hole_before_mean,
+            report.hole_after_mean
+        );
+        assert_eq!(
+            report.square_singularities_before,
+            report.square_singularities_after
+        );
+        assert_eq!(
+            report.hole_singularities_before,
+            report.hole_singularities_after
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn weak_boundary_approaches_tangent() -> Result<(), String> {
+        let (points, tris) = square_mesh(6);
+        let size: Vec<f64> = points.iter().map(|point| 1.0 + 0.5 * point[0]).collect();
+        let none = solve_with_options(&points, &tris, &size, &Options::default(), 100)?;
+        let zero = solve_with_options(
+            &points,
+            &tris,
+            &size,
+            &Options {
+                boundary: BoundaryMode::Weak(0.0),
+                ..Options::default()
+            },
+            100,
+        )?;
+        assert_eq!(none, zero);
+        let weak = solve_with_options(
+            &points,
+            &tris,
+            &size,
+            &Options {
+                boundary: BoundaryMode::Weak(1.0e6),
+                ..Options::default()
+            },
+            100,
+        )?;
+        let tangent = solve_with_options(
+            &points,
+            &tris,
+            &size,
+            &Options {
+                boundary: BoundaryMode::Tangent,
+                ..Options::default()
+            },
+            100,
+        )?;
+        let difference = weak
+            .iter()
+            .zip(tangent.iter())
+            .map(|(&a, &b)| rosy_distance(a, b))
+            .fold(0.0f64, f64::max);
+        println!(
+            "weak boundary w=1e6 vs exact Tangent: max 4-RoSy difference={difference:.3e} rad"
+        );
+        assert!(
+            difference < 1e-4,
+            "the weak penalty did not approach Dirichlet ({difference})"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn anisotropy_aligns_a_stretched_rectangle() -> Result<(), String> {
+        let report = demo_anisotropy()?;
+        println!(
+            "anisotropy on a 2x1 rectangle, frame angle={:.3} rad:",
+            report.frame_angle
+        );
+        for (a, mean, angle, step) in &report.rows {
+            println!(
+                "  a={a:.1}: mean distance to frame={mean:.6e} rad, \
+                 mean field angle={angle:.6e} rad, max adjacent step={step:.6e} rad"
+            );
+        }
+        assert_eq!(report.rows.len(), 3);
+        let isotropic = report.rows[0];
+        let anisotropic = report.rows[2];
+        assert_eq!(isotropic.0, 1.0);
+        assert_eq!(anisotropic.0, 4.0);
+        assert!(
+            isotropic.1 > 0.1,
+            "the isotropic field is unexpectedly aligned ({})",
+            isotropic.1
+        );
+        assert!(
+            anisotropic.1 < 0.3 * isotropic.1,
+            "a=4 did not align the field: {} vs {}",
+            anisotropic.1,
+            isotropic.1
+        );
+        assert!(
+            anisotropic.1 < 0.1,
+            "a=4 is not close to the anisotropy frame ({})",
+            anisotropic.1
+        );
+        assert!(
+            anisotropic.3 < 0.2,
+            "the anisotropic field is not smooth ({})",
+            anisotropic.3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn anisotropy_one_reproduces_the_isotropic_field() -> Result<(), String> {
+        let (points, tris) = square_mesh(6);
+        let size: Vec<f64> = points.iter().map(|point| 1.0 + 0.5 * point[0]).collect();
+        let base = solve(&points, &tris, &size, 100)?;
+        let options = Options {
+            anisotropy: 1.0,
+            anisotropy_angle: 0.7,
+            ..Options::default()
+        };
+        let rotated_frame = solve_with_options(&points, &tris, &size, &options, 100)?;
+        let difference = base
+            .iter()
+            .zip(rotated_frame.iter())
+            .map(|(&a, &b)| rosy_distance(a, b))
+            .fold(0.0f64, f64::max);
+        println!(
+            "anisotropy a=1 with a rotated frame: max 4-RoSy difference to solve()={difference:.3e} rad"
+        );
+        assert!(
+            difference < 1e-10,
+            "a=1 changed the isotropic field ({difference})"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_refinement_smooths_the_field() -> Result<(), String> {
+        let report = demo_adaptive()?;
+        println!(
+            "adaptive refinement on a guided 10x10 graded square: threshold={:.3} rad, \
+             flagged={} of {} triangles, refined mesh: {} triangles / {} vertices, \
+             field difference mean={:.6e} rad, max={:.6e} rad, \
+             singularities before={:?}, after={:?}",
+            report.threshold,
+            report.flagged_triangles,
+            report.original_triangles,
+            report.refined_triangles,
+            report.refined_vertices,
+            report.mean_field_difference,
+            report.max_field_difference,
+            report.singularities_before,
+            report.singularities_after
+        );
+        assert!(
+            report.flagged_triangles > 0,
+            "no triangle was flagged at threshold {}",
+            report.threshold
+        );
+        assert!(report.refined_triangles > report.original_triangles);
+        assert!(report.refined_vertices > report.original_vertices);
+        assert!(report.mean_field_difference.is_finite());
+        assert!(report.max_field_difference.is_finite());
+        assert!(
+            report.mean_field_difference > 0.0,
+            "the refined field is identical to the original field"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_option_returns_the_original_vertex_count() -> Result<(), String> {
+        let (points, tris) = square_mesh(10);
+        let size: Vec<f64> = points.iter().map(|point| 1.0 + point[0]).collect();
+        let guidance = Guidance {
+            weight: 1.0,
+            angle: vec![0.3; points.len()],
+        };
+        let base = solve_with_guidance(&points, &tris, &size, &guidance, 100)?;
+        let refined = solve_with_guidance_and_options(
+            &points,
+            &tris,
+            &size,
+            &guidance,
+            &Options {
+                adaptive: 0.08,
+                ..Options::default()
+            },
+            100,
+        )?;
+        assert_eq!(refined.len(), base.len());
+        let mean = refined
+            .iter()
+            .zip(base.iter())
+            .map(|(&a, &b)| rosy_distance(a, b))
+            .sum::<f64>()
+            / base.len() as f64;
+        println!("public adaptive option: mean 4-RoSy difference={mean:.3e} rad");
+        assert!(mean > 0.0, "the adaptive option did not change the field");
+        Ok(())
+    }
+
+    #[test]
+    fn new_options_are_validated() {
+        let (points, tris) = square_mesh(2);
+        let size = vec![1.0; points.len()];
+        let defaults = Options::default();
+        assert_eq!(defaults.anisotropy, 1.0);
+        assert_eq!(defaults.anisotropy_angle, 0.0);
+        assert_eq!(defaults.boundary, BoundaryMode::None);
+        assert_eq!(defaults.adaptive, 0.0);
+
+        for anisotropy in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let options = Options {
+                anisotropy,
+                ..Options::default()
+            };
+            assert!(
+                solve_with_options(&points, &tris, &size, &options, 10).is_err(),
+                "anisotropy {anisotropy} was accepted"
+            );
+        }
+        for angle in [f64::NAN, f64::INFINITY] {
+            let options = Options {
+                anisotropy: 2.0,
+                anisotropy_angle: angle,
+                ..Options::default()
+            };
+            assert!(
+                solve_with_options(&points, &tris, &size, &options, 10).is_err(),
+                "anisotropy angle {angle} was accepted"
+            );
+        }
+        for weight in [f64::NAN, f64::INFINITY, -1.0] {
+            let options = Options {
+                boundary: BoundaryMode::Weak(weight),
+                ..Options::default()
+            };
+            assert!(
+                solve_with_options(&points, &tris, &size, &options, 10).is_err(),
+                "weak boundary weight {weight} was accepted"
+            );
+        }
+        for adaptive in [f64::NAN, f64::INFINITY, -0.1] {
+            let options = Options {
+                adaptive,
+                ..Options::default()
+            };
+            assert!(
+                solve_with_options(&points, &tris, &size, &options, 10).is_err(),
+                "adaptive threshold {adaptive} was accepted"
             );
         }
     }
