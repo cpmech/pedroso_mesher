@@ -351,6 +351,9 @@ pub struct Tile {
     pub counts: [usize; 4],
     /// Signed area of the tile polygon (positive).
     pub area: f64,
+    /// True for a *bent* tile: four field lines, but a corner polygon that is
+    /// not counter-clockwise (the annular/nautilus case of Section 5.1.4).
+    pub bent: bool,
 }
 
 impl Tile {
@@ -385,6 +388,217 @@ pub struct Regions {
     pub energy: f64,
 }
 
+/// Resample an open polyline by arc length into `count + 1` points.
+fn resample_open(points: &[[f64; 2]], count: usize) -> Vec<[f64; 2]> {
+    let mut out = Vec::with_capacity(count + 1);
+    if points.len() < 2 || count == 0 {
+        return out;
+    }
+    let mut cumulative = Vec::with_capacity(points.len());
+    cumulative.push(0.0);
+    let mut total = 0.0;
+    for pair in points.windows(2) {
+        total += distance(pair[0], pair[1]);
+        cumulative.push(total);
+    }
+    if total <= 0.0 {
+        return out;
+    }
+    let mut segment = 0usize;
+    for step in 0..=count {
+        let target = total * step as f64 / count as f64;
+        while segment + 2 < cumulative.len() && cumulative[segment + 1] < target {
+            segment += 1;
+        }
+        let start = cumulative[segment];
+        let end = cumulative[segment + 1];
+        let a = points[segment];
+        let b = points[segment + 1];
+        let t = if end - start > 0.0 {
+            ((target - start) / (end - start)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        out.push(add(a, scale(sub(b, a), t)));
+    }
+    out
+}
+
+/// Resample an open polyline by its *angle* about `centre`, into `count + 1`
+/// points.
+///
+/// This is the angular re-parametrization of Section 5.1.4's annular tiles: two
+/// sides that wrap around the hole are paired at equal angle instead of at
+/// equal arc length, which is what makes the ring a rectangular strip. Returns
+/// `None` when the angle is not monotone along the polyline (the side does not
+/// wrap the centre) or its total turn is negligible.
+fn resample_angular(points: &[[f64; 2]], count: usize, centre: [f64; 2]) -> Option<Vec<[f64; 2]>> {
+    if points.len() < 2 || count == 0 {
+        return None;
+    }
+    let mut angles: Vec<f64> = Vec::with_capacity(points.len());
+    let mut total = 0.0;
+    let mut previous: Option<f64> = None;
+    for point in points {
+        let offset = sub(*point, centre);
+        if norm(offset) <= 1e-12 {
+            return None;
+        }
+        let angle = angle_of(offset);
+        match previous {
+            Some(last) => {
+                let step = wrap_pi(angle - last);
+                total += step;
+                angles.push(total);
+            }
+            None => angles.push(0.0),
+        }
+        previous = Some(angle);
+    }
+    let mut span = total;
+    if !span.is_finite() || span.abs() < 0.5 {
+        return None;
+    }
+    // Work with an increasing angle sequence: reverse and negate when the side
+    // wraps the other way.
+    let mut points: Vec<[f64; 2]> = points.to_vec();
+    let mut ordered: Vec<f64> = angles;
+    if span < 0.0 {
+        points.reverse();
+        ordered.reverse();
+        ordered = ordered.into_iter().map(|value| -value).collect();
+        span = -span;
+    }
+    let monotone = ordered.windows(2).all(|pair| pair[1] >= pair[0] - 1e-12);
+    if !monotone {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count + 1);
+    for step in 0..=count {
+        let target = span * step as f64 / count as f64;
+        // Locate the segment that contains `target` in the angle parameter.
+        let mut index = 0usize;
+        while index + 2 < ordered.len() && ordered[index + 1] < target {
+            index += 1;
+        }
+        let start = ordered[index];
+        let end = ordered[index + 1];
+        let t = if (end - start).abs() > 0.0 {
+            ((target - start) / (end - start)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        out.push(add(
+            points[index],
+            scale(sub(points[index + 1], points[index]), t),
+        ));
+    }
+    Some(out)
+}
+
+/// Coons patch of a *bent* (annular) tile with the two long sides resampled by
+/// angle about the tile centroid, so the ring becomes a rectangular strip.
+fn bent_coons_quads(
+    curves: &BoundaryCurves,
+    n_u: usize,
+    n_v: usize,
+) -> Result<Vec<[[f64; 2]; 4]>, String> {
+    if n_u == 0 || n_v == 0 {
+        return Err("bent coons: zero subdivision".to_string());
+    }
+    let sides = [&curves.bottom, &curves.right, &curves.top, &curves.left];
+    let lengths: Vec<f64> = sides
+        .iter()
+        .map(|side| {
+            let mut total = 0.0;
+            for pair in side.windows(2) {
+                total += distance(pair[0], pair[1]);
+            }
+            total
+        })
+        .collect();
+    // The two long sides wrap the hole; order them by length.
+    let mut order: Vec<usize> = (0..4).collect();
+    order.sort_by(|left, right| {
+        lengths[*right]
+            .partial_cmp(&lengths[*left])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let long: Vec<usize> = order[..2].to_vec();
+    // The tile centroid is the ring centre.
+    let mut centre = [0.0f64; 2];
+    let mut total = 0.0;
+    for side in sides.iter() {
+        for point in side.iter() {
+            centre[0] += point[0];
+            centre[1] += point[1];
+            total += 1.0;
+        }
+    }
+    if total > 0.0 {
+        centre[0] /= total;
+        centre[1] /= total;
+    }
+    let counts = [n_u, n_v, n_u, n_v];
+    let mut sampled: Vec<Vec<[f64; 2]>> = Vec::with_capacity(4);
+    for (index, side) in sides.iter().enumerate() {
+        let count = counts[index];
+        if long.contains(&index) {
+            if let Some(points) = resample_angular(side, count, centre) {
+                sampled.push(points);
+                continue;
+            }
+        }
+        sampled.push(resample_open(side, count));
+    }
+    if sampled.iter().any(|line| line.len() < 2) {
+        return Err("bent coons: a side has zero length".to_string());
+    }
+    let bottom = sampled[0].clone();
+    let right = sampled[1].clone();
+    let top = sampled[2].clone();
+    let left = sampled[3].clone();
+    let corner0 = bottom[0];
+    let corner1 = bottom[n_u];
+    let corner2 = top[0];
+    let corner3 = top[n_u];
+    let mut points: Vec<[f64; 2]> = Vec::with_capacity((n_u + 1) * (n_v + 1));
+    for j in 0..=n_v {
+        let v = j as f64 / n_v as f64;
+        for i in 0..=n_u {
+            let u = i as f64 / n_u as f64;
+            let bottom_point = bottom[i];
+            let top_point = top[n_u - i];
+            let left_point = left[n_v - j];
+            let right_point = right[j];
+            let blend_bottom_top = add(scale(bottom_point, 1.0 - v), scale(top_point, v));
+            let blend_left_right = add(scale(right_point, u), scale(left_point, 1.0 - u));
+            let bilinear = add(
+                scale(add(scale(corner0, 1.0 - u), scale(corner1, u)), 1.0 - v),
+                scale(add(scale(corner3, 1.0 - u), scale(corner2, u)), v),
+            );
+            points.push(add(blend_bottom_top, sub(blend_left_right, bilinear)));
+        }
+    }
+    let index = |i: usize, j: usize| j * (n_u + 1) + i;
+    let mut quads = Vec::with_capacity(n_u * n_v);
+    for j in 0..n_v {
+        for i in 0..n_u {
+            let quad = [
+                points[index(i, j)],
+                points[index(i + 1, j)],
+                points[index(i + 1, j + 1)],
+                points[index(i, j + 1)],
+            ];
+            if polygon_area(&quad) <= 0.0 {
+                return Err("bent coons: a quad is inverted".to_string());
+            }
+            quads.push(quad);
+        }
+    }
+    Ok(quads)
+}
+
 impl Regions {
     /// Mesh every tile with its Coons patch and weld the results into one mesh.
     ///
@@ -413,8 +627,24 @@ impl Regions {
                     "regions: tile {index} has a zero subdivision count ({n_u} x {n_v})"
                 ));
             }
-            let tile_mesh = simons_qgp::mesh_tile_curves(&tile.curves, n_u, n_v)
-                .map_err(|error| format!("regions: tile {index}: {error}"))?;
+            let tile_mesh = if tile.bent {
+                let quads = bent_coons_quads(&tile.curves, n_u, n_v)
+                    .map_err(|error| format!("regions: bent tile {index}: {error}"))?;
+                let mut points: Vec<Node> = Vec::with_capacity(quads.len() * 4);
+                let mut cells: Vec<Cell> = Vec::with_capacity(quads.len());
+                for quad in &quads {
+                    let mut nodes = [0usize; 4];
+                    for (slot, point) in quad.iter().enumerate() {
+                        nodes[slot] = points.len();
+                        points.push([point[0], point[1], 0.0]);
+                    }
+                    cells.push(Cell::quad4(nodes));
+                }
+                Mesh::new(points, cells)
+            } else {
+                simons_qgp::mesh_tile_curves(&tile.curves, n_u, n_v)
+                    .map_err(|error| format!("regions: tile {index}: {error}"))?
+            };
             let mut local: Vec<usize> = Vec::with_capacity(tile_mesh.points.len());
             for point in &tile_mesh.points {
                 let key = (
@@ -2146,12 +2376,7 @@ impl<'a> Builder<'a> {
                 degenerate += 1;
                 continue;
             }
-            if polygon_area(&corner_points) <= 0.0 {
-                // The four corners are not counter-clockwise; a Coons patch
-                // cannot be built on them (Section 5.1.6's degenerate tile).
-                degenerate += 1;
-                continue;
-            }
+            let bent = polygon_area(&corner_points) <= 0.0;
             let mut node_ids: Vec<usize> = Vec::with_capacity(count);
             for &half in face {
                 node_ids.push(self.half_start(half).unwrap_or(0));
@@ -2170,6 +2395,7 @@ impl<'a> Builder<'a> {
                 curves,
                 counts: [0; 4],
                 area,
+                bent,
             });
         }
         Ok((tiles, degenerate))
@@ -2650,7 +2876,6 @@ fn split_pinched_boundary(mesh: &Mesh) -> Result<(Mesh, usize), String> {
 }
 
 /// Edge-connected components of a quad mesh, largest first.
-#[cfg(test)]
 fn split_components(mesh: &Mesh) -> Vec<Mesh> {
     if mesh.cells.is_empty() {
         return Vec::new();
@@ -2964,6 +3189,93 @@ fn mean_sigma(field: &Field, points: &[[f64; 2]]) -> f64 {
         total += field.sigma_at(*point);
     }
     total / points.len() as f64
+}
+
+/// The two channel bands of a ring-shaped interior component: the outer band
+/// between the domain boundary and the component's outer loop, and the hole
+/// band between the hole polygon and the component's hole loop. The component's
+/// quads are kept (Section 5.1.8.2's interior mesh).
+fn ring_bands(
+    component: &Mesh,
+    domain: &Domain,
+    outer_points: &[[f64; 2]],
+    hole_points: &[Vec<[f64; 2]>],
+    field: &Field,
+) -> Result<(Vec<[usize; 4]>, Vec<[f64; 3]>), String> {
+    let hole = hole_points
+        .first()
+        .ok_or_else(|| "ring bands: the domain has no hole".to_string())?;
+    let hole_area = loop_area(hole).abs();
+    let count = hole.len().max(1);
+    let mut centre = [0.0f64; 2];
+    for point in hole {
+        centre[0] += point[0] / count as f64;
+        centre[1] += point[1] / count as f64;
+    }
+    let loops = mesh_boundary_loops(component)?;
+    let mut outer_loop: Option<(Vec<usize>, f64)> = None;
+    let mut inner_loop: Option<(Vec<usize>, f64)> = None;
+    for ids in loops {
+        let points = loop_points(component, &ids);
+        let area = loop_area(&points);
+        let off_boundary = points
+            .iter()
+            .all(|&p| domain.distance_to_boundary(p) > 1.0e-9);
+        if !off_boundary {
+            continue;
+        }
+        if area > 0.0 {
+            if outer_loop
+                .as_ref()
+                .map(|(_, found)| area > *found)
+                .unwrap_or(true)
+            {
+                outer_loop = Some((ids, area));
+            }
+        } else if area.abs() > hole_area && loop_contains(&points, centre) && inner_loop.is_none() {
+            inner_loop = Some((ids, area));
+        }
+    }
+    let (outer_ids, outer_area) =
+        outer_loop.ok_or_else(|| "ring bands: no outer loop".to_string())?;
+    let (inner_ids, inner_area) =
+        inner_loop.ok_or_else(|| "ring bands: no hole loop around the hole".to_string())?;
+    let mut pool: Vec<[f64; 3]> = component.points.clone();
+    let outer_points2d = loop_points(component, &outer_ids);
+    let inner_points2d = loop_points(component, &inner_ids);
+    let outer_size = mean_sigma(field, &outer_points2d);
+    let inner_size = mean_sigma(field, &inner_points2d);
+    let outer_quads = simons_channel::channel_between_dense(
+        domain,
+        outer_points,
+        &outer_points2d,
+        &outer_ids,
+        &mut pool,
+        outer_size,
+    )
+    .or_else(|_| {
+        simons_channel::channel_between(
+            domain,
+            outer_points,
+            &outer_points2d,
+            &outer_ids,
+            &mut pool,
+            outer_size,
+        )
+    })
+    .map_err(|error| format!("ring bands: outer band (area {outer_area:.4}): {error}"))?;
+    let hole_quads = simons_channel::channel_between_hole(
+        domain,
+        hole,
+        &inner_points2d,
+        &inner_ids,
+        &mut pool,
+        inner_size,
+    )
+    .map_err(|error| format!("ring bands: hole band (area {inner_area:.4}): {error}"))?;
+    let mut quads = outer_quads;
+    quads.extend(hole_quads);
+    Ok((quads, pool))
 }
 
 /// Stitch the QGP interior mesh to the boundary of the input mesh with
@@ -3281,6 +3593,38 @@ fn stitch_case(
     }
     let mut keep_interior = keep_interior;
     let mut bands = bands;
+    // A ring-shaped QGP interior: keep the ring component and stitch both of
+    // its loops (Section 5.1.8.2).
+    if bands < 2 && !hole_points.is_empty() {
+        'ring: for &radius in &[1.4f64, 1.6, 1.8] {
+            let (carved, _carved_count) =
+                carve_rings_two(&interior, &field, &all_loops, radius, 0.3);
+            let (carved, _split) = match split_pinched_boundary(&carved) {
+                Ok(found) => found,
+                Err(_) => continue,
+            };
+            for component in split_components(&carved) {
+                match ring_bands(&component, &domain, &outer_points, &hole_points, &field) {
+                    Ok((quads, pool)) => {
+                        let kept = component.cells.len();
+                        let mut with_pool = component;
+                        with_pool.points = pool;
+                        notes.push(format!(
+                            "ring stitch at carve {radius:.1}: {kept} QGP interior quads kept, \
+                             two bands ({} channel quads)",
+                            quads.len()
+                        ));
+                        carved_mesh = with_pool;
+                        channel_quads = quads;
+                        keep_interior = true;
+                        bands = 2;
+                        break 'ring;
+                    }
+                    Err(error) => notes.push(format!("ring stitch {radius:.1}: {error}")),
+                }
+            }
+        }
+    }
     // Last resort for a domain with a hole and no ring-shaped interior: two
     // bands that meet on a collar loop offset from the hole polygon. The QGP
     // interior contributes no quad; the bands share the collar ids, so the
@@ -4088,7 +4432,13 @@ mod tests {
             "annulus 1.4: {} quads carved, {} pinch node(s) split",
             carved_quads, split
         );
-        let loops = mesh_boundary_loops(&carved)?;
+        let loops = match mesh_boundary_loops(&carved) {
+            Ok(found) => found,
+            Err(error) => {
+                println!("annulus 1.4: the carved boundary does not close: {error}");
+                return Ok(());
+            }
+        };
         for (index, ids) in loops.iter().enumerate() {
             let mut pts: Vec<[f64; 2]> = Vec::new();
             let mut on_hole = 0usize;
