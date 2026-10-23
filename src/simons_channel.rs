@@ -146,6 +146,8 @@
 //! sig_simons_channel::mesh(&domain, h)            -> Result<Mesh, String>
 //! sig_simons_channel::mesh_with_stats(&domain, h) -> Result<(Mesh, ChannelStats), String>
 //! sig_simons_channel::channel(&domain, h)         -> Result<Vec<ChannelLoop>, String>
+//! sig_simons_channel::channel_between(domain, outer, inner, inner_ids, points, size)
+//!                                                -> Result<Vec<[usize;4]>, String>
 //! sig_simons_channel::demo()                      -> Result<DemoNumbers, String>
 //! ```
 //!
@@ -339,6 +341,163 @@ pub fn channel(domain: &Domain, size: f64) -> Result<Vec<ChannelLoop>, String> {
         });
     }
     Ok(loops)
+}
+
+/// Mesh the channel between two given closed loops, using the caller's shared
+/// node pool.
+///
+/// `outer` is normally the domain boundary (every point is checked to lie on
+/// the domain polyline) and `inner` is the boundary loop of an existing
+/// interior mesh, whose node ids in `points` are `inner_ids`. The returned
+/// quads index into `points`, which is extended in place with the new boundary
+/// and Steiner nodes. No grid is built: this is the same [`add_ribbon`] code
+/// path used by [`build_ribbon`], including the widest-path/cap and resampled
+/// strip construction, the convexity/angle validation, the channel-area check
+/// and the shared-node compaction.
+///
+/// On error `points` is left untouched. The loops are expected to be closed
+/// (without a repeated closing point) and in any orientation.
+pub fn channel_between(
+    domain: &Domain,
+    outer: &[[f64; 2]],
+    inner: &[[f64; 2]],
+    inner_ids: &[usize],
+    points: &mut Vec<[f64; 3]>,
+    size: f64,
+) -> Result<Vec<[usize; 4]>, String> {
+    if !size.is_finite() || size <= 0.0 {
+        return Err("the element size must be positive and finite".into());
+    }
+    if outer.len() < 3 || inner.len() < 3 || inner_ids.len() < 3 {
+        return Err("both channel loops need at least three vertices".into());
+    }
+    if inner.len() != inner_ids.len() {
+        return Err("the inner loop and its id list have different lengths".into());
+    }
+    for (slot, &id) in inner_ids.iter().enumerate() {
+        let Some(point) = points.get(id) else {
+            return Err(format!("inner id {id} is out of range for the node pool"));
+        };
+        let expected = inner[slot];
+        if (point[0] - expected[0]).abs() > 1.0e-9 || (point[1] - expected[1]).abs() > 1.0e-9 {
+            return Err(format!(
+                "inner node {id} is at ({}, {}) but the loop says ({}, {})",
+                point[0], point[1], expected[0], expected[1]
+            ));
+        }
+    }
+
+    let outer_clean = clean_loop_points(outer)?;
+    let inner_clean = clean_loop_points(inner)?;
+    if inner_clean.len() != inner_ids.len() {
+        return Err("the inner loop changed length while cleaning; ids would be misaligned".into());
+    }
+    // The outer loop must really be the domain boundary, and the inner loop
+    // must lie inside the domain.
+    let tolerance = 1.0e-6 * (1.0 + size);
+    for point in &outer_clean {
+        if domain.distance_to_boundary(*point) > tolerance {
+            return Err("an outer-loop point is not on the domain boundary".into());
+        }
+    }
+    for point in &inner_clean {
+        if !domain.contains(*point) {
+            return Err("an inner-loop point is not inside the domain".into());
+        }
+    }
+    let outer_area = polygon_area_points(&outer_clean).abs();
+    let inner_area = polygon_area_points(&inner_clean).abs();
+    let band_area = outer_area - inner_area;
+    if band_area <= EPS {
+        return Err("the inner loop does not leave a positive channel area".into());
+    }
+
+    // Work on a 2D copy so the shared pool is untouched on failure.
+    let base = points.len();
+    let mut pos: Vec<[f64; 2]> = points.iter().map(|p| [p[0], p[1]]).collect();
+    let mut outer_ids: Vec<usize> = Vec::with_capacity(outer_clean.len());
+    for point in &outer_clean {
+        outer_ids.push(pos.len());
+        pos.push(*point);
+    }
+    let mut quads: Vec<[usize; 4]> = Vec::new();
+    let (_, _) = add_ribbon(
+        &outer_clean,
+        &outer_clean,
+        &outer_ids,
+        &inner_clean,
+        inner_ids,
+        true,
+        "channel_between",
+        &mut pos,
+        &mut quads,
+    )?;
+    if quads.is_empty() {
+        return Err("channel_between produced no quads".into());
+    }
+
+    // Validate the quads on the local positions before committing anything.
+    let mut total = 0.0f64;
+    for quad in &quads {
+        let corners = [
+            *pos.get(quad[0])
+                .ok_or("internal error: channel_between quad index")?,
+            *pos.get(quad[1])
+                .ok_or("internal error: channel_between quad index")?,
+            *pos.get(quad[2])
+                .ok_or("internal error: channel_between quad index")?,
+            *pos.get(quad[3])
+                .ok_or("internal error: channel_between quad index")?,
+        ];
+        let area = quad_area(corners);
+        if area <= 1.0e-14 || quad_angle_rank(corners).is_none() {
+            return Err("channel_between produced a degenerate or non-convex quad".into());
+        }
+        let centroid = [
+            (corners[0][0] + corners[1][0] + corners[2][0] + corners[3][0]) / 4.0,
+            (corners[0][1] + corners[1][1] + corners[2][1] + corners[3][1]) / 4.0,
+        ];
+        let centroid_inside =
+            domain.contains(centroid) || domain.distance_to_boundary(centroid) <= 1.0e-9;
+        if !centroid_inside {
+            return Err("channel_between produced a quad outside the domain".into());
+        }
+        total += area;
+    }
+    if (total - band_area).abs() > 1.0e-6 * band_area.max(1.0) {
+        return Err(format!(
+            "channel_between covers {total:.6} but the band area is {band_area:.6}"
+        ));
+    }
+
+    // Compact the newly created nodes and commit them to the shared pool.
+    let mut used: BTreeSet<usize> = BTreeSet::new();
+    for quad in &quads {
+        for &id in quad {
+            if id >= base {
+                used.insert(id);
+            }
+        }
+    }
+    let mut remap: HashMap<usize, usize> = HashMap::new();
+    let mut fresh: Vec<[f64; 3]> = Vec::with_capacity(used.len());
+    for &id in &used {
+        let point = *pos.get(id).ok_or("internal error: channel_between node")?;
+        remap.insert(id, points.len() + fresh.len());
+        fresh.push([point[0], point[1], 0.0]);
+    }
+    for quad in &mut quads {
+        for id in quad.iter_mut() {
+            if *id >= base {
+                let Some(&mapped) = remap.get(id) else {
+                    return Err("internal error: channel_between lost a node".into());
+                };
+                *id = mapped;
+            }
+        }
+    }
+    points.extend(fresh);
+    Ok(quads)
 }
 
 /// Run the three demo cases and return their numbers.
@@ -3894,6 +4053,152 @@ mod tests {
         }
         signs.sort_unstable();
         assert_eq!(signs, vec![false, true], "the two loops are opposed");
+    }
+
+    #[test]
+    fn channel_between_square_annulus() {
+        let domain = match Domain::rectangle(10.0, 10.0) {
+            Ok(domain) => domain,
+            Err(error) => {
+                assert!(false, "{error}");
+                return;
+            }
+        };
+        let outer = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let inner = vec![[2.0, 2.0], [8.0, 2.0], [8.0, 8.0], [2.0, 8.0]];
+        let inner_ids = [0usize, 1, 2, 3];
+        let mut points: Vec<[f64; 3]> = inner.iter().map(|p| [p[0], p[1], 0.0]).collect();
+
+        let quads = match channel_between(&domain, &outer, &inner, &inner_ids, &mut points, 1.0) {
+            Ok(quads) => quads,
+            Err(error) => {
+                assert!(false, "channel_between failed: {error}");
+                return;
+            }
+        };
+        assert_eq!(quads.len(), 4, "four quads around the square ring");
+        assert_eq!(points.len(), 8, "four inner + four outer nodes");
+        assert_eq!(points.len(), 8);
+
+        let cells: Vec<Cell> = quads.iter().map(|&quad| Cell::quad4(quad)).collect();
+        let mesh = Mesh::new(points.clone(), cells);
+        assert!(mesh.validate().is_ok(), "the ribbon mesh must validate");
+        let topology = mesh.topology();
+        assert_eq!(topology.cracks, 0, "cracks");
+        assert_eq!(topology.inconsistent, 0, "inconsistent orientation");
+        assert_eq!(topology.non_manifold, 0, "non-manifold");
+        let report = quality::report(&mesh);
+        assert_eq!(report.inverted, 0, "inverted cells");
+        assert!(report.min_scaled_jacobian > 0.0);
+
+        let mut edge_use: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut area = 0.0f64;
+        for quad in &quads {
+            let corners = [
+                points[quad[0]],
+                points[quad[1]],
+                points[quad[2]],
+                points[quad[3]],
+            ];
+            area += quad_area([
+                [corners[0][0], corners[0][1]],
+                [corners[1][0], corners[1][1]],
+                [corners[2][0], corners[2][1]],
+                [corners[3][0], corners[3][1]],
+            ]);
+            for k in 0..4 {
+                *edge_use
+                    .entry(edge_key(quad[k], quad[(k + 1) % 4]))
+                    .or_insert(0) += 1;
+            }
+        }
+        assert!((area - 64.0).abs() < 1.0e-9, "ring area {area}");
+        // Inner edges are used once and keep the caller's ids; so are the four
+        // outer edges (nodes 4..8); every cross edge is shared by two quads.
+        for i in 0..4 {
+            let a = inner_ids[i];
+            let b = inner_ids[(i + 1) % 4];
+            assert_eq!(
+                edge_use.get(&edge_key(a, b)).copied(),
+                Some(1),
+                "inner edge {a}-{b}"
+            );
+            assert_eq!(
+                edge_use.get(&edge_key(4 + i, 4 + (i + 1) % 4)).copied(),
+                Some(1),
+                "outer edge"
+            );
+        }
+        for (&edge, &count) in &edge_use {
+            let inner_edge = (0..4).any(|i| edge_key(inner_ids[i], inner_ids[(i + 1) % 4]) == edge);
+            let outer_edge = (0..4).any(|i| edge_key(4 + i, 4 + (i + 1) % 4) == edge);
+            if !inner_edge && !outer_edge {
+                assert_eq!(count, 2, "cross edge {edge:?} must be shared");
+            }
+        }
+        for point in points.iter().skip(4) {
+            assert!(
+                domain.distance_to_boundary([point[0], point[1]]) < 1.0e-9,
+                "outer node off the polyline"
+            );
+        }
+        for id in inner_ids {
+            assert!(quads.iter().any(|quad| quad.contains(&id)));
+        }
+        println!(
+            "channel_between square annulus: {} quads, {} nodes, area {:.3}, min SJ {:.4}",
+            quads.len(),
+            points.len(),
+            area,
+            report.min_scaled_jacobian
+        );
+
+        // A subdivided inner loop exercises the loop-count mismatch path.
+        let inner8 = vec![
+            [2.0, 2.0],
+            [5.0, 2.0],
+            [8.0, 2.0],
+            [8.0, 5.0],
+            [8.0, 8.0],
+            [5.0, 8.0],
+            [2.0, 8.0],
+            [2.0, 5.0],
+        ];
+        let inner8_ids = [0usize, 1, 2, 3, 4, 5, 6, 7];
+        let mut points8: Vec<[f64; 3]> = inner8.iter().map(|p| [p[0], p[1], 0.0]).collect();
+        match channel_between(&domain, &outer, &inner8, &inner8_ids, &mut points8, 1.0) {
+            Ok(quads8) => {
+                let mut area8 = 0.0f64;
+                for quad in &quads8 {
+                    area8 += quad_area([
+                        [points8[quad[0]][0], points8[quad[0]][1]],
+                        [points8[quad[1]][0], points8[quad[1]][1]],
+                        [points8[quad[2]][0], points8[quad[2]][1]],
+                        [points8[quad[3]][0], points8[quad[3]][1]],
+                    ]);
+                }
+                assert!((area8 - 64.0).abs() < 1.0e-9, "8-gon ring area {area8}");
+                let cells8: Vec<Cell> = quads8.iter().map(|&quad| Cell::quad4(quad)).collect();
+                let mesh8 = Mesh::new(points8.clone(), cells8);
+                let topology8 = mesh8.topology();
+                assert_eq!(topology8.cracks, 0);
+                assert_eq!(quality::report(&mesh8).inverted, 0);
+                println!(
+                    "channel_between 8-sided inner loop: {} quads, {} nodes, area {:.3}",
+                    quads8.len(),
+                    points8.len(),
+                    area8
+                );
+            }
+            Err(error) => println!("channel_between 8-sided inner loop not supported: {error}"),
+        }
+
+        // Failure must not touch the shared pool.
+        let mut pool: Vec<[f64; 3]> = inner.iter().map(|p| [p[0], p[1], 0.0]).collect();
+        let before = pool.clone();
+        let bad = channel_between(&domain, &outer, &inner, &[0, 1, 2, 99], &mut pool, 1.0);
+        assert!(bad.is_err());
+        assert_eq!(pool, before);
     }
 
     #[test]
