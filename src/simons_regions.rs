@@ -3170,10 +3170,45 @@ fn mesh_boundary_loops(mesh: &Mesh) -> Result<Vec<Vec<usize>>, String> {
     for &edge in &directed {
         outgoing.entry(edge.0).or_default().push(edge);
     }
+    // Cell adjacency: every directed cell edge and its owner, so that at a
+    // pinch node (several loops meeting, e.g. a singularity) the walk can sweep
+    // the fan of cells around the node and pick the next boundary edge
+    // deterministically instead of relying on near-collinear angles.
+    let mut owner: HashMap<(usize, usize), usize> = HashMap::new();
+    for (index, cell) in mesh.cells.iter().enumerate() {
+        for slot in 0..4 {
+            let a = cell.nodes[slot];
+            let b = cell.nodes[(slot + 1) % 4];
+            owner.insert((a, b), index);
+        }
+    }
+    let next_in_cell = |cell: usize, edge: (usize, usize)| -> Option<(usize, usize)> {
+        let quad = mesh.cells.get(cell)?;
+        for slot in 0..4 {
+            if quad.nodes[slot] == edge.0 && quad.nodes[(slot + 1) % 4] == edge.1 {
+                let after = quad.nodes[(slot + 2) % 4];
+                return Some((edge.1, after));
+            }
+        }
+        None
+    };
+    let boundary: HashMap<(usize, usize), ()> = directed.iter().map(|&e| (e, ())).collect();
+    let sweep = |edge: (usize, usize)| -> Option<(usize, usize)> {
+        let mut current = edge;
+        for _ in 0..16 {
+            let cell = owner.get(&current).copied()?;
+            let candidate = next_in_cell(cell, current)?;
+            if boundary.contains_key(&candidate) {
+                return Some(candidate);
+            }
+            current = (candidate.1, candidate.0);
+        }
+        None
+    };
     let position = |node: usize| -> Option<[f64; 2]> {
         mesh.points.get(node).map(|point| [point[0], point[1]])
     };
-    let next = |edge: (usize, usize)| -> Option<(usize, usize)> {
+    let geometric = |edge: (usize, usize)| -> Option<(usize, usize)> {
         let b = position(edge.1)?;
         let a = position(edge.0)?;
         let back = angle_of(sub(a, b));
@@ -3207,7 +3242,7 @@ fn mesh_boundary_loops(mesh: &Mesh) -> Result<Vec<Vec<usize>>, String> {
             }
             visited.insert(edge, ());
             loop_ids.push(edge.0);
-            edge = match next(edge) {
+            edge = match sweep(edge).or_else(|| geometric(edge)) {
                 Some(found) => found,
                 None => break,
             };
