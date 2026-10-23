@@ -15,7 +15,9 @@
 //! integration step, documented in the vault.
 //!
 //! Supported: rectangle-like domains, including holes (the plate-with-hole
-//! family, 4/2/1 mm), and the rectilinear non-convex parts (l-bracket, stepped)
+//! family, 4/2/1 mm: 262/1240/5324 quads, SJ 0.608/0.564/0.481 after the shared
+//! smoother + shape pass), and the rectilinear non-convex parts (l-bracket,
+//! stepped: 600/2300 quads as perfect grids)
 //! where the adaptive channel width (thesis 1.4 h, then 1.0 h, then 0.7 h) lets
 //! the interior grid reach close enough to the boundary for the cover to close
 //! the remaining band. The quarter-annulus ring still fails: its curved

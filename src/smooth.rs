@@ -60,6 +60,7 @@
 
 use crate::mesh::{Kind, Mesh};
 use crate::quality;
+use crate::simons_smooth;
 use crate::stats::MeshStatistics;
 use crate::sun;
 use crate::two_d::{smooth_mesh, Domain};
@@ -113,6 +114,19 @@ pub struct SmoothOptions {
     /// guards as a ceiling; lowering it makes the smoother more conservative
     /// about long thin quads.
     pub aspect_cap: f64,
+
+    /// Weight of the thesis angle+stretch objective in the final shape pass
+    /// (default 1.0). [`crate::simons_smooth`] adds a stretch term (longest
+    /// diagonal / shortest edge) to the angle deviation, so the optimiser
+    /// cannot turn a square into an elongated rectangle of the right area.
+    /// Measured on a perturbed 6x6 grid: angle-only raises the aspect max
+    /// 1.666 -> 2.009, angle+stretch keeps it at 1.594 while still lifting the
+    /// minimum angle 64.96 -> 78.57 degrees. Set to 0 to disable the term.
+    pub stretch_weight: f64,
+
+    /// Run the angle+stretch shape pass after the other passes (default true,
+    /// all-quad meshes only; a mesh with triangles skips it).
+    pub shape_pass: bool,
 }
 
 impl Default for SmoothOptions {
@@ -125,6 +139,8 @@ impl Default for SmoothOptions {
             perturb_rounds: 0,
             reject_if_worse: true,
             aspect_cap: ASPECT_CAP,
+            stretch_weight: 1.0,
+            shape_pass: true,
         }
     }
 }
@@ -227,6 +243,35 @@ pub fn smooth(domain: &Domain, mesh: &Mesh, size: f64, options: &SmoothOptions) 
             Some(domain),
         );
         work = join(p, &q, &t);
+    }
+    // The thesis section 2.2.10 shape pass. The angle-only objective above can
+    // still leave elongated rectangles (the user's observation): it raises the
+    // minimum angle while the aspect tail grows. The stretch term is the
+    // reference answer, and it is kept only when it actually reduces the tail
+    // and the mesh stays above the gate, so it cannot trade a pass for shape.
+    if options.shape_pass && options.stretch_weight > 0.0 {
+        let all_quads = work.cells.iter().all(|c| c.kind == Kind::Quad4);
+        if all_quads {
+            let before_shape = MeshStatistics::of(domain, &work);
+            let thesis = simons_smooth::Options {
+                iterations: 30,
+                stretch_weight: options.stretch_weight,
+                allow_boundary: false,
+                simplex: true,
+            };
+            if let Ok(candidate) = simons_smooth::smooth(domain, &work, size, &thesis) {
+                let s = MeshStatistics::of(domain, &candidate);
+                let shape_gain = s.aspect_ratio.max < before_shape.aspect_ratio.max - 1.0e-9
+                    || s.aspect_ratio.p95 < before_shape.aspect_ratio.p95 - 1.0e-9;
+                let gate_safe = s.margin() >= 1.0 - 1.0e-9;
+                let topology_ok = s.cracks <= before_shape.cracks
+                    && s.overlapping <= before_shape.overlapping
+                    && s.inverted <= before_shape.inverted;
+                if shape_gain && gate_safe && topology_ok {
+                    work = candidate;
+                }
+            }
+        }
     }
     let after = MeshStatistics::of(domain, &work);
     // Reject-by-default is the safe choice for an automatic pipeline; the
@@ -577,6 +622,60 @@ mod tests {
         after.passes = false;
         after.min_corner_angle_deg += 5.0;
         assert!(better(&before, &after));
+    }
+
+    #[test]
+    fn the_shape_pass_never_worsens_the_aspect_tail() {
+        // A wavy boundary plus perturbed interior nodes leaves rectangles that
+        // the angle-only passes accept; the thesis stretch pass must not make
+        // the aspect tail worse, and the gate must stay safe.
+        let mut points = Vec::new();
+        for j in 0..7 {
+            for i in 0..7 {
+                let mut x = i as f64;
+                let mut y = j as f64;
+                let boundary = i == 0 || i == 6 || j == 0 || j == 6;
+                if boundary {
+                    x += 0.18 * (3.0 * y).sin();
+                    y += 0.18 * (2.5 * x).cos();
+                } else {
+                    x += 0.12 * ((i * 7 + j * 3) as f64 * 0.7).sin();
+                    y += 0.12 * ((i * 5 + j * 11) as f64 * 0.9).cos();
+                }
+                points.push([x, y, 0.0]);
+            }
+        }
+        let mut cells = Vec::new();
+        for j in 0..6 {
+            for i in 0..6 {
+                let a = j * 7 + i;
+                cells.push(crate::mesh::Cell::quad4([a, a + 1, a + 8, a + 7]));
+            }
+        }
+        let mesh = Mesh::new(points, cells);
+        let domain = Domain::rectangle(6.0, 6.0).unwrap();
+        let with = SmoothOptions::default();
+        let without = SmoothOptions {
+            shape_pass: false,
+            ..SmoothOptions::default()
+        };
+        let a = smooth(&domain, &mesh, 1.0, &with);
+        let b = smooth(&domain, &mesh, 1.0, &without);
+        assert!(a.after.passes, "{}", a.after.line());
+        assert!(
+            a.after.aspect_ratio.max <= b.after.aspect_ratio.max + 1.0e-9,
+            "shape pass made the aspect tail worse: {} > {}",
+            a.after.aspect_ratio.max,
+            b.after.aspect_ratio.max
+        );
+        assert!(a.after.aspect_ratio.p95 <= b.after.aspect_ratio.p95 + 1.0e-9);
+        // The boundary is fixed in both runs.
+        for (v, p) in mesh.points.iter().enumerate() {
+            if v % 7 == 0 || v % 7 == 6 || v < 7 || v >= 42 {
+                assert!((a.smoothed.points[v][0] - p[0]).abs() < 1.0e-12);
+                assert!((a.smoothed.points[v][1] - p[1]).abs() < 1.0e-12);
+            }
+        }
     }
 
     #[test]

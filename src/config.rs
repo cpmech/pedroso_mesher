@@ -150,11 +150,12 @@ pub enum Route {
     /// `simons_godf`, `simons_sizefamily` and `simons_qgp`. Character: a
     /// regular grid interior, a carved channel and a boundary ribbon (or the
     /// template cover), all-quad and exactly on the boundary. Measured table
-    /// (`generate -- sized <part>`, with the shared smoother): plate-hole 4 mm
-    /// 262 quads SJ 0.440 / 44.6 degrees, 2 mm 1240 / 0.456 / 44.6,
-    /// 1 mm 5324 / 0.495 / 44.8; l-bracket 600 / 1.000 / 90 degrees and stepped
-    /// 2300 / 1.000 / 90 (perfect grids). The ring returns a clean error: its
-    /// curved staircase channel cannot be closed by the current cover.
+    /// (`generate -- sized <part>`, with the shared smoother + shape pass):
+    /// plate-hole 4 mm 262 quads SJ 0.608 / 38.2 degrees, 2 mm 1240 / 0.564 /
+    /// 42.5, 1 mm 5324 / 0.481 / 35.3; l-bracket 600 / 1.000 / 90 degrees and
+    /// stepped 2300 / 1.000 / 90 (perfect grids). The ring returns a clean
+    /// error: its curved staircase channel cannot be closed by the current
+    /// cover.
     Sized,
 }
 
