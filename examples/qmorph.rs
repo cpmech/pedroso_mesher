@@ -89,7 +89,7 @@ fn print_row(name: &str, size: f64, row: &Row) {
         row.timing.conversion,
     );
     println!(
-        "{:12} {:>4}  +W2 sm  quads {:5}  tri {:4}  inv {:3}  ovl {:2}  SJ {:.3}  ang {:5.1}  cracks {:3}  {:4}  | quads-only SJ {:.3} ang {:5.1} | rounds {} {:.2}s",
+        "{:12} {:>4}  +W2 sm  quads {:5}  tri {:4}  inv {:3}  ovl {:2}  SJ {:.3}  ang {:5.1}  cracks {:3}  {:4}  | quads-only SJ {:.3} ang {:5.1} | off {:.1e} | rounds {} {:.2}s",
         "",
         "",
         row.gate.quads,
@@ -102,6 +102,7 @@ fn print_row(name: &str, size: f64, row: &Row) {
         if row.accepted { "PASS" } else { "UNSUPPORTED" },
         row.stats.quads_only_sj,
         row.stats.quads_only_angle_deg,
+        row.stats.boundary_offset,
         row.stats.rounds,
         row.timing.total,
     );

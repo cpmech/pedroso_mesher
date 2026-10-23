@@ -69,9 +69,19 @@ name = "pedroso-mesher"
 version = "0.0.0"
 dependencies = [
  "mwmatching",
+ "plotpy",
  "serde",
  "serde_json",
  "spade",
+]
+
+[[package]]
+name = "plotpy"
+version = "1.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78745248664ca35c7c971f1b503e4e960c5e909b4d1b1a36a2514c69e5d9cd8d"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]

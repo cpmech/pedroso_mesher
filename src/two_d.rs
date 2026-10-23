@@ -1,14 +1,39 @@
 //! P1: planar all-quad meshing.
 //!
-//! The pipeline is the one the plan fixes: build a constrained Delaunay
-//! triangulation of the domain, refine it to the requested size, then pair
-//! triangles into quads with a **maximum-cardinality, maximum-weight matching**
-//! on the dual graph (the Blossom-Quad construction). Pairing first maximises
-//! how many triangles are used — that is what makes the result all-quad — and
-//! then maximises the quality of the quads formed.
+//! The pipeline is:
+//!
+//! 1. **Boundary sampling.** Every input segment is split so no piece is longer
+//!    than ~the size field (`sample_loops`); a long plate edge left as one
+//!    constrained edge would make every incident triangle a sliver.
+//! 2. **Constrained Delaunay triangulation** (`spade`, whose predicates follow
+//!    Shewchuk 1997, corpus `shewchuk-1997`), with every sampled boundary
+//!    segment inserted as a constraint.
+//! 3. **Ruppert/Delaunay refinement** (corpus
+//!    `shewchuk-2002-delaunay-refinement`): insert a triangle's circumcenter
+//!    when it is inside the domain, clear of the boundary and of existing
+//!    nodes; otherwise split the nearest boundary edge at its midpoint. The
+//!    implementation is the simple circumcenter version, not Ruppert's full
+//!    encroachment proof.
+//! 4. **Blossom-Quad pairing** (corpus `remacle-2012`): the dual graph of the
+//!    triangles is matched with a **maximum-cardinality, maximum-weight**
+//!    matching — Edmonds' blossom algorithm, via the `mwmatching` crate. The
+//!    cardinality pass is what makes the result all-quad; the weight is the
+//!    candidate quad's scaled Jacobian. Quality floors reject needles before
+//!    they reach the matching ([`PairGuard`]).
+//! 5. **Optional all-quad closure**, then valence clean-up (`cleanup`) and
+//!    smoothing ([`smooth_mesh`]).
 //!
 //! The triangulation is the substrate, not the product: a triangle that cannot
-//! be paired is returned separately, never silently dropped.
+//! be paired is returned separately, never silently dropped. `TwoDResult` is
+//! therefore quad-dominant by contract unless `Sizing::all_quad` is set and the
+//! cascade succeeds.
+//!
+//! **Approximated or missing.** The size field is uniform: [`Sizing::size_at`]
+//! ignores the point (no curvature, feature or anisotropic field). The
+//! refinement uses a fixed boundary margin plus a point-grid spacing rule
+//! instead of Ruppert's encroachment test, and the matching floors are
+//! empirical (see the measured notes on the constants). Clean-up is edge swaps
+//! only; it has no face open/close of the kind Q-Morph's clean-up uses.
 
 use mwmatching::{Matching, SENTINEL};
 use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
@@ -18,13 +43,28 @@ use crate::quality;
 
 /// A planar domain: one outer loop and any number of holes, all closed
 /// polygons in the XY plane (millimetres).
+///
+/// Invariants enforced by [`Domain::new`]: every loop has at least three points
+/// and every coordinate is finite. The outer loop is expected counter-clockwise
+/// (a clockwise one gives a negative [`Domain::area`] and is rejected by
+/// [`mesh_2d`]); holes may be given either way because [`Domain::contains`] is
+/// even-odd.
 #[derive(Clone, Debug, Default)]
 pub struct Domain {
+    /// Outer boundary loop, in order: `[x, y]` pairs in millimetres.
     pub outer: Vec<[f64; 2]>,
+
+    /// Hole loops, each ordered around its own boundary; a hole is excluded
+    /// from the domain. Empty when the domain is simply connected.
     pub holes: Vec<Vec<[f64; 2]>>,
 }
 
 /// What can go wrong building or meshing a domain.
+///
+/// Every variant is a rejected request, never a partial mesh: the public
+/// functions return `Ok` only when they produced a mesh, so a caller can treat
+/// an error as "nothing was built". The messages are user-facing (the CLI
+/// prints them verbatim).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TwoDError {
     /// A loop has fewer than three points.
@@ -52,13 +92,19 @@ impl std::error::Error for TwoDError {}
 
 impl Domain {
     /// A domain with an outer loop and optional holes.
+    ///
+    /// The loops are stored as given. Validation rejects a loop with fewer than
+    /// three points and any non-finite coordinate; it does **not** reject a
+    /// self-intersecting polygon, a hole outside the outer loop, or a clockwise
+    /// outer loop (the latter is caught by the area check in [`mesh_2d`]).
     pub fn new(outer: Vec<[f64; 2]>, holes: Vec<Vec<[f64; 2]>>) -> Result<Self, TwoDError> {
         let domain = Domain { outer, holes };
         domain.validate()?;
         Ok(domain)
     }
 
-    /// An axis-aligned rectangle, counter-clockwise.
+    /// An axis-aligned rectangle, counter-clockwise, with its lower-left corner
+    /// at the origin and dimensions in millimetres.
     pub fn rectangle(width: f64, height: f64) -> Result<Self, TwoDError> {
         Domain::new(
             vec![[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]],
@@ -67,6 +113,11 @@ impl Domain {
     }
 
     /// A rectangle with a circular hole at its centre.
+    ///
+    /// `segments` points discretise the circle (the caller's sampling choice);
+    /// the hole is emitted clockwise, the conventional opposite orientation to
+    /// the counter-clockwise outer loop. A plate with a hole is the corpus
+    /// stress-concentration part used by the quality checks.
     pub fn plate_with_hole(
         width: f64,
         height: f64,
@@ -89,6 +140,8 @@ impl Domain {
         )
     }
 
+    /// Check the invariants of [`Domain`]: at least three points per loop and
+    /// all coordinates finite.
     fn validate(&self) -> Result<(), TwoDError> {
         let loops = std::iter::once(&self.outer).chain(self.holes.iter());
         for loop_points in loops {
@@ -105,7 +158,13 @@ impl Domain {
         Ok(())
     }
 
-    /// Signed area: positive when the outer loop is counter-clockwise.
+    /// Signed area in square millimetres: positive when the outer loop is
+    /// counter-clockwise.
+    ///
+    /// The hole terms are subtracted by absolute value, so a hole given
+    /// clockwise (the convention) and one given counter-clockwise give the same
+    /// result. Returns a negative value for a clockwise outer loop, which
+    /// [`mesh_2d`] rejects.
     pub fn area(&self) -> f64 {
         let ring = |points: &[[f64; 2]]| -> f64 {
             let mut sum = 0.0;
@@ -119,7 +178,52 @@ impl Domain {
         ring(&self.outer) - self.holes.iter().map(|h| ring(h).abs()).sum::<f64>()
     }
 
-    /// Boundary segments, outer loop and holes.
+    /// Vertices where the boundary turns by more than 30 degrees.
+    ///
+    /// A circular boundary discretised as a 24-gon turns 15 degrees per vertex:
+    /// those are sampling points, not features, and a mesh may legitimately skip
+    /// one. A square corner turns 90 degrees and must be a mesh node. This is the
+    /// set `corner_offset` measures and that `smooth` must not slide.
+    ///
+    /// The test is on the angle between the two incident edge vectors, so it is
+    /// independent of loop orientation. Degenerate (zero-length) edges are
+    /// skipped. Measured reason for the 150-degree threshold: on the
+    /// plate-with-hole a 24-gon hole's shallow vertices (15 degrees of turn)
+    /// were being slid along the arc, which moved the geometry; a 90-degree
+    /// corner that was not protected ended up 1.0 mm from the nearest node.
+    pub fn sharp_corners(&self) -> Vec<[f64; 2]> {
+        let mut out = Vec::new();
+        for loop_pts in std::iter::once(&self.outer).chain(self.holes.iter()) {
+            let n = loop_pts.len();
+            if n < 3 {
+                continue;
+            }
+            for i in 0..n {
+                let p = loop_pts[(i + n - 1) % n];
+                let v = loop_pts[i];
+                let q = loop_pts[(i + 1) % n];
+                let a = [p[0] - v[0], p[1] - v[1]];
+                let b = [q[0] - v[0], q[1] - v[1]];
+                let la = (a[0] * a[0] + a[1] * a[1]).sqrt();
+                let lb = (b[0] * b[0] + b[1] * b[1]).sqrt();
+                if la < 1.0e-12 || lb < 1.0e-12 {
+                    continue;
+                }
+                let cos = ((a[0] * b[0] + a[1] * b[1]) / (la * lb)).clamp(-1.0, 1.0);
+                if cos.acos().to_degrees() < 150.0 {
+                    out.push(v);
+                }
+            }
+        }
+        out
+    }
+
+    /// All boundary segments, outer loop first and then each hole, as
+    /// `(start, end)` pairs in the loops' stored order.
+    ///
+    /// The closing segment of every loop is included. Used by
+    /// [`Domain::nearest_segment`] and [`Domain::distance_to_boundary`]; it
+    /// allocates on every call, so hot paths should cache the result.
     pub fn segments(&self) -> Vec<([f64; 2], [f64; 2])> {
         let mut out = Vec::new();
         for loop_points in std::iter::once(&self.outer).chain(self.holes.iter()) {
@@ -131,6 +235,9 @@ impl Domain {
     }
 
     /// Even-odd test: inside the outer loop and outside every hole.
+    ///
+    /// A point exactly on an edge or vertex has no defined side here; callers
+    /// that care use [`Domain::distance_to_boundary`] with a tolerance instead.
     pub fn contains(&self, p: [f64; 2]) -> bool {
         if !point_in_polygon(p, &self.outer) {
             return false;
@@ -138,12 +245,19 @@ impl Domain {
         !self.holes.iter().any(|h| point_in_polygon(p, h))
     }
 
-    /// Distance from `p` to the nearest boundary segment.
+    /// Euclidean distance, in millimetres, from `p` to the nearest boundary
+    /// segment (zero on the boundary).
     pub fn distance_to_boundary(&self, p: [f64; 2]) -> f64 {
         self.nearest_segment(p).2
     }
 
-    /// The boundary segment nearest to `p`: its endpoints and the distance.
+    /// The boundary segment nearest to `p`: its endpoints and the Euclidean
+    /// distance to it, in millimetres.
+    ///
+    /// Ties are broken by iteration order (outer loop before holes, segments in
+    /// stored order). A domain with no segments returns a dummy
+    /// `([0, 0], [0, 0], +inf)`, which callers compare against as "not near the
+    /// boundary".
     pub fn nearest_segment(&self, p: [f64; 2]) -> ([f64; 2], [f64; 2], f64) {
         let mut best = ([0.0; 2], [0.0; 2], f64::INFINITY);
         for (a, b) in self.segments() {
@@ -156,6 +270,11 @@ impl Domain {
     }
 }
 
+/// Classical even-odd ray casting: count the polygon edges crossed by a
+/// horizontal ray from `p` to the right.
+///
+/// The `(a[1] > p[1]) != (b[1] > p[1])` test is the half-open rule that makes a
+/// vertex on the ray count once, not twice. Boundary points are unspecified.
 fn point_in_polygon(p: [f64; 2], polygon: &[[f64; 2]]) -> bool {
     let mut inside = false;
     let n = polygon.len();
@@ -172,6 +291,10 @@ fn point_in_polygon(p: [f64; 2], polygon: &[[f64; 2]]) -> bool {
     inside
 }
 
+/// Euclidean distance from `p` to the closed segment `a`-`b`.
+///
+/// The projection parameter is clamped to `[0, 1]`, so the distance to a
+/// degenerate (zero-length) segment is the distance to its point.
 fn point_segment_distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     let ab = [b[0] - a[0], b[1] - a[1]];
     let length2 = ab[0] * ab[0] + ab[1] * ab[1];
@@ -185,9 +308,16 @@ fn point_segment_distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
 
 /// A uniform element size, in millimetres. Curvature and feature fields come
 /// later; the P1 gate only needs this.
+///
+/// The struct is public and has public fields, so it can be built without
+/// [`Sizing::uniform`]; the meshing entry points re-check `size` and return
+/// [`TwoDError::BadRequest`] rather than trusting it.
 #[derive(Clone, Copy, Debug)]
 pub struct Sizing {
+    /// Target element size in millimetres: the refinement aims for circumradius
+    /// and edge lengths around this value. Must be finite and positive.
     pub size: f64,
+
     /// Close every leftover triangle by a conforming refinement cascade.
     ///
     /// Off by default: the cascade is exact but expensive — the split of a
@@ -200,6 +330,11 @@ pub struct Sizing {
 }
 
 impl Sizing {
+    /// A uniform size field with `all_quad` off.
+    ///
+    /// Errors with [`TwoDError::BadRequest`] when `size` is not finite or not
+    /// positive. The check is repeated in [`triangulate`] because the fields are
+    /// public and a caller can bypass this constructor.
     pub fn uniform(size: f64) -> Result<Self, TwoDError> {
         if !size.is_finite() || size <= 0.0 {
             return Err(TwoDError::BadRequest(
@@ -213,27 +348,51 @@ impl Sizing {
     }
 
     /// Ask for a mesh with no triangles, at the cost of local refinement.
+    ///
+    /// This is a builder: it consumes and returns the value. The cascade is
+    /// best-effort — a triangle it cannot close is still returned in
+    /// `TwoDResult::unpaired`.
     pub fn all_quad(mut self) -> Self {
         self.all_quad = true;
         self
     }
 
+    /// Target size at `p`, in millimetres.
+    ///
+    /// Currently constant: `p` is ignored. This is the hook where a curvature
+    /// or feature-size field would be evaluated; keeping the call sites on this
+    /// method means such a field can be added without touching them.
     pub fn size_at(&self, _p: [f64; 2]) -> f64 {
         self.size
     }
 }
 
 /// Statistics of one planar meshing run.
+///
+/// Counts are taken after the all-quad closure and before the final clean-up /
+/// smoothing (those change cells but not these fields). `points` counts the
+/// final node set, including any node the closure cascade inserted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TwoDStats {
+    /// Nodes in the returned mesh.
     pub points: usize,
+
+    /// Triangles produced by the triangulation (before matching), not the
+    /// number left in the output.
     pub triangles: usize,
+
+    /// Quads in the returned mesh.
     pub quads: usize,
+
     /// Triangles the matching could not pair. They are kept in the mesh, so the
     /// output is quad-dominant rather than all-quad.
     pub unpaired_triangles: usize,
-    /// Reserved for the closure pass (not yet enabled); always zero.
+
+    /// Reserved for the closure pass; the field is populated but its current
+    /// meaning is the number of extra quads the cascade created, not a count of
+    /// absorbed triangles.
     pub absorbed_triangles: usize,
+
     /// Edge swaps taken by the valence-driven clean-up.
     pub cleanup_swaps: usize,
 }
@@ -251,10 +410,21 @@ impl TwoDStats {
 }
 
 /// A planar quad mesh, plus any triangle the matching could not pair.
+///
+/// `mesh` contains both quads and the leftover triangles, so it tiles the
+/// domain; `unpaired` is the same leftover list, repeated for callers that want
+/// to post-process the triangles without filtering the cell list.
 #[derive(Clone, Debug)]
 pub struct TwoDResult {
+    /// The output mesh: `Cell::Quad4` cells plus one `Cell::Tri3` per entry in
+    /// `unpaired`, wound counter-clockwise.
     pub mesh: Mesh,
+
+    /// Node triples of the triangles that could not be paired, in the order the
+    /// matching reported them (deterministic).
     pub unpaired: Vec<[usize; 3]>,
+
+    /// Counts for this run; see [`TwoDStats`].
     pub stats: TwoDStats,
 }
 
@@ -275,12 +445,23 @@ const SMOOTHING_ITERATIONS: usize = 80;
 const MIN_SPACING_FRACTION: f64 = 0.45;
 
 /// A uniform grid of points, for "is this candidate too close to anything?".
+///
+/// Used by [`refine`] to enforce the spacing rule without a nearest-neighbour
+/// structure: a query only has to look in the 3x3 block of buckets around it,
+/// so the check is O(1) in the number of inserted points.
 struct PointGrid {
+    /// Bucket side length; at least `1e-9` so the division in [`PointGrid::key`]
+    /// cannot be by zero. The refinement sets it to the target element size.
     cell: f64,
+
+    /// Points bucketed by integer cell coordinates. A point belongs to exactly
+    /// one bucket; `nearest` searches the 3x3 neighbourhood, which is enough
+    /// because a query farther than one cell cannot find a closer point.
     buckets: std::collections::HashMap<(i64, i64), Vec<[f64; 2]>>,
 }
 
 impl PointGrid {
+    /// A grid with the given cell size, clamped to a positive value.
     fn new(cell: f64) -> Self {
         PointGrid {
             cell: cell.max(1e-9),
@@ -288,6 +469,7 @@ impl PointGrid {
         }
     }
 
+    /// Integer bucket coordinate of `p` (floor, so negative coordinates work).
     fn key(&self, p: [f64; 2]) -> (i64, i64) {
         (
             (p[0] / self.cell).floor() as i64,
@@ -295,6 +477,8 @@ impl PointGrid {
         )
     }
 
+    /// Store `p`. Duplicates are not rejected here; the caller's spacing check
+    /// is what keeps them out.
     fn insert(&mut self, p: [f64; 2]) {
         self.buckets.entry(self.key(p)).or_default().push(p);
     }
@@ -339,8 +523,16 @@ const MAX_PAIR_ANGLE_DEG: f64 = 160.0;
 /// conversion) can ask for a stricter floor without changing that path.
 #[derive(Clone, Copy, Debug)]
 pub struct PairGuard {
+    /// Smallest corner scaled Jacobian a candidate quad may have; a value in
+    /// `[0, 1]`, where 1 is a square. Candidates below it are not offered to
+    /// the matching.
     pub min_scaled_jacobian: f64,
+
+    /// Smallest corner angle, in degrees, a candidate quad may have.
     pub min_angle_deg: f64,
+
+    /// Largest corner angle, in degrees, a candidate quad may have. This is the
+    /// guard that rejects needle pairs (a corner near 180 degrees).
     pub max_angle_deg: f64,
 }
 
@@ -361,6 +553,25 @@ const MAX_PASSES: usize = 200;
 const BOUNDARY_MARGIN: f64 = 0.55;
 
 /// Mesh a planar domain with all-quad elements.
+///
+/// Runs the whole pipeline: sample, triangulate, refine, pair, optionally close
+/// the leftovers, clean up and smooth. `domain` is in millimetres and must have
+/// a positive [`Domain::area`]; `sizing.size` must be finite and positive.
+///
+/// # Errors
+///
+/// [`TwoDError::BadRequest`] for a non-positive area or size,
+/// [`TwoDError::LoopTooShort`] / [`TwoDError::NonFinite`] from
+/// [`Domain::new`] (if the struct was built by hand, `validate` is not re-run
+/// here), and [`TwoDError::Triangulation`] when the constrained triangulation
+/// cannot insert a point or a constraint. Any error means no mesh was built.
+///
+/// # Postconditions
+///
+/// The returned mesh tiles the domain: quads plus `unpaired` triangles, with no
+/// cell dropped. All cells are wound counter-clockwise. Geometry is in the XY
+/// plane (`z = 0`). Topology is validated only for the all-quad closure path;
+/// the quad-dominant path relies on the triangulation being conforming.
 pub fn mesh_2d(domain: &Domain, sizing: &Sizing) -> Result<TwoDResult, TwoDError> {
     if domain.area() <= 0.0 {
         return Err(TwoDError::BadRequest(
@@ -411,6 +622,9 @@ pub fn mesh_2d(domain: &Domain, sizing: &Sizing) -> Result<TwoDResult, TwoDError
 }
 
 /// Assemble a mesh from quads plus leftover triangles.
+///
+/// The cell order is quads first, then triangles in `leftover` order; used to
+/// run the topology check on the closure candidate before committing to it.
 fn build_mesh(points: &[Node], quads: &[[usize; 4]], leftover: &[[usize; 3]]) -> Mesh {
     let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
     cells.extend(leftover.iter().map(|t| Cell::tri3(*t)));
@@ -426,12 +640,28 @@ fn build_mesh(points: &[Node], quads: &[[usize; 4]], leftover: &[[usize; 3]]) ->
 /// only when it raises the smallest angle of every incident quad *and* does not
 /// lower the smallest scaled Jacobian — the lesson from the first smoothing
 /// attempt, which traded 0.37 of Jacobian for one degree of angle.
+///
+/// This is a nodally based quality objective in the spirit of Knupp 2000
+/// (corpus `knupp-2000-part1`), not the Laplacian smoother the name might
+/// suggest. `size` is the local element size in millimetres and sets the search
+/// radii; `iterations` is an upper bound (the loop stops early when no node
+/// moves). The mesh's connectivity is unchanged — only `Mesh::points` moves —
+/// and boundary nodes stay on their own segment.
+///
+/// The caller is [`mesh_2d`]; the public form exists so a caller can re-smooth a
+/// mesh after its own post-processing.
 pub fn smooth_mesh(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
     smooth(mesh, domain, iterations, size);
 }
 
+/// Implementation of [`smooth_mesh`], also used internally by [`mesh_2d`].
 fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
     let n = mesh.points.len();
+    // A sharp corner is a feature of the geometry: sliding it along one of the
+    // two adjacent edges cuts the corner. Measured on the plate-with-hole: a
+    // 24-gon hole's shallow vertices were being slid, and on the ring a 90-degree
+    // corner sat 1.0 away from the nearest node after smoothing.
+    let corners = domain.sharp_corners();
     let mut incident: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (c, cell) in mesh.cells.iter().enumerate() {
         for &v in &cell.nodes {
@@ -447,6 +677,13 @@ fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
             }
             let current = [mesh.points[v][0], mesh.points[v][1]];
             let on_boundary = domain.distance_to_boundary(current) < 1e-9;
+            if on_boundary
+                && corners
+                    .iter()
+                    .any(|c| (c[0] - current[0]).powi(2) + (c[1] - current[1]).powi(2) < 1.0e-18)
+            {
+                continue;
+            }
 
             let mut ring = Vec::new();
             for &c in &incident[v] {
@@ -492,6 +729,11 @@ fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
                 if !spacing_ok(&incident[v], mesh, candidate, v, size) {
                     continue;
                 }
+                // Discrete descent: try the candidate in place, keep it only if
+                // the objective strictly improves. The comparison is against the
+                // current best (not the original position), so several good
+                // candidates can compound within one visit; a candidate that
+                // inverts a cell scores +inf and can never win.
                 mesh.points[v] = [candidate[0], candidate[1], 0.0];
                 let f = node_objective(&incident[v], mesh);
                 if f < best_f - 1e-9 {
@@ -517,8 +759,13 @@ fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
 /// the ends of the old edge lose one, the new corners gain one. A swap is taken
 /// only when it strictly lowers the irregularity `sum |valence - 4|` over the
 /// interior nodes it touches and both new quads stay convex with a usable
-/// Jacobian. This is the cheap half of Q-Morph's clean-up — edge swaps only, no
-/// face opens or closes.
+/// Jacobian. This is the cheap half of Q-Morph's clean-up (Owen et al. 1999,
+/// corpus `owen-1999`) — edge swaps only, no face opens or closes.
+///
+/// `max_rounds` bounds the passes, not the swaps; the loop stops early when a
+/// pass changes nothing. Returns the number of swaps actually taken. Nodes on
+/// the mesh boundary are excluded from the valence cost because their valence is
+/// fixed by the boundary discretisation.
 fn cleanup(mesh: &mut Mesh, max_rounds: usize) -> usize {
     let mut swaps = 0usize;
     for _ in 0..max_rounds {
@@ -554,7 +801,16 @@ fn cleanup(mesh: &mut Mesh, max_rounds: usize) -> usize {
                 .sum()
         };
 
-        for ((a, b), owners) in edges.clone() {
+        // Deterministic: `HashMap` iteration order is randomised per process, and
+        // each swap mutates the mesh the next candidate is measured on. Visiting
+        // the keys in ascending order makes the same binary produce the same mesh;
+        // it changes only the order equal-cost swaps are considered in.
+        let mut keys: Vec<(usize, usize)> = edges.keys().copied().collect();
+        keys.sort_unstable();
+        for (a, b) in keys {
+            let Some(owners) = edges.get(&(a, b)).cloned() else {
+                continue;
+            };
             if owners.len() != 2 {
                 continue;
             }
@@ -633,6 +889,7 @@ fn cleanup(mesh: &mut Mesh, max_rounds: usize) -> usize {
     swaps
 }
 
+/// The XY coordinates of a quad's four nodes, in stored order.
 fn coords_of(quad: &[usize], points: &[Node]) -> [[f64; 2]; 4] {
     [
         [points[quad[0]][0], points[quad[0]][1]],
@@ -642,7 +899,8 @@ fn coords_of(quad: &[usize], points: &[Node]) -> [[f64; 2]; 4] {
     ]
 }
 
-/// Nodally based quality objective, in the spirit of Knupp (2000).
+/// Nodally based quality objective, in the spirit of Knupp (2000, corpus
+/// `knupp-2000-part1`).
 ///
 /// For every corner of every incident quad: `(1 - sin θ)²`, which is the
 /// deviation of the scaled Jacobian from 1, plus a logarithmic barrier on
@@ -678,6 +936,10 @@ fn node_objective(incident: &[usize], mesh: &Mesh) -> f64 {
 }
 
 /// True when `p` keeps every edge of the incident cells at a usable length.
+///
+/// Only edges that touch the moving node `v` are checked. The 0.15 x size floor
+/// is a guard against a move that collapses an edge (and with it a quad corner);
+/// it is a hard reject, unlike the objective's soft barrier.
 fn spacing_ok(incident: &[usize], mesh: &Mesh, p: [f64; 2], v: usize, size: f64) -> bool {
     for &c in incident {
         for (i, &u) in mesh.cells[c].nodes.iter().enumerate() {
@@ -704,11 +966,31 @@ fn spacing_ok(incident: &[usize], mesh: &Mesh, p: [f64; 2], v: usize, size: f64)
     true
 }
 
-/// Closest point to `p` on segment `a..b`/// Closest point to `p` on segment `a..b`, kept at least `margin` (as a share of
-/// the segment) from either end so a node never lands on its neighbour.
-/// Smallest corner angle and smallest scaled Jacobian among the quads around a
-/// node.
 /// Triangulate the domain and refine it to the size field.
+///
+/// Pipeline: sample the loops (`sample_loops`), insert every sampled boundary
+/// point and constrain every sampled boundary segment in a constrained Delaunay
+/// triangulation (`spade`), refine with circumcenters (the private `refine`), and keep the
+/// triangles whose centroid is inside the domain.
+///
+/// # Preconditions
+///
+/// `domain` must be a valid [`Domain`] and `sizing.size` finite and positive.
+///
+/// # Postconditions
+///
+/// Returns `(points, triangles)` with `points` in the XY plane and every index
+/// valid. Boundary edges of the input are present in the triangulation (up to
+/// the sampling); triangles outside the domain (in a hole or outside the outer
+/// loop) are filtered out. The same point can appear in several triangles but
+/// is emitted once, keyed by its bit pattern.
+///
+/// # Approximations
+///
+/// The refinement is Ruppert's circumcenter rule (corpus
+/// `shewchuk-2002-delaunay-refinement`) with a fixed boundary margin and a
+/// uniform point grid instead of the full encroachment machinery; see
+/// `refine` and `BOUNDARY_MARGIN`.
 pub fn triangulate(
     domain: &Domain,
     sizing: &Sizing,
@@ -725,6 +1007,9 @@ pub fn triangulate(
     // it. A plate edge 100 mm long with a 1 mm size would otherwise be a single
     // constrained edge, and every triangle touching it would be a sliver.
     let loops = sample_loops(domain, sizing);
+    // Constrained Delaunay triangulation. The points have to be inserted before
+    // their constraint: `spade` recovers a constraint between existing vertices,
+    // it does not create the endpoints.
     let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
     for loop_points in &loops {
         for &[x, y] in loop_points {
@@ -741,9 +1026,13 @@ pub fn triangulate(
         }
     }
 
+    // Ruppert refinement on the constrained triangulation; it only inserts
+    // points, never moves a boundary vertex, so the constraints stay valid.
     refine(&mut cdt, domain, sizing);
 
-    // Triangles of the domain, keyed by spade's stable vertex indices.
+    // Triangles of the domain, keyed by spade's stable vertex indices. The
+    // filtering (centroid inside the domain) is what removes the triangles that
+    // fill a hole or lie outside the outer loop.
     let triangles = collect_triangles(&cdt, domain);
     if triangles.is_empty() {
         return Err(TwoDError::BadRequest("the domain triangulated to nothing"));
@@ -769,6 +1058,15 @@ pub fn triangulate(
 }
 
 /// Boundary loops with each segment split so none is longer than the target.
+///
+/// Each input segment is divided into `ceil(length / (1.1 * target))` equal
+/// pieces. The 1.1 factor leaves room for the refinement's own spacing rule: a
+/// piece exactly at the target would be rejected by the point grid's spacing
+/// test and could never be improved.
+///
+/// Returns one loop per input loop, outer first, with the end point of each
+/// segment omitted (the next segment starts there); the closing segment is
+/// therefore included implicitly.
 fn sample_loops(domain: &Domain, sizing: &Sizing) -> Vec<Vec<[f64; 2]>> {
     let mut out = Vec::new();
     for loop_points in std::iter::once(&domain.outer).chain(domain.holes.iter()) {
@@ -791,12 +1089,18 @@ fn sample_loops(domain: &Domain, sizing: &Sizing) -> Vec<Vec<[f64; 2]>> {
 
 /// Insert circumcenters until no triangle is larger than the sizing field.
 ///
-/// Two insertion rules, both Ruppert's: a triangle whose circumcenter is inside
+/// Two insertion rules, both Ruppert's (corpus
+/// `shewchuk-2002-delaunay-refinement`): a triangle whose circumcenter is inside
 /// and far enough from the boundary is split there; when the circumcenter is
 /// outside the domain or closer to the boundary than the margin, the nearest
 /// boundary edge is split at its midpoint instead. Without the second rule a
 /// square stalls immediately — its triangles are right-angled, so every
 /// circumcenter lands *on* an edge.
+///
+/// Only the insertion radius is controlled, not the full encroachment proof:
+/// `BOUNDARY_MARGIN` and `MIN_SPACING_FRACTION` replace it. The loop is bounded
+/// by `MAX_PASSES` and `MAX_POINTS`; on either bound it returns with the current
+/// (still valid) triangulation rather than reporting an error.
 fn refine(
     cdt: &mut ConstrainedDelaunayTriangulation<Point2<f64>>,
     domain: &Domain,
@@ -811,6 +1115,10 @@ fn refine(
     }
     let mut inserted_total = 0usize;
     for _ in 0..MAX_PASSES {
+        // Pass 1: collect one candidate per over-sized triangle. The candidate
+        // is either the circumcenter (the Ruppert split) or, when the
+        // circumcenter is unusable, the midpoint of the nearest boundary edge
+        // (the boundary-recovery split).
         let mut candidates: Vec<[f64; 2]> = Vec::new();
         for face in cdt.inner_faces() {
             let vertices = face.vertices();
@@ -883,6 +1191,11 @@ fn refine(
 const MAX_POINTS: usize = 200_000;
 
 /// Triangles whose centroid is inside the domain, as positions.
+///
+/// The centroid test is the domain filter: `spade` triangulates the convex hull
+/// of all inserted points, so the triangles filling holes or lying outside the
+/// outer loop must be discarded here. A triangle with all three vertices on the
+/// boundary but centroid outside is dropped with them.
 fn collect_triangles(
     cdt: &ConstrainedDelaunayTriangulation<Point2<f64>>,
     domain: &Domain,
@@ -902,6 +1215,7 @@ fn collect_triangles(
     out
 }
 
+/// Arithmetic mean of a polygon's vertices; used as the inside test point.
 fn centroid(p: &[[f64; 2]]) -> [f64; 2] {
     let n = p.len() as f64;
     [
@@ -911,6 +1225,10 @@ fn centroid(p: &[[f64; 2]]) -> [f64; 2] {
 }
 
 /// Circumcenter and circumradius of a triangle, or `None` if it is degenerate.
+///
+/// A triangle whose doubled signed area (the denominator `d`) is below `1e-14`
+/// is treated as degenerate: its circumcenter is at infinity, and inserting it
+/// would be meaningless.
 fn circumcenter(p: &[[f64; 2]]) -> Option<([f64; 2], f64)> {
     let (a, b, c) = (p[0], p[1], p[2]);
     let d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
@@ -928,6 +1246,9 @@ fn circumcenter(p: &[[f64; 2]]) -> Option<([f64; 2], f64)> {
 
 /// Pair adjacent triangles into quads: maximum cardinality, then maximum
 /// quality, via a general weighted matching (Edmonds' blossom algorithm).
+///
+/// This is [`pair_triangles_with`] with the shipped [`PairGuard::default`];
+/// see there for the construction and the paper reference.
 fn pair_triangles(tris: &[[usize; 3]], points: &[Node]) -> (Vec<[usize; 4]>, Vec<[usize; 3]>) {
     pair_triangles_with(tris, points, PairGuard::default())
 }
@@ -940,12 +1261,28 @@ fn pair_triangles(tris: &[[usize; 3]], points: &[Node]) -> (Vec<[usize; 4]>, Vec
 /// Jacobian ≥ `guard.min_scaled_jacobian` and corner angles within
 /// `[guard.min_angle_deg, guard.max_angle_deg]`; the rest is maximum-cardinality
 /// matching, weighted by scaled Jacobian.
+///
+/// The construction is Blossom-Quad (Remacle et al. 2012, corpus
+/// `remacle-2012`): a vertex per triangle, an edge for every pair that shares a
+/// triangle edge and passes the guards, weight `round(1000 * min SJ)` clamped to
+/// `[1, 1000]`. `mwmatching` solves it with Edmonds' blossom algorithm; the
+/// cardinality pass runs before the weights, so the number of paired triangles
+/// is maximised first and quality breaks ties. Ties are made deterministic by
+/// sorting the edge list before the matching.
+///
+/// # Postconditions
+///
+/// `quads` and `unpaired` partition the input triangles: every input appears in
+/// exactly one of them, no triangle is used twice, and a quad's four nodes keep
+/// a positive (counter-clockwise) winding. `points` is not modified.
 pub fn pair_triangles_with(
     tris: &[[usize; 3]],
     points: &[Node],
     guard: PairGuard,
 ) -> (Vec<[usize; 4]>, Vec<[usize; 3]>) {
-    // edge key -> the (up to two) triangles that use it
+    // Build the dual graph: edge key -> the (up to two) triangles that use it.
+    // Only an edge with exactly two owners can become a quad; a boundary edge
+    // (one owner) or a non-manifold edge (three or more) cannot.
     let mut edge_to_tris: std::collections::HashMap<(usize, usize), Vec<usize>> =
         std::collections::HashMap::new();
     for (t, tri) in tris.iter().enumerate() {
@@ -956,8 +1293,17 @@ pub fn pair_triangles_with(
         }
     }
 
+    // Deterministic: the blossom matching takes the edges in insertion order, and
+    // the result among equal-weight candidates depends on it. Collecting the keys
+    // and sorting them makes the edge list independent of `HashMap` order; the
+    // matching rule itself is unchanged.
+    let mut keys: Vec<(usize, usize)> = edge_to_tris.keys().copied().collect();
+    keys.sort_unstable();
     let mut edges: Vec<(usize, usize, i32)> = Vec::new();
-    for owners in edge_to_tris.values() {
+    for key in keys {
+        let Some(owners) = edge_to_tris.get(&key) else {
+            continue;
+        };
         if owners.len() != 2 {
             continue;
         }
@@ -980,15 +1326,25 @@ pub fn pair_triangles_with(
         if !max_angle.is_finite() || max_angle > guard.max_angle_deg {
             continue;
         }
-        // weight: quality in [0, 1] scaled to an integer; higher is better
+        // weight: quality in [0, 1] scaled to an integer; higher is better.
+        // Clamped to at least 1 so a quad that passed the guards is never
+        // mistaken for "no edge"; the matching is maximising, not minimising.
         let weight = (1000.0 * worst).round().clamp(1.0, 1000.0) as i32;
         edges.push((t1, t2, weight));
     }
 
+    // Blossom-Quad: first maximise the number of matched triangles (the
+    // cardinality stage), then maximise the total weight among those matchings.
+    // The cardinality stage is what makes the result all-quad; without it the
+    // weighted stage would leave a high-quality triangle unpaired to keep a
+    // slightly better quad elsewhere.
     let mut matching = Matching::new(edges);
     matching.max_cardinality();
     let mate = matching.solve();
 
+    // Rebuild the cells from the matching. Each mating edge is visited once
+    // (the `other <= t` guard), and `used` protects against a malformed mate
+    // array; a triangle absent from `mate` is unpaired, not an error.
     let mut quads: Vec<[usize; 4]> = Vec::new();
     let mut used = vec![false; tris.len()];
     for t in 0..tris.len() {
@@ -1020,6 +1376,11 @@ pub fn pair_triangles_with(
 }
 
 /// Strictly convex, counter-clockwise and non-degenerate.
+///
+/// `1e-12` is on the doubled signed area, i.e. about `5e-13` in area units; a
+/// quad below it is treated as a sliver. The four cross products then require
+/// every corner to turn left by a positive amount, so a concave quad and a
+/// collinear corner both fail.
 fn convex_ccw(q: &[[f64; 2]; 4]) -> bool {
     let mut area = 0.0;
     for i in 0..4 {
@@ -1040,12 +1401,22 @@ fn convex_ccw(q: &[[f64; 2]; 4]) -> bool {
     })
 }
 
-/// Scaled Jacobian of a quad given by coordinates, for callers outside this module.
+/// Scaled Jacobian of a quad given by coordinates, for callers outside this
+/// module.
+///
+/// Returns the minimum over the four corners, in `[-1, 1]` (1 is a square, 0 a
+/// degenerate corner, negative an inverted one). The coordinates must be in
+/// counter-clockwise order for the sign to mean anything.
 pub fn quad_min_sj_public(q: &[[f64; 2]; 4]) -> f64 {
     quad_min_sj(q)
 }
 
 /// The quality contract's scaled Jacobian, for a quad given as coordinates.
+///
+/// Thin wrapper over `quality::scaled_jacobian` on a temporary `Cell::quad4`;
+/// the node ids are irrelevant to the metric, so `[0, 1, 2, 3]` is used. Returns
+/// `+inf` for an empty iterator (not reachable with four corners) and the
+/// minimum corner value otherwise.
 fn quad_min_sj(q: &[[f64; 2]; 4]) -> f64 {
     let pts: Vec<Node> = q.iter().map(|p| [p[0], p[1], 0.0]).collect();
     let cell = Cell::quad4([0, 1, 2, 3]);
@@ -1067,6 +1438,19 @@ fn quad_min_sj(q: &[[f64; 2]; 4]) -> f64 {
 /// Each triangle is attempted on its own copy: one that cannot be closed (a
 /// cycle, a split that would degenerate, a quad collecting three hanging nodes)
 /// is left as a triangle and reported, instead of sinking the whole mesh.
+///
+/// This is a local construction of this mesher, not a paper template: Sun et al.
+/// (corpus `sun-2015`, `sun-2016`) close residuals without refining, and that
+/// path is [`crate::sun::close_residuals`]. The cascade is exact and conforming
+/// but grows the element count; see the measured note on [`Sizing::all_quad`].
+///
+/// # Postconditions
+///
+/// `quads`, `points` and `leftover` tile exactly the input: every input quad is
+/// still present (possibly split into more quads), and every input triangle is
+/// either replaced by a valid cascade of quads or returned in `leftover`
+/// unchanged. A component that shares an edge with a triangle that is not being
+/// closed is never split, so no crack is introduced.
 fn close_by_refinement(
     quads: &[[usize; 4]],
     unpaired: &[[usize; 3]],
@@ -1203,7 +1587,12 @@ fn leftover_components(unpaired: &[[usize; 3]]) -> Vec<Vec<[usize; 3]>> {
         let root = find(&mut parent, i);
         groups.entry(root).or_default().push(unpaired[i]);
     }
-    groups.into_values().collect()
+    // Deterministic: components are closed in this order and appended to the
+    // mesh, so `HashMap` order would reorder the cells. Lowest component root
+    // (the smallest triangle index) first.
+    let mut groups: Vec<(usize, Vec<[usize; 3]>)> = groups.into_iter().collect();
+    groups.sort_unstable_by_key(|(root, _)| *root);
+    groups.into_iter().map(|(_, group)| group).collect()
 }
 
 /// The cascade for one triangle, or `None` if it cannot be completed.
@@ -1304,6 +1693,7 @@ fn close_one(
     ))
 }
 
+/// True when the cell's boundary contains the undirected edge `a`-`b`.
 fn has_edge(cell: &[usize], a: usize, b: usize) -> bool {
     (0..cell.len()).any(|i| {
         let (x, y) = (cell[i], cell[(i + 1) % cell.len()]);
@@ -1311,6 +1701,11 @@ fn has_edge(cell: &[usize], a: usize, b: usize) -> bool {
     })
 }
 
+/// Return the midpoint of `a`-`b`, inserting it once.
+///
+/// The midpoint node is memoised by the *sorted* edge key, because a cascade can
+/// ask for the same edge from both of its cells; returning a fresh node twice
+/// would create two coincident points and a crack. The new node has `z = 0`.
 fn midpoint(
     pts: &mut Vec<Node>,
     mids: &mut std::collections::HashMap<(usize, usize), usize>,
@@ -1332,6 +1727,10 @@ fn midpoint(
     id
 }
 
+/// A convex, counter-clockwise quad with a usable scaled Jacobian (`> 0.02`).
+///
+/// The cascade uses this on every quad it is about to create; a cascade step
+/// that would produce a worse quad is refused and the triangle is left alone.
 fn valid_quad(q: &[usize; 4], pts: &[Node]) -> bool {
     let coords = [
         [pts[q[0]][0], pts[q[0]][1]],
@@ -1342,9 +1741,7 @@ fn valid_quad(q: &[usize; 4], pts: &[Node]) -> bool {
     convex_ccw(&coords) && quad_min_sj(&coords) > 0.02
 }
 
-/// Split a quad that has two hanging edges: opposite edges give two quads
-/// directly, adjacent edges give three quads around a centroid.
-/// Build the quad from two triangles that share an edge./// Build the quad from two triangles that share an edge.
+/// Build the quad from two triangles that share an edge.
 ///
 /// The shared edge must be taken in each triangle's own winding: triangle `a`
 /// traverses it one way, triangle `b` the other. Walking the *sorted* edge
