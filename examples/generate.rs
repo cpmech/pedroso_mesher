@@ -16,6 +16,7 @@ fn part(name: &str) -> (Domain, f64) {
         "plate-hole-4mm" => (Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap(), 4.0),
         "plate-hole-2mm" => (Domain::plate_with_hole(100.0, 60.0, 10.0, 24).unwrap(), 2.0),
         "plate-hole-1mm" => (Domain::plate_with_hole(100.0, 60.0, 10.0, 48).unwrap(), 1.0),
+        "plate-hole-0.6mm" => (Domain::plate_with_hole(100.0, 60.0, 10.0, 64).unwrap(), 0.6),
         "l-bracket" => (
             Domain::new(
                 vec![
