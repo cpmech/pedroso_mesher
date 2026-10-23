@@ -97,3 +97,5 @@ pub mod simons_features;
 pub mod simons_limit;
 
 pub mod simons_pipeline;
+
+pub mod simons_graded;

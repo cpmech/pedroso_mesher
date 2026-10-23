@@ -155,10 +155,19 @@
 //!   49 to **79 quads** with every quad positive. The interior is still not a
 //!   ring, though: the horseshoe is an *open* C-strip (its two ends are the
 //!   radial seps, so its boundary is one loop with no hole), and the hole is
-//!   surrounded by the three 3/5-corner faces, which are still rejected. A
-//!   quad mesh of a triangle with two even sep sides and a free arc exists
-//!   (all-quad triangulations need interior valence-3/5 pairs and the
-//!   even-boundary rule), but that construction is not implemented, so
+//!   surrounded by the three 3/5-corner faces, which are still rejected. Those
+//!   faces measure: areas 0.433, 0.185 and 0.174, with sides (graph edges,
+//!   boundary edges) = [(2,0), (1,1), (2,0)], [(2,0), (2,1), (1,0)] and
+//!   [(3,1), (1,0), (1,0)]: the free hole side is a **single** graph edge (so
+//!   its subdivision is free) while the two seps carry the neighbours' counts.
+//!   A quad mesh of a triangle with legs 6 and base 4 needs 12 quads and four
+//!   interior vertices (two valence-3/5 pairs) by the Euler/edge-parity count,
+//!   and it needs six rows because each row consumes one segment per leg; the
+//!   "rows of 6, 4, 2" layout consumes only three side edges per leg, so it is
+//!   infeasible as specified (and the arc-2 / rows 6, 4 variant fails the same
+//!   count: 14 boundary segments and 10 quads give 13 interior edges, i.e. 17
+//!   vertices, not 14 + two pairs). A correct (6, 6, 4) even-triangle
+//!   quadrangulation is what is missing; it is not implemented, so
 //!   `ring_bands` reports "no hole loop around the hole" and the collar
 //!   fallback runs: a collar loop offset `1.4 sigma` from the hole polygon
 //!   (100 nodes) carries the outer band (100 quads) and the hole band (100
