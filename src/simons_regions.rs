@@ -134,25 +134,32 @@
 //! [`crate::simons_channel::channel_between`] together with the domain
 //! boundary. Measured, and blocked on two concrete things:
 //!
-//! * Rectangle: the carve works (160 -> 112 quads, a 44-node interior loop,
-//!   min SJ 1.000, coverage 0.70, 44 cracks along the unstitched ring), but
-//!   `channel_between` rejects that loop with "neither the width-path DP nor
-//!   the resampled strip produced a valid ribbon". A direct probe shows that a
-//!   four-node inner loop stitches fine (4 quads), so the failure is the
-//!   density/corner matching between a 4-corner boundary and a 44-node
-//!   staircase loop, not the call.
-//! * Annulus: the carve leaves boundary loops that pinch at a node (three or
-//!   more boundary edges meet there, at the tile corners), so the boundary
-//!   walk cannot close and the stitch reports the geometry; at a 3.0 sigma
-//!   carve one 12-node loop survives but some of its points fall outside the
-//!   domain. The hole band would additionally need `channel_between` to accept
-//!   an inner loop that is *larger* than the outer one (the outer loop must be
-//!   on the domain boundary), which it does not.
+//! Pinched boundary nodes are split before the walk: every non-manifold
+//! boundary node gets one copy per incident boundary loop (the quads at the
+//! node are re-indexed to the copy of the wedge that contains their centroid),
+//! so the boundary edge set becomes a set of disjoint cycles.
 //!
-//! What is needed from the two modules: `channel_between` should match the
-//! inner loop's corners to the boundary's corners (or accept a dense loop);
-//! and the interior loop extraction needs an interior mesh whose boundary has
-//! no non-manifold vertex (or a split-node pass before the stitch).
+//! * Rectangle: 48 quads carved, and the boundary of the remaining 112 quads
+//!   is **one loop of 44 nodes with area 1.400** (`rectangle_carve_walks_as_
+//!   one_loop`). `channel_between` still rejects that loop at every carve
+//!   radius 1.4-3.6: "neither the width-path DP nor the resampled strip nor
+//!   the row strip produced a valid ribbon". A direct probe shows a four-node
+//!   inner loop stitches fine (4 quads) while the same inset rectangle
+//!   resampled to 44 collinear nodes is rejected, so the remaining blocker is
+//!   the dense collinear inner loop against a four-corner outer loop.
+//! * Annulus: at a 1.4 sigma carve three pinch nodes are split and the loops
+//!   close, but the interior mesh is **fragmented**: a 20-node hole-side loop
+//!   (6 of its nodes lie on the hole boundary) plus three interior islands of
+//!   area 0.7145, 0.6863 and 0.1907. A single ribbon cannot cover three
+//!   islands, and the hole band between the hole polygon and the hole-side loop
+//!   needs a reversed band (the interior loop is *larger* than the hole
+//!   polygon, while `channel_between` requires the outer loop to be on the
+//!   domain boundary and `|outer| > |inner|`). Both are reported, not hacked.
+//!
+//! What is needed: `channel_between` should match the inner loop's corners to
+//! the boundary's corners (or accept dense collinear loops), expose a hole
+//! band, and the annulus interior has to stop fragmenting (the rejected
+//! quadrilateral-illiterate faces and the horseshoe tile are what split it).
 //!
 //! # Not implemented
 //!
@@ -2345,9 +2352,9 @@ fn distance_to_loop(p: [f64; 2], points: &[[f64; 2]]) -> f64 {
 /// Boundary loops of a quad mesh, with the material on the left (so an outer
 /// loop is counter-clockwise and a hole loop is clockwise). Vertices are node
 /// ids in order.
-fn mesh_boundary_loops(mesh: &Mesh) -> Result<Vec<Vec<usize>>, String> {
+/// Directed boundary edges of a quad mesh (material on the left).
+fn boundary_directed(mesh: &Mesh) -> Result<Vec<(usize, usize)>, String> {
     let mut directed: HashMap<(usize, usize), ()> = HashMap::new();
-    let mut inserted = 0usize;
     for (index, cell) in mesh.cells.iter().enumerate() {
         if cell.nodes.len() != 4 {
             return Err(format!("regions: cell {index} is not a quad"));
@@ -2356,21 +2363,28 @@ fn mesh_boundary_loops(mesh: &Mesh) -> Result<Vec<Vec<usize>>, String> {
             let a = cell.nodes[slot];
             let b = cell.nodes[(slot + 1) % 4];
             if directed.remove(&(b, a)).is_none() && directed.insert((a, b), ()).is_some() {
-                inserted += 1;
+                return Err(format!(
+                    "regions: directed mesh edge ({a}, {b}) is used twice in the same \
+                     direction (inconsistent quad winding)"
+                ));
             }
         }
-    }
-    if inserted > 0 {
-        return Err(format!(
-            "regions: {inserted} directed mesh edge(s) are used twice in the same direction \
-             (inconsistent quad winding or a crack)"
-        ));
     }
     if directed.is_empty() {
         return Err("regions: the mesh has no boundary".to_string());
     }
+    let mut edges: Vec<(usize, usize)> = directed.keys().copied().collect();
+    edges.sort_unstable();
+    Ok(edges)
+}
+
+/// Boundary loops of a quad mesh, with the material on the left (so an outer
+/// loop is counter-clockwise and a hole loop is clockwise). Vertices are node
+/// ids in order.
+fn mesh_boundary_loops(mesh: &Mesh) -> Result<Vec<Vec<usize>>, String> {
+    let directed = boundary_directed(mesh)?;
     let mut outgoing: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-    for &edge in directed.keys() {
+    for &edge in &directed {
         outgoing.entry(edge.0).or_default().push(edge);
     }
     let position = |node: usize| -> Option<[f64; 2]> {
@@ -2396,7 +2410,7 @@ fn mesh_boundary_loops(mesh: &Mesh) -> Result<Vec<Vec<usize>>, String> {
     };
     let mut visited: HashMap<(usize, usize), ()> = HashMap::new();
     let mut loops: Vec<Vec<usize>> = Vec::new();
-    for &start in directed.keys() {
+    for &start in &directed {
         if visited.contains_key(&start) {
             continue;
         }
@@ -2432,6 +2446,183 @@ fn mesh_boundary_loops(mesh: &Mesh) -> Result<Vec<Vec<usize>>, String> {
         loops.push(loop_ids);
     }
     Ok(loops)
+}
+
+/// Split every non-manifold boundary node into one copy per incident boundary
+/// loop, so the boundary edge set becomes a union of disjoint cycles.
+///
+/// A quad-mesh boundary node where two boundary loops touch (a *pinch*, three
+/// or more boundary edges at the node) is duplicated: each incident boundary
+/// wedge keeps its own copy, and every quad at the node is re-indexed to the
+/// copy of the wedge that contains its centroid. The copies sit at the same
+/// position, so the mesh stays conforming inside each fan and the loops become
+/// independent. Returns the new mesh and the number of extra nodes created.
+fn split_pinched_boundary(mesh: &Mesh) -> Result<(Mesh, usize), String> {
+    let directed = boundary_directed(mesh)?;
+    let mut outgoing: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut incoming: HashMap<usize, Vec<usize>> = HashMap::new();
+    for &(a, b) in &directed {
+        outgoing.entry(a).or_default().push(b);
+        incoming.entry(b).or_default().push(a);
+    }
+    let position = |node: usize| -> Option<[f64; 2]> {
+        mesh.points.get(node).map(|point| [point[0], point[1]])
+    };
+    // Wedges at every pinched node: (incoming start, outgoing end, sector
+    // start angle, sector end angle) measured counter-clockwise.
+    let mut wedges: HashMap<usize, Vec<(usize, usize, f64, f64)>> = HashMap::new();
+    let mut created = 0usize;
+    let mut pinch_nodes: Vec<usize> = outgoing
+        .iter()
+        .filter(|(_, list)| list.len() > 1)
+        .map(|(&node, _)| node)
+        .collect();
+    pinch_nodes.sort_unstable();
+    for node in pinch_nodes {
+        let centre = match position(node) {
+            Some(found) => found,
+            None => return Err("regions: a boundary node has no position".to_string()),
+        };
+        let outs = outgoing.get(&node).cloned().unwrap_or_default();
+        let ins = incoming.get(&node).cloned().unwrap_or_default();
+        if ins.len() != outs.len() || outs.len() < 2 {
+            return Err(format!(
+                "regions: boundary node {node} has {} incoming and {} outgoing boundary \
+                 edges; it cannot be split",
+                ins.len(),
+                outs.len()
+            ));
+        }
+        let mut entries: Vec<(usize, usize, f64, f64)> = Vec::with_capacity(outs.len());
+        let mut used: Vec<bool> = vec![false; outs.len()];
+        for &start in &ins {
+            let from = match position(start) {
+                Some(found) => found,
+                None => continue,
+            };
+            let back = angle_of(sub(from, centre));
+            let mut best: Option<(f64, usize)> = None;
+            for (slot, &end) in outs.iter().enumerate() {
+                if used[slot] {
+                    continue;
+                }
+                let target = match position(end) {
+                    Some(found) => found,
+                    None => continue,
+                };
+                let turn = (back - angle_of(sub(target, centre))).rem_euclid(std::f64::consts::TAU);
+                if best.map(|(current, _)| turn < current).unwrap_or(true) {
+                    best = Some((turn, slot));
+                }
+            }
+            let slot = match best {
+                Some((_, found)) => found,
+                None => {
+                    return Err(format!(
+                        "regions: boundary node {node} has no free outgoing edge"
+                    ))
+                }
+            };
+            used[slot] = true;
+            let end = outs[slot];
+            let target = match position(end) {
+                Some(found) => found,
+                None => return Err("regions: a boundary node has no position".to_string()),
+            };
+            // The material wedge at the node runs counter-clockwise from the
+            // outgoing direction to the reverse of the incoming direction.
+            entries.push((start, end, angle_of(sub(target, centre)), back));
+        }
+        if entries.len() != outs.len() {
+            return Err(format!("regions: boundary node {node} could not be paired"));
+        }
+        created += entries.len() - 1;
+        wedges.insert(node, entries);
+    }
+    if wedges.is_empty() {
+        return Ok((mesh.clone(), 0));
+    }
+    // New copy ids for every wedge except the first one of each node.
+    let mut copies: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut points = mesh.points.clone();
+    for (&node, entries) in &wedges {
+        for (slot, _) in entries.iter().enumerate() {
+            let id = if slot == 0 {
+                node
+            } else {
+                let id = points.len();
+                points.push(mesh.points.get(node).copied().unwrap_or([0.0; 3]));
+                id
+            };
+            copies.insert((node, slot), id);
+        }
+    }
+    let contains_angle = |start: f64, end: f64, value: f64| -> bool {
+        let span = (end - start).rem_euclid(std::f64::consts::TAU);
+        let offset = (value - start).rem_euclid(std::f64::consts::TAU);
+        offset <= span + 1e-12
+    };
+    let mut cells: Vec<Cell> = Vec::with_capacity(mesh.cells.len());
+    for (index, cell) in mesh.cells.iter().enumerate() {
+        let mut nodes = cell.nodes.clone();
+        for slot in 0..nodes.len() {
+            let node = nodes[slot];
+            let entries = match wedges.get(&node) {
+                Some(found) => found,
+                None => continue,
+            };
+            let centre = match position(node) {
+                Some(found) => found,
+                None => return Err("regions: a boundary node has no position".to_string()),
+            };
+            let mut centroid = [0.0f64; 2];
+            for &other in &cell.nodes {
+                if let Some(point) = position(other) {
+                    centroid[0] += 0.25 * point[0];
+                    centroid[1] += 0.25 * point[1];
+                }
+            }
+            let direction = angle_of(sub(centroid, centre));
+            let mut best: Option<(f64, usize)> = None;
+            for (entry, &(_, _, start, end)) in entries.iter().enumerate() {
+                if contains_angle(start, end, direction) {
+                    best = Some((0.0, entry));
+                    break;
+                }
+                // distance to the nearer sector end, as a fallback
+                let to_start = (direction - start).rem_euclid(std::f64::consts::TAU);
+                let to_end = (end - direction).rem_euclid(std::f64::consts::TAU);
+                let distance = to_start.min(to_end);
+                if best.map(|(current, _)| distance < current).unwrap_or(true) {
+                    best = Some((distance, entry));
+                }
+            }
+            let entry = match best {
+                Some((_, found)) => found,
+                None => {
+                    return Err(format!(
+                        "regions: cell {index} at pinch node {node} has no wedge"
+                    ))
+                }
+            };
+            nodes[slot] = *copies.get(&(node, entry)).unwrap_or(&node);
+        }
+        let mut unique = true;
+        for a in 0..nodes.len() {
+            for b in (a + 1)..nodes.len() {
+                if nodes[a] == nodes[b] {
+                    unique = false;
+                }
+            }
+        }
+        if !unique {
+            return Err(format!(
+                "regions: splitting the boundary pinches collapsed cell {index}"
+            ));
+        }
+        cells.push(Cell::quad4([nodes[0], nodes[1], nodes[2], nodes[3]]));
+    }
+    Ok((Mesh::new(points, cells), created))
 }
 
 /// Remove the quads whose centroid is closer than `radius_factor * sigma` to
@@ -2536,20 +2727,44 @@ fn stitch_case(
     let domain = Domain::new(outer_points.clone(), hole_points.clone())
         .map_err(|error| format!("regions: the domain is invalid: {error}"))?;
 
-    // Carve radius search: the carve decides which boundary loop the channel
-    // has to stitch, and a smaller radius can leave a pinched loop (a node
-    // where two boundary loops touch) that cannot carry a ribbon.
-    let mut chosen: Option<(Mesh, usize, Vec<usize>, f64)> = None;
-    for &radius in &[1.4f64, 1.6, 1.8, 2.0, 2.4, 3.0] {
+    // Carve radius and band search: the carve decides which boundary loop the
+    // channel has to stitch, and `channel_between` may reject a loop that is
+    // too dense or a band that is too thin, so every radius is tried.
+    let mut attempt: Option<(
+        Mesh,
+        usize,
+        Vec<[f64; 2]>,
+        Vec<usize>,
+        Vec<[usize; 4]>,
+        Vec<[f64; 3]>,
+        f64,
+    )> = None;
+    let mut fallback: Option<(Mesh, usize)> = None;
+    for &radius in &[1.4f64, 1.6, 1.8, 2.0, 2.4, 3.0, 3.6] {
         let (carved, carved_quads) = carve_outer_ring(&interior, &field, &outer_points, radius);
         if carved.cells.is_empty() {
             notes.push(format!("carve {radius:.1}: every quad was carved away"));
             continue;
         }
+        let (carved, split_nodes) = match split_pinched_boundary(&carved) {
+            Ok(found) => found,
+            Err(error) => {
+                notes.push(format!("carve {radius:.1}: {error}"));
+                continue;
+            }
+        };
+        if split_nodes > 0 {
+            notes.push(format!(
+                "carve {radius:.1}: split {split_nodes} pinched boundary node(s)"
+            ));
+        }
         let loops = match mesh_boundary_loops(&carved) {
             Ok(found) => found,
             Err(error) => {
                 notes.push(format!("carve {radius:.1}: {error}"));
+                if fallback.is_none() {
+                    fallback = Some((carved, carved_quads));
+                }
                 continue;
             }
         };
@@ -2561,75 +2776,110 @@ fn stitch_case(
                 points2d.push([point[0], point[1]]);
             }
             let area = loop_area(&points2d);
-            let on_boundary = points2d
+            let off_boundary = points2d
                 .iter()
-                .all(|&p| domain.distance_to_boundary(p) <= 1.0e-9);
+                .all(|&p| domain.distance_to_boundary(p) > 1.0e-9);
             if area > 0.0
-                && !on_boundary
+                && off_boundary
                 && loop_ids.len() >= 4
                 && best.map(|(_, found)| area > found).unwrap_or(true)
             {
                 best = Some((index, area));
             }
         }
-        if let Some((index, area)) = best {
-            let loop_ids = loops[index].clone();
-            let length = loop_ids.len();
-            if length.is_multiple_of(2) {
-                chosen = Some((carved, carved_quads, loop_ids, radius));
+        let (index, area) = match best {
+            Some(found) => found,
+            None => {
+                notes.push(format!("carve {radius:.1}: no interior loop of area > 0"));
+                if fallback.is_none() {
+                    fallback = Some((carved, carved_quads));
+                }
+                continue;
+            }
+        };
+        let loop_ids = loops[index].clone();
+        let length = loop_ids.len();
+        if !length.is_multiple_of(2) {
+            notes.push(format!(
+                "carve {radius:.1}: interior loop of {length} nodes is odd and cannot carry a ribbon"
+            ));
+            if fallback.is_none() {
+                fallback = Some((carved, carved_quads));
+            }
+            continue;
+        }
+        let mut loop_points: Vec<[f64; 2]> = Vec::with_capacity(length);
+        for &node in &loop_ids {
+            let point = carved.points.get(node).copied().unwrap_or([0.0; 3]);
+            loop_points.push([point[0], point[1]]);
+        }
+        let mut total = 0.0;
+        for point in &loop_points {
+            total += field.sigma_at(*point);
+        }
+        let mean_size = total / length as f64;
+        let mut pool: Vec<[f64; 3]> = carved.points.clone();
+        match simons_channel::channel_between(
+            &domain,
+            &outer_points,
+            &loop_points,
+            &loop_ids,
+            &mut pool,
+            mean_size,
+        ) {
+            Ok(quads) => {
                 notes.push(format!(
-                    "carve {radius:.1}: interior loop of {length} nodes, area {area:.4}"
+                    "carve {radius:.1}: interior loop of {length} nodes (area {area:.4}), \
+                     channel {} quads",
+                    quads.len()
+                ));
+                attempt = Some((
+                    carved,
+                    carved_quads,
+                    loop_points,
+                    loop_ids,
+                    quads,
+                    pool,
+                    radius,
                 ));
                 break;
             }
-            notes.push(format!(
-                "carve {radius:.1}: interior loop of {} nodes is odd and cannot carry a ribbon",
-                loop_ids.len()
-            ));
+            Err(error) => {
+                notes.push(format!("carve {radius:.1}: channel_between: {error}"));
+                if fallback.is_none() {
+                    fallback = Some((carved, carved_quads));
+                }
+            }
         }
     }
-    let (mut carved_mesh, carved_quads, loop_ids, _radius) = match chosen {
-        Some(found) => found,
-        None => {
-            return Err(format!(
-                "regions: no carve radius left a stitchable interior loop ({notes:?})"
-            ))
-        }
-    };
-    // The loop to stitch is the largest loop that is not on the domain
-    // boundary.
-    let mut loop_points: Vec<[f64; 2]> = Vec::with_capacity(loop_ids.len());
-    for &node in &loop_ids {
-        let point = carved_mesh.points.get(node).copied().unwrap_or([0.0; 3]);
-        loop_points.push([point[0], point[1]]);
+    let (mut carved_mesh, carved_quads, _loop_points, _loop_ids, channel_quads, pool, radius) =
+        match attempt {
+            Some(found) => found,
+            None => {
+                let (carved, carved_quads) = match fallback {
+                    Some(found) => found,
+                    None => {
+                        return Err(format!(
+                            "regions: no carve radius left a stitchable interior loop ({notes:?})"
+                        ))
+                    }
+                };
+                (
+                    carved,
+                    carved_quads,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    0.0,
+                )
+            }
+        };
+    if !pool.is_empty() {
+        carved_mesh.points = pool;
     }
-    let mean_size = if loop_ids.is_empty() {
-        1.0
-    } else {
-        let mut total = 0.0;
-        for &node in &loop_ids {
-            let point = carved_mesh.points.get(node).copied().unwrap_or([0.0; 3]);
-            total += field.sigma_at([point[0], point[1]]);
-        }
-        total / loop_ids.len() as f64
-    };
-    let mut pool: Vec<[f64; 3]> = carved_mesh.points.clone();
-    let channel_quads = match simons_channel::channel_between(
-        &domain,
-        &outer_points,
-        &loop_points,
-        &loop_ids,
-        &mut pool,
-        mean_size,
-    ) {
-        Ok(quads) => quads,
-        Err(error) => {
-            notes.push(format!("channel_between: {error}"));
-            Vec::new()
-        }
-    };
     let bands = usize::from(!channel_quads.is_empty());
-    carved_mesh.points = pool;
+    let _ = radius;
     let mut cells = carved_mesh.cells.clone();
     for quad in &channel_quads {
         cells.push(Cell::quad4(*quad));
@@ -3208,6 +3458,72 @@ mod tests {
         assert!(!numbers.rectangle.mesh.cells.is_empty());
         assert!(!numbers.annulus.mesh.cells.is_empty());
         assert!(numbers.annulus.quads > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rectangle_carve_walks_as_one_loop() -> Result<(), String> {
+        let (points, tris, alpha, size) = rectangle_fixture()?;
+        let field = Field::new(&points, &tris, &alpha, &size)?;
+        let regions = build(&points, &tris, &alpha, &size)?;
+        let interior = regions.mesh()?;
+        let outer = field.boundary_points.clone();
+        let (carved, carved_quads) = carve_outer_ring(&interior, &field, &outer[0], 1.4);
+        assert_eq!(carved_quads, 48);
+        let (carved, split) = split_pinched_boundary(&carved)?;
+        assert_eq!(split, 0, "the rectangle loop has no pinch");
+        let loops = mesh_boundary_loops(&carved)?;
+        assert_eq!(loops.len(), 1, "the carved rectangle boundary is one loop");
+        assert_eq!(loops[0].len(), 44, "the loop has 44 nodes");
+        let mut loop_points: Vec<[f64; 2]> = Vec::new();
+        for &node in &loops[0] {
+            let point = carved.points.get(node).copied().unwrap_or([0.0; 3]);
+            loop_points.push([point[0], point[1]]);
+        }
+        let area = loop_area(&loop_points);
+        assert!((area - 1.4).abs() < 1e-9, "loop area {area}");
+        println!(
+            "rectangle carve: {} quads carved, one loop of {} nodes, area {area:.3}",
+            carved_quads,
+            loops[0].len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn annulus_hole_loop_geometry() -> Result<(), String> {
+        let (points, tris, alpha, size) = annulus_fixture()?;
+        let field = Field::new(&points, &tris, &alpha, &size)?;
+        let regions = build(&points, &tris, &alpha, &size)?;
+        let interior = regions.mesh()?;
+        let outer = field.boundary_points.clone();
+        let (carved, carved_quads) = carve_outer_ring(&interior, &field, &outer[0], 1.4);
+        let (carved, split) = split_pinched_boundary(&carved)?;
+        println!(
+            "annulus 1.4: {} quads carved, {} pinch node(s) split",
+            carved_quads, split
+        );
+        let loops = mesh_boundary_loops(&carved)?;
+        for (index, ids) in loops.iter().enumerate() {
+            let mut pts: Vec<[f64; 2]> = Vec::new();
+            let mut on_hole = 0usize;
+            for &node in ids {
+                let point = carved.points.get(node).copied().unwrap_or([0.0; 3]);
+                pts.push([point[0], point[1]]);
+                if field.boundary_points.len() > 1
+                    && field.boundary_points[1..]
+                        .iter()
+                        .any(|hole| distance_to_loop([point[0], point[1]], hole) <= 1e-9)
+                {
+                    on_hole += 1;
+                }
+            }
+            println!(
+                "annulus loop {index}: {} nodes, area {:.4}, {on_hole} nodes on the hole boundary",
+                ids.len(),
+                loop_area(&pts)
+            );
+        }
         Ok(())
     }
 
