@@ -95,3 +95,5 @@ pub mod simons_regions;
 pub mod simons_features;
 
 pub mod simons_limit;
+
+pub mod simons_pipeline;

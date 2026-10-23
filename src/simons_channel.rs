@@ -93,6 +93,42 @@
 //!   grid strip at every tried δ and remains unmarshalled; the corpus L (wide
 //!   legs, size 2) is the case that passes.
 //!
+//! # Chapter 2 fidelity status
+//!
+//! * **§2.2.5 midpoint splits** are implemented for the template ranking:
+//!   `split_polygon` inserts the midpoints, and `best_split_variant` tries a
+//!   5-gon as 6 (one split), a 7-gon as 8 (one split), a 6-gon as 8 (two
+//!   splits) and a 4-gon as 6 (two splits), ranking each against the plain
+//!   template. The collinear midpoint is allowed; rotations that would put both
+//!   half-edges in one quad are rejected by the convexity check. The variants
+//!   are **not wired into the cover** yet: a split edge is shared with the
+//!   neighbouring patch, and making every neighbour agree (and stay even-sided)
+//!   needs a global split set; the cover therefore still uses the plain
+//!   templates. Measured: regular 5-gon split → 6-sided, 2 quads, rank 0.60;
+//!   regular 7-gon split → 8-sided, 4 quads, rank 0.5714.
+//! * **§2.2.7 cap merging** is implemented (`add_megapatches`): a patch with a
+//!   single boundary cross edge is merged with each neighbour and kept as a
+//!   megapatch if the union is 4–8-sided and meshalable. It is used when the
+//!   greedy cover leaves faces uncovered; the resulting cover is kept only if
+//!   it covers more area. The widest-path cycle cover (§2.2.8) is not
+//!   implemented; greedy remains the selection rule.
+//! * **Template set**: six-gons use the 0/1/2-Steiner templates (the convex
+//!   3-Steiner configuration is necessarily a doublet or a central triangular
+//!   hole, so it is not generated). Eight-gons use the recursive cuts from
+//!   Fig. 2.6 in the direct, 4+6, 6/6, corner-cut+4/6 and double-chord forms;
+//!   this is a subset of the thesis' selected 13 templates, not the full set.
+//!
+//! # Known quality limit: the 0.6 mm perf plate
+//!
+//! A cap-aware projection strip was implemented and measured for the staircase
+//! hole band: a cap consumes two grid edges and one inner vertex where a grid
+//! edge is nearly radial (the 5° sliver). Its best minimum rank was 0.14
+//! (≈12°), and the node mapping could make the cap strip overlap neighbouring
+//! bands; it cannot reach the 30° target, so it is **not enabled**. The §2.2.5
+//! cross-edge midpoint splits were not completed. The raw perf mesh therefore
+//! stays at min SJ 0.0874 / 5.01° (BelowTarget); the shared smoother and shape
+//! pass take it to SJ 0.513 / 36.4°, which is the integrated 7/7 result.
+//!
 //! * **Covering (§2.2.7–2.2.9)**: the full megapatch/widest-path search is not
 //!   implemented. Patches are scored and selected by a greedy cover: repeatedly
 //!   take the patch that adds the largest uncovered channel area, breaking ties
@@ -2089,6 +2125,73 @@ fn quadrangulate_eight(boundary: &[[f64; 2]]) -> Option<Decomp> {
     best
 }
 
+/// Insert the midpoints of the chosen polygon edges and return the extended
+/// polygon. Edge `i` runs from vertex `i` to vertex `i+1`.
+#[allow(dead_code)]
+fn split_polygon(polygon: &[[f64; 2]], split_edges: &[usize]) -> Vec<[f64; 2]> {
+    let n = polygon.len();
+    let mut out = Vec::with_capacity(n + split_edges.len());
+    for i in 0..n {
+        out.push(polygon[i]);
+        if split_edges.contains(&i) {
+            let a = polygon[i];
+            let b = polygon[(i + 1) % n];
+            out.push([0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])]);
+        }
+    }
+    out
+}
+
+/// §2.2.5 split variants for one patch: a 5-gon is tried as 6 by splitting one
+/// edge, a 7-gon as 8, a 6-gon also as 8 by splitting two edges, and a 4-gon
+/// also as 6 by splitting two edges. The collinear midpoint is allowed as a
+/// boundary vertex; templates that put both half-edges in one quad are rejected
+/// by the convex-angle validation, and a rotation that sends an interior edge
+/// through the midpoint wins instead.
+#[allow(dead_code)]
+fn best_split_variant(polygon: &[[f64; 2]]) -> Option<(Decomp, Vec<usize>)> {
+    let n = polygon.len();
+    let mut best: Option<(f64, Decomp, Vec<usize>)> = None;
+    let mut consider = |splits: Vec<usize>| {
+        let extended = split_polygon(polygon, &splits);
+        if let Some(decomposition) = decompose(&extended) {
+            let better = match &best {
+                None => true,
+                Some((rank, _, _)) => decomposition.rank > *rank,
+            };
+            if better {
+                best = Some((decomposition.rank, decomposition, splits));
+            }
+        }
+    };
+    if n.is_multiple_of(2) {
+        consider(Vec::new());
+    }
+    match n {
+        5 | 7 => {
+            for edge in 0..n {
+                consider(vec![edge]);
+            }
+        }
+        6 => {
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    consider(vec![a, b]);
+                }
+            }
+        }
+        4 => {
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    consider(vec![a, b]);
+                }
+            }
+        }
+        _ => {}
+    }
+    best.map(|(_, decomposition, splits)| (decomposition, splits))
+}
+
 fn decompose(boundary: &[[f64; 2]]) -> Option<Decomp> {
     match boundary.len() {
         4 => {
@@ -2109,6 +2212,7 @@ fn decompose(boundary: &[[f64; 2]]) -> Option<Decomp> {
 // Patch generation and greedy covering (§2.2.4, §2.2.7–2.2.9)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct CandidatePatch {
     faces: Vec<usize>,
     boundary: Vec<usize>,
@@ -2188,6 +2292,76 @@ fn finalize_patches(patches: &mut [CandidatePatch], pos: &[[f64; 2]]) {
             patch.decomposition = Some(decomposition);
         }
     }
+}
+
+/// Cap merging (§2.2.7): a patch with exactly one cross edge on its boundary
+/// is a dead end; merge it with each neighbour across that edge and keep the
+/// resulting megapatch if it is itself meshalable. The rank of a megapatch is
+/// the worst contained rank.
+fn add_megapatches(
+    patches: &[CandidatePatch],
+    cross: &HashSet<(usize, usize)>,
+    faces: &[Face],
+    pos: &[[f64; 2]],
+) -> Vec<CandidatePatch> {
+    let mut edge_patches: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (index, patch) in patches.iter().enumerate() {
+        let n = patch.boundary.len();
+        for i in 0..n {
+            let key = edge_key(patch.boundary[i], patch.boundary[(i + 1) % n]);
+            edge_patches.entry(key).or_default().push(index);
+        }
+    }
+    let mut seen: HashSet<Vec<usize>> = patches.iter().map(|patch| patch.faces.clone()).collect();
+    let mut extras: Vec<CandidatePatch> = Vec::new();
+    for (index, patch) in patches.iter().enumerate() {
+        let n = patch.boundary.len();
+        let mut cap_edges: Vec<(usize, usize)> = Vec::new();
+        for i in 0..n {
+            let key = edge_key(patch.boundary[i], patch.boundary[(i + 1) % n]);
+            if cross.contains(&key) {
+                cap_edges.push(key);
+            }
+        }
+        if cap_edges.len() != 1 {
+            continue;
+        }
+        let cap_edge = cap_edges[0];
+        let Some(neighbours) = edge_patches.get(&cap_edge) else {
+            continue;
+        };
+        for &other in neighbours {
+            if other == index {
+                continue;
+            }
+            let mut union = patch.faces.clone();
+            union.extend(patches[other].faces.iter().copied());
+            union.sort_unstable();
+            union.dedup();
+            if !seen.insert(union.clone()) {
+                continue;
+            }
+            let Some((boundary, _, area)) = union_boundary(&union, faces) else {
+                continue;
+            };
+            if !(4..=8).contains(&boundary.len()) {
+                continue;
+            }
+            let polygon: Vec<[f64; 2]> = boundary.iter().map(|&id| pos[id]).collect();
+            let Some(decomposition) = decompose(&polygon) else {
+                continue;
+            };
+            let rank = decomposition.rank.min(patch.rank).min(patches[other].rank);
+            extras.push(CandidatePatch {
+                faces: union,
+                boundary,
+                decomposition: Some(decomposition),
+                area,
+                rank,
+            });
+        }
+    }
+    extras
 }
 
 fn greedy_cover(faces: &[Face], patches: &[CandidatePatch]) -> (Vec<usize>, f64) {
@@ -2843,15 +3017,48 @@ fn subdivide_chain(points: &[[f64; 2]], target_edges: usize) -> Result<Vec<[f64;
 
 fn build(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
     let mut last_error = String::new();
+    // A template mesh found at the widest channel is kept provisionally: if a
+    // narrower channel gives a better grid (the usual 1.0h result for the
+    // wide-leg sections), that one wins. The thesis-default 1.4h template
+    // result is still used when no narrower channel closes.
+    let mut provisional: Option<BuildOutput> = None;
     for delta in ADAPTIVE_DELTAS {
         match build_ribbon_with_delta(domain, size, delta) {
-            Ok(output) => return Ok(output),
+            Ok(output) if output.stats.min_scaled_jacobian >= 0.2 => return Ok(output),
+            Ok(output) => {
+                // A valid but poor ribbon (the 0.6 mm perf plate) gets one
+                // template-path attempt; keep whichever mesh is better.
+                if let Ok(templates) = build_templates_with_delta(domain, size, delta) {
+                    if templates.stats.min_scaled_jacobian > output.stats.min_scaled_jacobian {
+                        return Ok(templates);
+                    }
+                }
+                return Ok(output);
+            }
             Err(error) => last_error = format!("delta={delta:.2}h ribbon: {error}"),
         }
         match build_templates_with_delta(domain, size, delta) {
-            Ok(output) => return Ok(output),
-            Err(error) => last_error.push_str(&format!("; delta={delta:.2}h templates: {error}")),
+            Ok(output) => {
+                if output.stats.min_scaled_jacobian >= 0.9 || delta <= 1.0 {
+                    return Ok(output);
+                }
+                let better = match &provisional {
+                    None => true,
+                    Some(current) => {
+                        output.stats.min_scaled_jacobian > current.stats.min_scaled_jacobian
+                    }
+                };
+                if better {
+                    provisional = Some(output);
+                }
+            }
+            Err(error) => {
+                last_error.push_str(&format!("; delta={delta:.2}h templates: {error}"));
+            }
         }
+    }
+    if let Some(output) = provisional {
+        return Ok(output);
     }
     match two_chain_strip(domain, size) {
         Ok(output) => Ok(output),
@@ -4192,11 +4399,25 @@ fn build_templates_with_delta(
         .filter(|patch| patch.decomposition.is_some())
         .count();
 
-    let (selected, greedy_fraction) = greedy_cover(&faces, &patches);
+    let (mut selected, mut greedy_fraction) = greedy_cover(&faces, &patches);
+    if greedy_fraction < 0.999 {
+        let cross: HashSet<(usize, usize)> =
+            cross_edges.iter().map(|&(a, b)| edge_key(a, b)).collect();
+        let extras = add_megapatches(&patches, &cross, &faces, &pos_snapshot);
+        if !extras.is_empty() {
+            let mut all = patches.clone();
+            all.extend(extras);
+            let (candidate_selected, candidate_fraction) = greedy_cover(&faces, &all);
+            if candidate_fraction > greedy_fraction + 1.0e-9 {
+                selected = candidate_selected;
+                greedy_fraction = candidate_fraction;
+                patches = all;
+            }
+        }
+    }
 
     // ---- fallback: close whatever the greedy cover left -------------------
     let mut pos = prepared.pos.clone();
-    let mut selected = selected;
     let mut splits: HashMap<(usize, usize), usize> = HashMap::new();
     let mut fallback_quads: Vec<[usize; 4]> = Vec::new();
     let mut fallback_regions = 0usize;
@@ -5278,6 +5499,50 @@ mod tests {
             Err(error) => {
                 assert!(false, "channel_between_dense staircase failed: {error}");
             }
+        }
+    }
+
+    #[test]
+    fn split_template_variants() {
+        let regular = |n: usize| -> Vec<[f64; 2]> {
+            (0..n)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * i as f64 / n as f64;
+                    [a.cos(), a.sin()]
+                })
+                .collect()
+        };
+        for n in [4usize, 5, 6, 7] {
+            let polygon = regular(n);
+            let Some((decomposition, splits)) = best_split_variant(&polygon) else {
+                assert!(false, "{n}-gon has no split variant");
+                return;
+            };
+            let extended = split_polygon(&polygon, &splits);
+            assert!(
+                matches!(extended.len(), 4 | 6 | 8),
+                "{n}-gon: extended {} sides",
+                extended.len()
+            );
+            assert!(!decomposition.quads.is_empty());
+            let total = extended.len() + decomposition.steiner.len();
+            for quad in &decomposition.quads {
+                assert!(quad.iter().all(|&index| index < total));
+            }
+            match n {
+                5 | 7 => assert_eq!(splits.len(), 1, "{n}-gon must split one edge"),
+                4 | 6 => assert!(
+                    splits.is_empty() || splits.len() == 2,
+                    "{n}-gon splits {splits:?}"
+                ),
+                _ => {}
+            }
+            println!(
+                "split template {n}-gon: {} splits {splits:?}, {} quads, rank {:.4}",
+                splits.len(),
+                decomposition.quads.len(),
+                decomposition.rank
+            );
         }
     }
 

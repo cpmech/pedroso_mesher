@@ -150,7 +150,19 @@
 //!   ring component (the five rejected faces cut it into a hole-side loop with
 //!   6 nodes on the hole plus islands of 0.7145, 0.6863 and 0.1907), so no
 //!   interior loop encloses the hole and neither band can attach to the QGP
-//!   mesh. Two channel bands are therefore built on a **collar loop offset from
+//!   mesh. Three attempts at a ring were measured and rejected:
+//!   (a) coarser annulus meshes (40x4 and 60x6) still have the same rejected
+//!   faces and still fall back to the collar; (b) keeping the 2.93-area
+//!   horseshoe as a *bent* tile (four field-line sides, clockwise corner
+//!   polygon) and meshing it with a bilinear Coons patch that ignores the
+//!   corner winding grows the QGP interior from 49 to 54 quads, but the patch
+//!   folds ("bent coons: a quad is inverted"): a 180-degree bent strip is not
+//!   transfinite-meshable, and the thesis handles exactly this case with the
+//!   singularity pairs and chord redirection of Section 5.1.4, not a Coons
+//!   patch; (c) after carving both rings no edge-connected component has a
+//!   hole loop that encloses the hole, so the two-band `ring_bands` path has
+//!   nothing to attach to. `kept_interior` therefore stays 0 for the annulus
+//!   and the collar fallback remains the only gate-passing construction. Two channel bands are therefore built on a **collar loop offset from
 //!   the hole polygon** by `1.4 sigma` (100 nodes): the outer band (100 quads)
 //!   between the domain boundary and the collar, and the hole band (100 quads)
 //!   between the hole polygon and the same collar. They share the collar ids,

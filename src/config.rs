@@ -165,13 +165,23 @@ pub enum Route {
     /// polylines come from [`MeshConfig::features`]; the route needs at least
     /// one.
     Features,
+
+    /// **Pipeline** — the full Simons 2024 pipeline: the size-aware GODF field
+    /// (Chapter 3) drives the QGP tiles (Chapter 5), the Chapter 2 carve +
+    /// channel stitches them to the boundary, and the §2.2.10 smoothing runs
+    /// last. Measured: a constant-size 10×10 square runs the full QGP+stitch
+    /// path (96 quads, SJ 0.7035, near-uniform, size ratio 1.249); a graded
+    /// square falls back to the uniform channel because a uniaxial size
+    /// gradient gives a singularity-free field and the one QGP tile collapses
+    /// (documented in `simons_pipeline`).
+    Pipeline,
 }
 
 impl Route {
-    /// All eleven routes, in shipping order (the order the tables and the
+    /// All twelve routes, in shipping order (the order the tables and the
     /// configuration examples use). Every route in this array is callable by
     /// [`generate`]; not every route passes the gate on every part.
-    pub const ALL: [Route; 11] = [
+    pub const ALL: [Route; 12] = [
         Route::Qmorph,
         Route::Paving,
         Route::Bipartite,
@@ -183,6 +193,7 @@ impl Route {
         Route::L1,
         Route::Sized,
         Route::Features,
+        Route::Pipeline,
     ];
 
     /// The stable lowercase name used in tables, JSON and logs.
@@ -202,6 +213,7 @@ impl Route {
             Route::L1 => "l1",
             Route::Sized => "sized",
             Route::Features => "features",
+            Route::Pipeline => "pipeline",
         }
     }
 }
@@ -258,6 +270,10 @@ pub struct MeshConfig {
     /// Options of the `sized` route (the Simons 2024 channel route; currently
     /// empty because the thesis knobs are fixed at their measured defaults).
     pub sized: crate::sized::Options,
+
+    /// Options of the `pipeline` route: base size, size growth and whether the
+    /// §2.2.10 smoothing runs.
+    pub pipeline: crate::simons_pipeline::Options,
 
     /// Interior feature polylines for [`Route::Features`] (empty otherwise).
     /// A through-going polyline (both endpoints on the domain boundary) splits
@@ -404,6 +420,7 @@ pub fn generate(
         }
         Route::L1 => crate::alt_l1::mesh_with_options(domain, sizing, &config.l1)?,
         Route::Sized => crate::sized::mesh_with_options(domain, sizing, &config.sized)?,
+        Route::Pipeline => crate::simons_pipeline::mesh(domain, &config.pipeline)?.mesh,
         Route::Features => {
             if config.features.is_empty() {
                 return Err("the features route needs at least one feature polyline".into());
