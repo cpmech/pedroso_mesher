@@ -64,14 +64,28 @@
 //!    (5.2)) using its integer counts. The tile meshes are welded by coordinate
 //!    into one [`Mesh`].
 //!
+//! 7. **Merged regions (Section 5.1.5.2) and their block decomposition.**
+//!    Tiles that share a singularity corner are merged transitively into one
+//!    region; its boundary is reconstructed from the tiles' directed sides
+//!    with the shared edges removed, so the singular vertices become interior.
+//!    A disk-shaped merged region is split into four-sided blocks by
+//!    ear-clipping chords ([`quadrangulate_polygon`]): an ear is accepted when
+//!    the two chains opposite each other carry the same QGP count, the chord
+//!    stays inside, and the block meshes to positive quads. An annular merged
+//!    region (the whole domain, when every tile merges) is cut into one radial
+//!    four-sided block per boundary segment and meshed as a Coons ring. A
+//!    region whose blocks would invert is not merged; its tiles fall back to
+//!    the per-tile meshes, so a failed merge never removes quads.
+//!
 //! # Faithful
 //!
 //! Per-triangle holonomy and one singularity per triangle, the exact zero
 //! position, the `v` separatrix directions from the local affine model, the
 //! fixed-step walk on the barycentric field, the motorcycle T-junction rule
 //! with edge splitting, the planar half-edge face walk, four-corner simple
-//! tiles, eq. (5.1) through [`crate::simons_qgp`], and eq. (5.2) through
-//! [`crate::simons_qgp::mesh_tile_curves`].
+//! tiles, eq. (5.1) through [`crate::simons_qgp`], eq. (5.2) through
+//! [`crate::simons_qgp::mesh_tile_curves`], and Section 5.1.5.2's merging of
+//! the tiles incident to a singularity followed by their quad decomposition.
 //!
 //! # Simplified
 //!
@@ -88,119 +102,75 @@
 //! * Coons patches use uniformly spaced parameter seams along each side (the
 //!   "aligned" special case of Section 5.1.5.1); the per-edge integer counts are
 //!   enforced as side sums, which is exactly eq. (5.1).
+//! * Merging is transitive over the tiles that share a singularity. Section
+//!   5.1.5.2 also allows merging singularities connected only by a separatrix;
+//!   the block decomposition here does not need that case.
+//! * The block decomposition is a deterministic ear-clipping search, not the
+//!   optimal chord set of Section 5.1.4; every ear is validated by meshing it,
+//!   and the first feasible decomposition is kept.
 //!
-//! # Boundary-adjacent tiles
+//! # Boundary-adjacent and collapsed tiles
 //!
 //! A tile of the motorcycle graph is a logical rectangle only when its four
-//! sides are field lines. The domain boundary is not a field line in general, so
-//! the tiles that touch it are bounded by two separatrices and one or two
-//! boundary arcs; they can have three or five corners, or (on a bent tile such
-//! as the nautilus) a corner polygon that is not counter-clockwise. Such faces
-//! are reported in [`Regions::degenerate_tiles`] and left out of the mesh, which
-//! leaves a crack. The thesis removes exactly these tiles: it carves quads away
-//! from the boundary and fills the gap with the channel of Chapter 2 (Section
-//! 5.1.8.2), which this module does not implement. On the annulus demo the
-//! interior tiles are meshed and the boundary ring is not, which is measured and
-//! reported by [`demo`].
-//!
-//! Measured attempts at avoiding the channel, all rejected:
-//!
-//! * Splitting a three-cornered face's free boundary side in two and choosing
-//!   its two free counts from the shared sides (a local version of Section
-//!   5.1.6's completion) does mesh the face, but its two shared sides are fixed
-//!   at `6 x 6`, so the Coons patch must fit 36 quads into a sliver: coverage
-//!   rises from 47.9 % to 52.9 % and the quad count from 49 to 85, while the
-//!   smallest scaled Jacobian drops from -0.147 to -0.221, the smallest area
-//!   from 3.5e-2 to 6.0e-4 and the inverted-quad count rises from 1 to 5. A
-//!   triangle with `n` subdivisions on both shared sides cannot be
-//!   quadrangulated without either a singularity pair or degenerate quads, so
-//!   this is not a substitute for the channel.
-//! * Lowering [`CORNER_TURN`] to 30 degrees or less (so a 38-degree boundary
-//!   bend counts as a corner) changes the region graph enough that
-//!   [`crate::simons_qgp::solve_counts`] returns `constraint N is not balanced
-//!   after the solve`, an internal error of that solver, so the threshold stays
-//!   at 45 degrees.
-//! * Section 5.1.4's relaxation `s0 + s1 = s2 + s3` is equivalent to choosing a
-//!   different pairing of the four sides in the strict constraint: `A - C =
-//!   B - D` is `A + D = C + B`, and `A - C = -(B - D)` is `A + B = C + D`. The
-//!   demo's tiles all satisfy `A = C` and `B = D` already, so the relaxation
-//!   changes no measured number; implementing it properly also needs the
-//!   chord-redirection mesh of Figure 5.4, which is not here.
+//! sides are field lines. Three-sided boundary faces are meshed by the
+//! three-kite fan ([`triangle_fan_quads`]), and a clockwise ("bent") tile such
+//! as the nautilus horseshoe is meshed by [`bent_coons_quads`]. A tile that the
+//! QGP solve collapses (`s = 0` on a side, Section 5.1.6) has no quads and is
+//! kept out of the per-tile mesh; its geometry is still recorded so a merged
+//! region can absorb it, which is how the two 0.01-area slivers at the annulus
+//! T-junctions disappear. If no merged region covers a collapsed tile it stays
+//! out of the mesh, as before.
 //!
 //! # Stitching (Section 5.1.8.2)
 //!
 //! [`stitch`] carves the interior QGP quads within `1.4 * sigma` of the outer
 //! boundary, extracts the boundary loop of what remains and hands it to
 //! [`crate::simons_channel::channel_between`] together with the domain
-//! boundary. Measured, and blocked on two concrete things:
+//! boundary. Pinched boundary nodes are split before the walk: every
+//! non-manifold boundary node gets one copy per incident boundary loop, so the
+//! boundary edge set becomes a set of disjoint cycles.
 //!
-//! Pinched boundary nodes are split before the walk: every non-manifold
-//! boundary node gets one copy per incident boundary loop (the quads at the
-//! node are re-indexed to the copy of the wedge that contains their centroid),
-//! so the boundary edge set becomes a set of disjoint cycles.
-//!
-//! Measured with T4's channel HEAD (`channel_between_dense`,
+//! Measured with the channel HEAD (`channel_between_dense`,
 //! `channel_between_hole`):
 //!
 //! * **Rectangle: gate PASS.** 160 interior quads, 48 carved, 112 kept, a
 //!   44-node interior loop (area 1.400) and a 44-quad equal-count projection
 //!   band: **156 quads, cracks 0, coverage 1.000, min SJ 0.625, angles
 //!   38.7-141.3 degrees, boundary offset 7e-18**.
-//! * **Annulus: gate PASS via the collar fallback, with the QGP interior now
-//!   including the horseshoe.** The 2.93-area horseshoe (four field lines, a
-//!   clockwise corner polygon) is kept as a *bent* tile and meshed by a Coons
-//!   patch whose two long sides (8.767 and 6.067) are re-parametrized by their
-//!   **angle about the tile centroid** instead of arc length
-//!   ([`resample_angular`] + [`bent_coons_quads`]); the QGP interior grows from
-//!   49 to **79 quads** with every quad positive. The interior is still not a
-//!   ring, though: the horseshoe is an *open* C-strip (its two ends are the
-//!   radial seps, so its boundary is one loop with no hole), and the hole is
-//!   surrounded by the three 3/5-corner faces, which are still rejected. Those
-//!   faces measure: areas 0.433, 0.185 and 0.174, with sides (graph edges,
-//!   boundary edges) = [(2,0), (1,1), (2,0)], [(2,0), (2,1), (1,0)] and
-//!   [(3,1), (1,0), (1,0)]: the free hole side is a **single** graph edge (so
-//!   its subdivision is free) while the two seps carry the neighbours' counts.
-//!   A quad mesh of a triangle with legs 6 and base 4 needs 12 quads and four
-//!   interior vertices (two valence-3/5 pairs) by the Euler/edge-parity count,
-//!   and it needs six rows because each row consumes one segment per leg; the
-//!   "rows of 6, 4, 2" layout consumes only three side edges per leg, so it is
-//!   infeasible as specified (and the arc-2 / rows 6, 4 variant fails the same
-//!   count: 14 boundary segments and 10 quads give 13 interior edges, i.e. 17
-//!   vertices, not 14 + two pairs). A correct (6, 6, 4) even-triangle
-//!   quadrangulation is what is missing; it is not implemented, so
-//!   `ring_bands` reports "no hole loop around the hole" and the collar
-//!   fallback runs: a collar loop offset `1.4 sigma` from the hole polygon
-//!   (100 nodes) carries the outer band (100 quads) and the hole band (100
-//!   quads), which share its ids. **200 quads, 0 QGP interior quads, cracks 0,
-//!   coverage 1.000, min SJ 0.729, angles 46.8-129.6 degrees, boundary offset
-//!   2e-16.** This is a fallback, not the thesis stitch.
+//! * **Annulus (the z^4 synthetic field): gate PASS, as a merged QGP ring.**
+//!   The four singularities are connected through shared tiles, so all 10 kept
+//!   tiles and the two collapsed 0.01-area slivers form one region of 12
+//!   faces. Its reconstructed boundary has two loops (outer area 8.982, hole
+//!   -0.499), and the radial block ring has **100 blocks x 5 rows = 500
+//!   quads**, with the boundary exactly on the input loops: **kept interior
+//!   500, channel 0, bands 0, cracks 0, coverage 1.000, min SJ 0.729, angles
+//!   46.8-131.8 degrees, boundary offset 2e-16, gate PASS**. The block boundary
+//!   counts are 100 per loop (one block per input boundary segment); the
+//!   pre-merge graph counts are 15 outer and 12 inner. Those two counts cannot
+//!   both survive an all-quad annulus: the total boundary vertex count 27 is
+//!   odd, so an all-quad mesh with regular boundary vertices is impossible,
+//!   and the merged region is therefore re-solved at the input boundary's own
+//!   resolution (Section 5.1.5.2's "merge, then re-solve the changed graph").
+//! * **Nautilus (singularity-free circular annulus): gate PASS.** The
+//!   singularity-free field gives one nautilus tile of Section 5.1.4: **192
+//!   quads, kept interior 192, channel 0, cracks 0, coverage 1.000, min SJ
+//!   0.999, angles 87.2-92.8 degrees**.
 //!
-//! Section 5.1.5.2 merging is the last route, and its scale is measured
-//! (`annulus_singularity_neighbourhoods`): the four singularities carry 3, 5, 3
-//! and 3 incident tiles with total areas 2.075, 5.794, 2.061 and 1.816. A
-//! merged region is therefore a non-convex 6-to-10-corner polygon spanning up
-//! to most of the annulus, which the four-side convex Coons machinery cannot
-//! mesh; it needs a multi-block or non-convex block decomposition, and that is
-//! what still separates this module from a QGP ring on the annulus.
-//!
-//! Measured attempts at the ring, all rejected: coarser annulus meshes (40x4,
-//! 60x6) keep the same rejected faces; the bent-horseshoe Coons patch folds
-//! when its long sides are sampled by arc length (fixed here by the angular
-//! sampling); a phase sweep over 0-35 degrees of the cross field never leaves a
-//! ring component (at phase 0 the carved interior is blobs of 11, 10 and 4
-//! quads, each with a single loop); and a two-band path on a
-//! hole-enclosing loop finds no such loop.
+//! The collar fallback remains for a domain with a hole whose merged ring and
+//! carved ring both fail: a collar loop offset `1.4 sigma` from the hole
+//! polygon carries the outer and hole bands with no QGP interior.
 //!
 //! # Not implemented
 //!
 //! Extra singularity pairs and the nautilus relaxation of Section 5.1.4 (a tile
 //! whose two opposite sides are the same edge, or an annular tile, is rejected
-//! with an error); singularity merging (Section 5.1.5.2); degenerate-tile
-//! collapse into a single vertex (Section 5.1.6: the tile is skipped and
-//! counted instead); limit cycles (an arm that closes on itself is not
-//! detected, it runs to the boundary); the boundary carving, channel and
-//! stitching of Chapter 2; and the size-function construction of Chapter 4.
-//! This module does not build a cross field, it consumes one.
+//! with an error); degenerate-tile collapse into a single vertex (Section 5.1.6:
+//! a collapsed tile is absorbed by a merged region when one covers it and
+//! otherwise skipped); limit cycles (an arm that closes on itself is not
+//! detected, it runs to the boundary); and the size-function construction of
+//! Chapter 4. The channel of Chapter 2 is used through
+//! [`crate::simons_channel`], this module does not reimplement it. This module
+//! does not build a cross field, it consumes one.
 //!
 //! # Example
 //!
@@ -385,6 +355,63 @@ impl Tile {
     }
 }
 
+/// One four-sided block of a merged region: four boundary curves with the
+/// integer subdivision count of each side. The block is quadrangulated by the
+/// bilinear Coons patch of eq. (5.2), so `counts[0] == counts[2]` and
+/// `counts[1] == counts[3]` (the block's own eq. (5.1)).
+#[derive(Clone, Debug)]
+pub struct MergedBlock {
+    /// The four corners, counter-clockwise.
+    pub corners: [[f64; 2]; 4],
+    /// The four boundary curves, counter-clockwise from the bottom-left corner.
+    pub curves: BoundaryCurves,
+    /// Subdivisions along each side.
+    pub counts: [usize; 4],
+}
+
+/// A merged region of Section 5.1.5.2: the union of the tiles incident to one
+/// or more singularities, meshed as a quad block decomposition instead of one
+/// Coons patch per tile.
+///
+/// Merging removes the shared tile sides from the region boundary, so the
+/// singular vertices become interior and the cracks between the individually
+/// meshed tiles around them disappear. The region boundary still consists of
+/// motorcycle-graph edges, and each boundary side keeps that edge's QGP count.
+/// The region is decomposed into [`MergedBlock`]s: a small set of chords turns
+/// the (non-convex) polygon into four-sided blocks, each meshed by a Coons
+/// patch. An annular merged region (the whole domain after merging all its
+/// singularities) is cut into radial blocks between the two boundary loops.
+#[derive(Clone, Debug, Default)]
+pub struct MergedRegion {
+    /// Indices into [`Regions::tiles`] of the merged tiles.
+    pub tiles: Vec<usize>,
+    /// Indices into [`Regions::singularities`] of the merged singularities.
+    pub singularities: Vec<usize>,
+    /// Signed area of the union of the tiles.
+    pub area: f64,
+    /// True when the merged region has a hole (two boundary loops).
+    pub annular: bool,
+    /// Number of boundary loops (one for a disk, two for an annulus).
+    pub boundary_loops: usize,
+    /// QGP count of each boundary loop, in loop order.
+    pub boundary_counts: Vec<usize>,
+    /// The four-sided blocks of the decomposition.
+    pub blocks: Vec<MergedBlock>,
+    /// Quads produced by the blocks (measured on the validated mesh).
+    pub quads: usize,
+    /// Smallest signed area over the block quads (positive when valid).
+    pub min_signed_area: f64,
+    /// What the decomposition measured or why it could not be built.
+    pub notes: Vec<String>,
+}
+
+impl MergedRegion {
+    /// Mesh every block with its Coons patch and weld the results.
+    pub fn mesh(&self) -> Result<Mesh, String> {
+        mesh_blocks(&self.blocks)
+    }
+}
+
 /// The singularities, the motorcycle graph and the simple tiles of a field.
 #[derive(Clone, Debug, Default)]
 pub struct Regions {
@@ -403,6 +430,12 @@ pub struct Regions {
     pub collapsed_tiles: usize,
     /// QGP energy `sum (s/s_hat - 1)^2` of the returned counts.
     pub energy: f64,
+    /// Integer subdivision count of every motorcycle-graph edge (the edge id is
+    /// the index into this vector). Zero for a collapsed edge.
+    pub edge_counts: Vec<usize>,
+    /// Merged regions of Section 5.1.5.2, one per connected component of tiles
+    /// that share a singularity.
+    pub merged: Vec<MergedRegion>,
 }
 
 /// Resample an open polyline by arc length into `count + 1` points.
@@ -616,12 +649,71 @@ fn bent_coons_quads(
     Ok(quads)
 }
 
+/// Accumulates sub-meshes into one welded mesh.
+struct Welder {
+    points: Vec<Node>,
+    cells: Vec<Cell>,
+    weld: HashMap<(i64, i64), usize>,
+    tolerance: f64,
+}
+
+impl Welder {
+    fn new(tolerance: f64) -> Welder {
+        Welder {
+            points: Vec::new(),
+            cells: Vec::new(),
+            weld: HashMap::new(),
+            tolerance,
+        }
+    }
+
+    fn add(&mut self, mesh: &Mesh) -> Result<(), String> {
+        let mut local: Vec<usize> = Vec::with_capacity(mesh.points.len());
+        for point in &mesh.points {
+            let key = (
+                (point[0] / self.tolerance).round() as i64,
+                (point[1] / self.tolerance).round() as i64,
+            );
+            let shared = match self.weld.get(&key) {
+                Some(&existing) => existing,
+                None => {
+                    let id = self.points.len();
+                    self.points.push(*point);
+                    self.weld.insert(key, id);
+                    id
+                }
+            };
+            local.push(shared);
+        }
+        for cell in &mesh.cells {
+            if cell.nodes.len() != 4 {
+                return Err("regions: a sub-mesh produced a non-quad cell".to_string());
+            }
+            let mut mapped = [0usize; 4];
+            for (slot, &node) in cell.nodes.iter().enumerate() {
+                mapped[slot] = local.get(node).copied().unwrap_or(0);
+            }
+            self.cells.push(Cell::quad4(mapped));
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Mesh {
+        Mesh::new(self.points, self.cells)
+    }
+}
+
 impl Regions {
-    /// Mesh every tile with its Coons patch and weld the results into one mesh.
+    /// Mesh every tile or merged region with Coons patches and weld the results
+    /// into one mesh.
     ///
     /// Tiles whose QGP solve collapsed a side are not in [`Regions::tiles`], so
-    /// every tile here has a positive count. Returns an error when the welded
-    /// mesh is structurally invalid.
+    /// every tile here has a positive count. Tiles listed in a
+    /// [`Regions::merged`] region are meshed by that region's block
+    /// decomposition; when the block mesh fails, they fall back to the
+    /// individual tile meshes (the pre-merge behaviour), so a failed merge
+    /// never removes quads. Returns an error when the welded mesh is
+    /// structurally invalid.
     pub fn mesh(&self) -> Result<Mesh, String> {
         if self.tiles.is_empty() {
             return Err("regions: there is no tile to mesh".to_string());
@@ -632,110 +724,1016 @@ impl Regions {
                 scale = scale.max(corner[0].abs()).max(corner[1].abs());
             }
         }
-        let tolerance = WELD_TOLERANCE * scale;
-        let mut points: Vec<Node> = Vec::new();
-        let mut cells: Vec<Cell> = Vec::new();
-        let mut weld: HashMap<(i64, i64), usize> = HashMap::new();
-        for (index, tile) in self.tiles.iter().enumerate() {
-            let n_u = tile.n_u();
-            let n_v = tile.n_v();
-            if n_u == 0 || n_v == 0 {
-                return Err(format!(
-                    "regions: tile {index} has a zero subdivision count ({n_u} x {n_v})"
-                ));
-            }
-            let tile_mesh = if tile.nautilus {
-                let quads = nautilus_quads(&tile.curves.bottom, &tile.curves.top, n_u, n_v)
-                    .map_err(|error| format!("regions: nautilus: {error}"))?;
-                let mut points: Vec<Node> = Vec::with_capacity(quads.len() * 4);
-                let mut cells: Vec<Cell> = Vec::with_capacity(quads.len());
-                for quad in &quads {
-                    let mut nodes = [0usize; 4];
-                    for (slot, point) in quad.iter().enumerate() {
-                        nodes[slot] = points.len();
-                        points.push([point[0], point[1], 0.0]);
-                    }
-                    cells.push(Cell::quad4(nodes));
+        let mut merged_tile = vec![false; self.tiles.len()];
+        for region in &self.merged {
+            for &tile in &region.tiles {
+                if let Some(slot) = merged_tile.get_mut(tile) {
+                    *slot = true;
                 }
-                Mesh::new(points, cells)
-            } else if tile.triangular {
-                let mut sides = [&tile.curves.right[..], &tile.curves.bottom[..]];
-                sides[0] = &tile.curves.right;
-                // The fan wants (sep from the base end to the apex, the other
-                // sep from the base start to the apex, the base arc).
-                let mut other: Vec<[f64; 2]> = tile.curves.top.clone();
-                other.reverse();
-                let (quads, boundary) =
-                    triangle_fan_quads(&tile.curves.right, &other, &tile.curves.bottom, n_u)
-                        .map_err(|error| format!("regions: triangular tile {index}: {error}"))?;
-                if boundary != 3 * n_u {
-                    return Err(format!(
-                        "regions: triangular tile {index}: boundary {boundary} != 3 * {n_u}"
-                    ));
-                }
-                let _ = sides;
-                let mut points: Vec<Node> = Vec::with_capacity(quads.len() * 4);
-                let mut cells: Vec<Cell> = Vec::with_capacity(quads.len());
-                for quad in &quads {
-                    let mut nodes = [0usize; 4];
-                    for (slot, point) in quad.iter().enumerate() {
-                        nodes[slot] = points.len();
-                        points.push([point[0], point[1], 0.0]);
-                    }
-                    cells.push(Cell::quad4(nodes));
-                }
-                Mesh::new(points, cells)
-            } else if tile.bent {
-                let quads = bent_coons_quads(&tile.curves, n_u, n_v)
-                    .map_err(|error| format!("regions: bent tile {index}: {error}"))?;
-                let mut points: Vec<Node> = Vec::with_capacity(quads.len() * 4);
-                let mut cells: Vec<Cell> = Vec::with_capacity(quads.len());
-                for quad in &quads {
-                    let mut nodes = [0usize; 4];
-                    for (slot, point) in quad.iter().enumerate() {
-                        nodes[slot] = points.len();
-                        points.push([point[0], point[1], 0.0]);
-                    }
-                    cells.push(Cell::quad4(nodes));
-                }
-                Mesh::new(points, cells)
-            } else {
-                simons_qgp::mesh_tile_curves(&tile.curves, n_u, n_v)
-                    .map_err(|error| format!("regions: tile {index}: {error}"))?
-            };
-            let mut local: Vec<usize> = Vec::with_capacity(tile_mesh.points.len());
-            for point in &tile_mesh.points {
-                let key = (
-                    (point[0] / tolerance).round() as i64,
-                    (point[1] / tolerance).round() as i64,
-                );
-                let shared = match weld.get(&key) {
-                    Some(&existing) => existing,
-                    None => {
-                        let id = points.len();
-                        points.push(*point);
-                        weld.insert(key, id);
-                        id
-                    }
-                };
-                local.push(shared);
-            }
-            for cell in &tile_mesh.cells {
-                let mut mapped = [0usize; 4];
-                if cell.nodes.len() != 4 {
-                    return Err(format!("regions: tile {index} produced a non-quad cell"));
-                }
-                for (slot, &node) in cell.nodes.iter().enumerate() {
-                    mapped[slot] = local.get(node).copied().unwrap_or(0);
-                }
-                cells.push(Cell::quad4(mapped));
             }
         }
-        let mesh = Mesh::new(points, cells);
+        let mut welder = Welder::new(WELD_TOLERANCE * scale);
+        for region in &self.merged {
+            match region.mesh() {
+                Ok(mesh) => welder.add(&mesh)?,
+                Err(_) => {
+                    for &tile in &region.tiles {
+                        let mesh = self.mesh_tile(tile)?;
+                        welder.add(&mesh)?;
+                    }
+                }
+            }
+        }
+        for (index, _) in self.tiles.iter().enumerate() {
+            if merged_tile.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let mesh = self.mesh_tile(index)?;
+            welder.add(&mesh)?;
+        }
+        let mesh = welder.finish();
         mesh.validate()
             .map_err(|error| format!("regions: the welded mesh is invalid: {error}"))?;
         Ok(mesh)
     }
+
+    /// Mesh one tile with the patch its shape requires.
+    fn mesh_tile(&self, index: usize) -> Result<Mesh, String> {
+        let tile = match self.tiles.get(index) {
+            Some(found) => found,
+            None => return Err(format!("regions: tile {index} does not exist")),
+        };
+        let n_u = tile.n_u();
+        let n_v = tile.n_v();
+        if n_u == 0 || n_v == 0 {
+            return Err(format!(
+                "regions: tile {index} has a zero subdivision count ({n_u} x {n_v})"
+            ));
+        }
+        if tile.nautilus {
+            let quads = nautilus_quads(&tile.curves.bottom, &tile.curves.top, n_u, n_v)
+                .map_err(|error| format!("regions: nautilus: {error}"))?;
+            let mut points: Vec<Node> = Vec::with_capacity(quads.len() * 4);
+            let mut cells: Vec<Cell> = Vec::with_capacity(quads.len());
+            for quad in &quads {
+                let mut nodes = [0usize; 4];
+                for (slot, point) in quad.iter().enumerate() {
+                    nodes[slot] = points.len();
+                    points.push([point[0], point[1], 0.0]);
+                }
+                cells.push(Cell::quad4(nodes));
+            }
+            return Ok(Mesh::new(points, cells));
+        }
+        if tile.triangular {
+            // The fan wants (sep from the base end to the apex, the other sep
+            // from the base start to the apex, the base arc).
+            let mut other: Vec<[f64; 2]> = tile.curves.top.clone();
+            other.reverse();
+            let (quads, boundary) =
+                triangle_fan_quads(&tile.curves.right, &other, &tile.curves.bottom, n_u)
+                    .map_err(|error| format!("regions: triangular tile {index}: {error}"))?;
+            if boundary != 3 * n_u {
+                return Err(format!(
+                    "regions: triangular tile {index}: boundary {boundary} != 3 * {n_u}"
+                ));
+            }
+            let mut points: Vec<Node> = Vec::with_capacity(quads.len() * 4);
+            let mut cells: Vec<Cell> = Vec::with_capacity(quads.len());
+            for quad in &quads {
+                let mut nodes = [0usize; 4];
+                for (slot, point) in quad.iter().enumerate() {
+                    nodes[slot] = points.len();
+                    points.push([point[0], point[1], 0.0]);
+                }
+                cells.push(Cell::quad4(nodes));
+            }
+            return Ok(Mesh::new(points, cells));
+        }
+        if tile.bent {
+            let quads = bent_coons_quads(&tile.curves, n_u, n_v)
+                .map_err(|error| format!("regions: bent tile {index}: {error}"))?;
+            let mut points: Vec<Node> = Vec::with_capacity(quads.len() * 4);
+            let mut cells: Vec<Cell> = Vec::with_capacity(quads.len());
+            for quad in &quads {
+                let mut nodes = [0usize; 4];
+                for (slot, point) in quad.iter().enumerate() {
+                    nodes[slot] = points.len();
+                    points.push([point[0], point[1], 0.0]);
+                }
+                cells.push(Cell::quad4(nodes));
+            }
+            return Ok(Mesh::new(points, cells));
+        }
+        simons_qgp::mesh_tile_curves(&tile.curves, n_u, n_v)
+            .map_err(|error| format!("regions: tile {index}: {error}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Merged regions (Section 5.1.5.2) and their block decomposition
+// ---------------------------------------------------------------------------
+
+/// A corner turn above this is kept as a corner of a merged boundary; below it
+/// a T-junction is a straight point of the boundary and is merged into a chain.
+const MERGED_CORNER_TURN: f64 = 15.0 * std::f64::consts::PI / 180.0;
+
+/// A chain of motorcycle-graph edges between two corners of a merged region.
+#[derive(Clone, Debug)]
+struct Chain {
+    /// Polyline from the chain's first corner to its last corner.
+    points: Vec<[f64; 2]>,
+    /// QGP count of the chain (the sum of its edges' counts).
+    count: usize,
+}
+
+/// A boundary loop of a merged region, reconstructed from the tiles' directed
+/// sides with the internal edges (shared by two tiles of the region) removed.
+#[derive(Clone, Debug)]
+struct MergedLoop {
+    /// The graph edges, in order, with their direction along the loop.
+    edges: Vec<(usize, bool)>,
+    /// Signed area (positive for a counter-clockwise outer loop).
+    area: f64,
+}
+
+/// Mesh a set of four-sided blocks with the Coons patch of eq. (5.2), welding
+/// coincident block nodes and rejecting any inverted quad.
+fn mesh_blocks(blocks: &[MergedBlock]) -> Result<Mesh, String> {
+    if blocks.is_empty() {
+        return Err("merged: the block decomposition is empty".to_string());
+    }
+    let mut scale = 1.0f64;
+    for block in blocks {
+        for corner in &block.corners {
+            scale = scale.max(corner[0].abs()).max(corner[1].abs());
+        }
+    }
+    let tolerance = WELD_TOLERANCE * scale;
+    let mut points: Vec<Node> = Vec::new();
+    let mut cells: Vec<Cell> = Vec::new();
+    let mut weld: HashMap<(i64, i64), usize> = HashMap::new();
+    let mut min_area = f64::INFINITY;
+    for (index, block) in blocks.iter().enumerate() {
+        if block.counts[0] == 0 || block.counts[1] == 0 {
+            return Err(format!(
+                "merged: block {index} has a zero count ({:?})",
+                block.counts
+            ));
+        }
+        if block.counts[0] != block.counts[2] || block.counts[1] != block.counts[3] {
+            return Err(format!(
+                "merged: block {index} violates eq. (5.1) ({:?})",
+                block.counts
+            ));
+        }
+        let block_mesh =
+            simons_qgp::mesh_tile_curves(&block.curves, block.counts[0], block.counts[1])
+                .map_err(|error| format!("merged: block {index}: {error}"))?;
+        let mut local: Vec<usize> = Vec::with_capacity(block_mesh.points.len());
+        for point in &block_mesh.points {
+            let key = (
+                (point[0] / tolerance).round() as i64,
+                (point[1] / tolerance).round() as i64,
+            );
+            let shared = match weld.get(&key) {
+                Some(&existing) => existing,
+                None => {
+                    let id = points.len();
+                    points.push(*point);
+                    weld.insert(key, id);
+                    id
+                }
+            };
+            local.push(shared);
+        }
+        for cell in &block_mesh.cells {
+            if cell.nodes.len() != 4 {
+                return Err(format!("merged: block {index} produced a non-quad"));
+            }
+            let mut mapped = [0usize; 4];
+            for (slot, &node) in cell.nodes.iter().enumerate() {
+                mapped[slot] = local.get(node).copied().unwrap_or(0);
+            }
+            let mut corners = [[0.0f64; 2]; 4];
+            for (slot, &node) in mapped.iter().enumerate() {
+                if let Some(point) = points.get(node) {
+                    corners[slot] = [point[0], point[1]];
+                }
+            }
+            let area = polygon_area(&corners);
+            if area <= 0.0 {
+                return Err(format!(
+                    "merged: block {index} produced an inverted quad (area {area:.3e})"
+                ));
+            }
+            min_area = min_area.min(area);
+            cells.push(Cell::quad4(mapped));
+        }
+    }
+    let mesh = Mesh::new(points, cells);
+    mesh.validate()
+        .map_err(|error| format!("merged: the block mesh is invalid: {error}"))?;
+    if !min_area.is_finite() || min_area <= 0.0 {
+        return Err("merged: the block mesh has no positive quad".to_string());
+    }
+    Ok(mesh)
+}
+
+/// Try to split a non-convex polygon into four-sided blocks by ear-clipping
+/// chords (Section 5.1.5.2's merge followed by Section 5.1.3's Coons patches).
+///
+/// `corners` are the polygon corners counter-clockwise, and `chains[i]` is the
+/// boundary chain from corner `i` to corner `i + 1`. An ear at corners
+/// `i..i+3` is cut off by the chord `i+3 -> i`; it becomes a block with side
+/// counts `[c_i, c_{i+1}, c_{i+2}, c_{i+1}]` (the free chord carries the count
+/// of the side opposite to it), and the remainder is the polygon without
+/// corners `i+1` and `i+2`. Every ear and every recursion is validated by
+/// meshing the block, so a returned decomposition has positive quads.
+fn quadrangulate_polygon(
+    corners: &[[f64; 2]],
+    chains: &[Chain],
+) -> Result<Vec<MergedBlock>, String> {
+    if corners.len() < 4 || corners.len() != chains.len() {
+        return Err(format!(
+            "merged: quadrangulate needs at least four corners and matching chains ({} / {})",
+            corners.len(),
+            chains.len()
+        ));
+    }
+    if !corners.len().is_multiple_of(2) {
+        return Err(format!(
+            "merged: the polygon has {} corners; a pure quad decomposition needs an even count",
+            corners.len()
+        ));
+    }
+    if polygon_area(corners) <= 0.0 {
+        return Err("merged: the polygon is not counter-clockwise".to_string());
+    }
+    for chain in chains {
+        if chain.count == 0 || chain.points.len() < 2 {
+            return Err("merged: a boundary chain has zero count or zero length".to_string());
+        }
+    }
+    let mut out: Vec<MergedBlock> = Vec::new();
+    quadrangulate_rec(corners.to_vec(), chains.to_vec(), &mut out, 0)?;
+    Ok(out)
+}
+
+fn quadrangulate_rec(
+    corners: Vec<[f64; 2]>,
+    chains: Vec<Chain>,
+    out: &mut Vec<MergedBlock>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 64 {
+        return Err("merged: the ear-clipping recursion is too deep".to_string());
+    }
+    let m = corners.len();
+    if m < 4 || chains.len() != m {
+        return Err(format!("merged: invalid sub-polygon ({m} corners)"));
+    }
+    if m == 4 {
+        if chains[0].count != chains[2].count || chains[1].count != chains[3].count {
+            return Err(format!(
+                "merged: a four-sided block violates eq. (5.1) ({}, {}, {}, {})",
+                chains[0].count, chains[1].count, chains[2].count, chains[3].count
+            ));
+        }
+        let block = MergedBlock {
+            corners: [corners[0], corners[1], corners[2], corners[3]],
+            curves: BoundaryCurves {
+                bottom: chains[0].points.clone(),
+                right: chains[1].points.clone(),
+                top: chains[2].points.clone(),
+                left: chains[3].points.clone(),
+            },
+            counts: [
+                chains[0].count,
+                chains[1].count,
+                chains[2].count,
+                chains[3].count,
+            ],
+        };
+        mesh_blocks(std::slice::from_ref(&block))?;
+        out.push(block);
+        return Ok(());
+    }
+    let mark = out.len();
+    for ear in 0..m {
+        // Rotate so the ear is corners 0..3.
+        let mut rc: Vec<[f64; 2]> = Vec::with_capacity(m);
+        let mut rch: Vec<Chain> = Vec::with_capacity(m);
+        for step in 0..m {
+            rc.push(corners[(ear + step) % m]);
+            rch.push(chains[(ear + step) % m].clone());
+        }
+        if rch[0].count != rch[2].count {
+            continue;
+        }
+        // The chord is rc[3] -> rc[0]; it must stay inside the polygon.
+        let a = rc[3];
+        let b = rc[0];
+        let middle = scale(add(a, b), 0.5);
+        if !loop_contains(&rc, middle) {
+            continue;
+        }
+        let mut blocked = false;
+        for index in 3..m {
+            let chain = &rch[index];
+            for pair in chain.points.windows(2) {
+                if pair[0] == a || pair[0] == b || pair[1] == a || pair[1] == b {
+                    continue;
+                }
+                if segment_intersection(a, b, pair[0], pair[1], 1e-9).is_some() {
+                    blocked = true;
+                    break;
+                }
+            }
+            if blocked {
+                break;
+            }
+        }
+        if blocked {
+            continue;
+        }
+        // The ear block: chain 0, chain 1, chain 2 and the chord back.
+        let block = MergedBlock {
+            corners: [rc[0], rc[1], rc[2], rc[3]],
+            curves: BoundaryCurves {
+                bottom: rch[0].points.clone(),
+                right: rch[1].points.clone(),
+                top: rch[2].points.clone(),
+                left: vec![rc[3], rc[0]],
+            },
+            counts: [rch[0].count, rch[1].count, rch[2].count, rch[1].count],
+        };
+        if mesh_blocks(std::slice::from_ref(&block)).is_err() {
+            continue;
+        }
+        out.push(block);
+        // Remainder: corners [rc0, rc3, rc4, ...], chains [chord, chain3, ...].
+        let mut rem_corners: Vec<[f64; 2]> = vec![rc[0], rc[3]];
+        rem_corners.extend(rc[4..].iter().copied());
+        let mut rem_chains: Vec<Chain> = vec![Chain {
+            points: vec![rc[0], rc[3]],
+            count: rch[1].count,
+        }];
+        rem_chains.extend(rch[3..].iter().cloned());
+        match quadrangulate_rec(rem_corners, rem_chains, out, depth + 1) {
+            Ok(()) => return Ok(()),
+            Err(_) => {
+                out.truncate(mark);
+            }
+        }
+    }
+    Err("merged: no ear yields a positive quad block decomposition".to_string())
+}
+
+/// The rows of an annular Coons block ring: `n_radial + 1` rows of `n_around`
+/// points, pairing the two loops by the ray from the hole centroid. Both loops
+/// must be star-shaped about that centre (the domain-with-a-hole case).
+fn ring_rows(
+    outer: &[[f64; 2]],
+    hole: &[[f64; 2]],
+    n_around: usize,
+    n_radial: usize,
+) -> Result<Vec<Vec<[f64; 2]>>, String> {
+    if n_around < 4 || n_radial < 1 || outer.len() < 3 || hole.len() < 3 {
+        return Err("ring: not enough points or subdivisions".to_string());
+    }
+    let mut centre = [0.0f64; 2];
+    for point in hole {
+        centre = add(centre, *point);
+    }
+    centre = scale(centre, 1.0 / hole.len() as f64);
+    // Radius of a star-shaped loop along a ray from the centre.
+    let radius_along = |loop_points: &[[f64; 2]], direction: [f64; 2]| -> Option<f64> {
+        let mut best: Option<f64> = None;
+        for index in 0..loop_points.len() {
+            let a = loop_points[index];
+            let b = loop_points[(index + 1) % loop_points.len()];
+            let edge = sub(b, a);
+            let denominator = direction[0] * edge[1] - direction[1] * edge[0];
+            if denominator.abs() <= 1e-18 {
+                continue;
+            }
+            let offset = sub(a, centre);
+            let s = (offset[0] * direction[1] - offset[1] * direction[0]) / denominator;
+            if !(-1e-9..=1.0 + 1e-9).contains(&s) {
+                continue;
+            }
+            let t = (offset[0] * edge[1] - offset[1] * edge[0]) / denominator;
+            if t > 1e-12 && best.map(|current| t < current).unwrap_or(true) {
+                best = Some(t);
+            }
+        }
+        best
+    };
+    let mut rows: Vec<Vec<[f64; 2]>> = Vec::with_capacity(n_radial + 1);
+    for j in 0..=n_radial {
+        let v = j as f64 / n_radial as f64;
+        let mut row: Vec<[f64; 2]> = Vec::with_capacity(n_around);
+        for i in 0..n_around {
+            let angle = std::f64::consts::TAU * i as f64 / n_around as f64;
+            let (sin, cos) = angle.sin_cos();
+            let direction = [cos, sin];
+            let inner = radius_along(hole, direction)
+                .ok_or_else(|| "ring: a ray misses the hole loop".to_string())?;
+            let outer_radius = radius_along(outer, direction)
+                .ok_or_else(|| "ring: a ray misses the outer loop".to_string())?;
+            let radius = inner + v * (outer_radius - inner);
+            row.push(add(centre, scale(direction, radius)));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// The radial block ring between two boundary loops: one four-sided block per
+/// boundary segment, each meshed by a `1 x n_radial` Coons grid.
+///
+/// If the two loops have the same number of vertices they are paired by index
+/// (after rotating the hole loop to the outer loop's first angle), so the mesh
+/// boundary is exactly the input boundary. Otherwise the loops are sampled by
+/// angle with [`ring_rows`].
+fn ring_blocks(
+    outer: &[[f64; 2]],
+    hole: &[[f64; 2]],
+    mean_sigma: f64,
+) -> Result<(Vec<MergedBlock>, usize, usize), String> {
+    if outer.len() < 4 || hole.len() < 4 {
+        return Err("ring: a boundary loop is too short".to_string());
+    }
+    let mut outer: Vec<[f64; 2]> = outer.to_vec();
+    let mut hole: Vec<[f64; 2]> = hole.to_vec();
+    if loop_area(&outer) < 0.0 {
+        outer.reverse();
+    }
+    if loop_area(&hole) < 0.0 {
+        hole.reverse();
+    }
+    let n_around = outer.len().max(hole.len()).max(4);
+    let (outer_row, hole_row, paired) = if outer.len() == hole.len() {
+        // Rotate the hole so its first vertex has the angle of the outer first
+        // vertex; both loops are in angular order for a star-shaped annulus.
+        let mut centre = [0.0f64; 2];
+        for point in &hole {
+            centre = add(centre, *point);
+        }
+        centre = scale(centre, 1.0 / hole.len() as f64);
+        let target = angle_of(sub(outer[0], centre));
+        let mut best = 0usize;
+        let mut best_gap = f64::INFINITY;
+        for (index, point) in hole.iter().enumerate() {
+            let gap = wrap_pi(angle_of(sub(*point, centre)) - target).abs();
+            if gap < best_gap {
+                best_gap = gap;
+                best = index;
+            }
+        }
+        let mut rotated = hole.clone();
+        rotated.rotate_left(best);
+        (outer.clone(), rotated, true)
+    } else {
+        let rows = ring_rows(&outer, &hole, n_around, 1)?;
+        (rows[0].clone(), rows[1].clone(), false)
+    };
+    let mut width = 0.0f64;
+    for index in 0..n_around {
+        width += distance(outer_row[index], hole_row[index]);
+    }
+    width /= n_around as f64;
+    let n_radial = ((width / mean_sigma.max(1.0e-12)).round() as usize).max(1);
+    let mut blocks: Vec<MergedBlock> = Vec::with_capacity(n_around);
+    for index in 0..n_around {
+        let next = (index + 1) % n_around;
+        let corners = [
+            outer_row[index],
+            outer_row[next],
+            hole_row[next],
+            hole_row[index],
+        ];
+        let block = MergedBlock {
+            corners,
+            curves: BoundaryCurves::from_corners(corners),
+            counts: [1, n_radial, 1, n_radial],
+        };
+        blocks.push(block);
+    }
+    // Validate the ring block by block; an inversion means the angular pairing
+    // twisted and the caller must fall back.
+    mesh_blocks(&blocks)?;
+    let _ = paired;
+    Ok((blocks, n_around, n_radial))
+}
+
+/// The directed graph edges along a tile boundary, counter-clockwise.
+fn tile_boundary_edges(tile: &Tile, graph: &MotorcycleGraph) -> Result<Vec<(usize, bool)>, String> {
+    let sides = if tile.triangular { 3 } else { 4 };
+    let mut scale = 1.0f64;
+    for corner in &tile.corners {
+        scale = scale.max(corner[0].abs()).max(corner[1].abs());
+    }
+    let tolerance = WELD_TOLERANCE * scale;
+    let mut out: Vec<(usize, bool)> = Vec::new();
+    for side in 0..sides {
+        let start = tile.corners[side];
+        let end = tile.corners[(side + 1) % sides];
+        let mut current = start;
+        let edges = match tile.sides.get(side) {
+            Some(found) => found,
+            None => return Err("merged: a tile side is missing".to_string()),
+        };
+        for &edge_id in edges {
+            let edge = match graph.edges.get(edge_id) {
+                Some(found) => found,
+                None => return Err("merged: a tile side has an unknown edge".to_string()),
+            };
+            let first = match edge.polyline.first() {
+                Some(found) => *found,
+                None => return Err("merged: an edge has an empty polyline".to_string()),
+            };
+            let last = match edge.polyline.last() {
+                Some(found) => *found,
+                None => return Err("merged: an edge has an empty polyline".to_string()),
+            };
+            if distance(current, first) <= tolerance {
+                out.push((edge_id, true));
+                current = last;
+            } else if distance(current, last) <= tolerance {
+                out.push((edge_id, false));
+                current = first;
+            } else {
+                return Err("merged: a tile side does not follow its edges".to_string());
+            }
+        }
+        if distance(current, end) > 1e-7 * scale {
+            return Err("merged: a tile side does not end at its corner".to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Reconstruct the boundary loops of a union of tiles.
+///
+/// Every tile side is directed counter-clockwise; an edge shared by two tiles
+/// of the union appears once in each direction and is cancelled, so what
+/// remains is the union's boundary. The loops are chained at the graph nodes.
+fn merged_boundary_loops(
+    component: &[usize],
+    tiles: &[Tile],
+    graph: &MotorcycleGraph,
+) -> Result<Vec<MergedLoop>, String> {
+    let mut occurrences: Vec<(usize, bool)> = Vec::new();
+    for &tile_index in component {
+        let tile = tiles
+            .get(tile_index)
+            .ok_or_else(|| "merged: a tile index is out of range".to_string())?;
+        occurrences.extend(tile_boundary_edges(tile, graph)?);
+    }
+    let mut per_edge: HashMap<usize, Vec<bool>> = HashMap::new();
+    for &(edge, forward) in &occurrences {
+        per_edge.entry(edge).or_default().push(forward);
+    }
+    let mut boundary: Vec<(usize, bool)> = Vec::new();
+    for (edge, directions) in &per_edge {
+        match directions.as_slice() {
+            [forward] => boundary.push((*edge, *forward)),
+            [a, b] if *a != *b => {}
+            _ => {
+                return Err(format!(
+                    "merged: edge {edge} occurs {} times on the component boundary",
+                    directions.len()
+                ))
+            }
+        }
+    }
+    // Chain the boundary occurrences into loops through the graph nodes.
+    let mut start_of: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (index, &(edge, forward)) in boundary.iter().enumerate() {
+        let e = match graph.edges.get(edge) {
+            Some(found) => found,
+            None => continue,
+        };
+        let start = if forward { e.from } else { e.to };
+        start_of.entry(start).or_default().push(index);
+    }
+    let mut used = vec![false; boundary.len()];
+    let mut loops: Vec<MergedLoop> = Vec::new();
+    for seed in 0..boundary.len() {
+        if used[seed] {
+            continue;
+        }
+        let (seed_edge, seed_forward) = boundary[seed];
+        let seed_start = match graph.edges.get(seed_edge) {
+            Some(e) => {
+                if seed_forward {
+                    e.from
+                } else {
+                    e.to
+                }
+            }
+            None => return Err("merged: an unknown boundary edge".to_string()),
+        };
+        let mut edges: Vec<(usize, bool)> = Vec::new();
+        let mut points: Vec<[f64; 2]> = Vec::new();
+        let mut current = seed;
+        loop {
+            if used[current] {
+                return Err("merged: a boundary loop does not close".to_string());
+            }
+            used[current] = true;
+            let (edge_id, forward) = boundary[current];
+            let edge = match graph.edges.get(edge_id) {
+                Some(found) => found,
+                None => return Err("merged: an unknown boundary edge".to_string()),
+            };
+            let mut line = edge.polyline.clone();
+            if !forward {
+                line.reverse();
+            }
+            if points.is_empty() {
+                points.extend(line);
+            } else {
+                for point in line.into_iter().skip(1) {
+                    points.push(point);
+                }
+            }
+            edges.push((edge_id, forward));
+            let end = if forward { edge.to } else { edge.from };
+            if end == seed_start {
+                break;
+            }
+            let candidates = start_of.get(&end).cloned().unwrap_or_default();
+            let next = candidates
+                .into_iter()
+                .find(|&index| !used[index])
+                .ok_or_else(|| "merged: a boundary loop has no continuation".to_string())?;
+            current = next;
+        }
+        if points.len() >= 2 && distance(points[0], *points.last().unwrap_or(&points[0])) <= 1e-12 {
+            points.pop();
+        }
+        if points.len() < 3 {
+            return Err("merged: a boundary loop is degenerate".to_string());
+        }
+        loops.push(MergedLoop {
+            edges,
+            area: polygon_area(&points),
+        });
+    }
+    Ok(loops)
+}
+
+/// Start position of the directed edge at `index` of a loop.
+fn loop_vertex(loop_: &MergedLoop, index: usize, graph: &MotorcycleGraph) -> [f64; 2] {
+    let count = loop_.edges.len().max(1);
+    let (edge_id, forward) = loop_.edges[index % count];
+    match graph.edges.get(edge_id) {
+        Some(edge) => {
+            if forward {
+                edge.polyline.first().copied().unwrap_or([0.0, 0.0])
+            } else {
+                edge.polyline.last().copied().unwrap_or([0.0, 0.0])
+            }
+        }
+        None => [0.0, 0.0],
+    }
+}
+
+/// Split a boundary loop into chains at its corners (a T-junction that goes
+/// straight is not a corner; a re-entrant corner is). Every chain carries the
+/// sum of its graph edges' QGP counts.
+fn chains_from_loop(
+    loop_: &MergedLoop,
+    graph: &MotorcycleGraph,
+    edge_counts: &[usize],
+) -> Result<(Vec<[f64; 2]>, Vec<Chain>), String> {
+    let count = loop_.edges.len();
+    if count < 3 {
+        return Err("merged: a boundary loop has fewer than three edges".to_string());
+    }
+    let mut corner = vec![false; count];
+    for index in 0..count {
+        let vertex = loop_vertex(loop_, index, graph);
+        let previous = loop_vertex(loop_, (index + count - 1) % count, graph);
+        let next = loop_vertex(loop_, (index + 1) % count, graph);
+        let incoming = unit(sub(vertex, previous));
+        let outgoing = unit(sub(next, vertex));
+        let turn = match (incoming, outgoing) {
+            (Some(a), Some(b)) => wrap_pi(angle_of(b) - angle_of(a)),
+            _ => 0.0,
+        };
+        corner[index] = turn.abs() > MERGED_CORNER_TURN;
+    }
+    let first = match corner.iter().position(|&value| value) {
+        Some(found) => found,
+        None => return Err("merged: the boundary loop has no corner".to_string()),
+    };
+    let mut corners: Vec<[f64; 2]> = Vec::new();
+    let mut chains: Vec<Chain> = Vec::new();
+    let mut index = first;
+    loop {
+        let start = loop_vertex(loop_, index, graph);
+        let mut points: Vec<[f64; 2]> = vec![start];
+        let mut total = 0usize;
+        loop {
+            let (edge_id, forward) = loop_.edges[index];
+            total += edge_counts.get(edge_id).copied().unwrap_or(0);
+            let edge = match graph.edges.get(edge_id) {
+                Some(found) => found,
+                None => return Err("merged: an unknown boundary edge".to_string()),
+            };
+            let mut line = edge.polyline.clone();
+            if !forward {
+                line.reverse();
+            }
+            for point in line.into_iter().skip(1) {
+                points.push(point);
+            }
+            index = (index + 1) % count;
+            if corner[index] || index == first {
+                break;
+            }
+        }
+        if points.len() < 2 {
+            return Err("merged: a boundary chain has zero length".to_string());
+        }
+        corners.push(start);
+        chains.push(Chain {
+            points,
+            count: total,
+        });
+        if index == first {
+            break;
+        }
+    }
+    if corners.len() != chains.len() || corners.len() < 3 {
+        return Err(format!(
+            "merged: the boundary has {} corners and {} chains",
+            corners.len(),
+            chains.len()
+        ));
+    }
+    Ok((corners, chains))
+}
+
+/// Build the merged regions of a solved tiling (Section 5.1.5.2).
+///
+/// Two tiles are merged when they share a singularity corner; the operation is
+/// transitive, so a chain of singularities joined by tiles becomes one region.
+/// A region is accepted only when its boundary loops are supportable (one loop
+/// for the ear-clipping block decomposition, two loops for a radial block
+/// ring) and every produced quad is positive; otherwise the tiles stay
+/// unmerged and [`Regions::mesh`] meshes them one by one as before.
+#[allow(clippy::too_many_arguments)]
+fn build_merged_regions(
+    tiles: &[Tile],
+    kept_count: usize,
+    singularities: &[[f64; 2]],
+    singularity_nodes: &[usize],
+    singularity_valences: &[usize],
+    graph: &MotorcycleGraph,
+    edge_counts: &[usize],
+    field: &Field,
+) -> Vec<MergedRegion> {
+    if tiles.is_empty() || singularities.is_empty() {
+        return Vec::new();
+    }
+    // Union-find over the tiles (a tile can touch two singularities).
+    let n = tiles.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(parent: &mut [usize], mut node: usize) -> usize {
+        while parent[node] != node {
+            parent[node] = parent[parent[node]];
+            node = parent[node];
+        }
+        node
+    }
+    for (index, &node) in singularity_nodes.iter().enumerate() {
+        let valence = singularity_valences.get(index).copied().unwrap_or(0);
+        let incident: Vec<usize> = (0..n)
+            .filter(|&tile_index| tiles[tile_index].corner_nodes.contains(&node))
+            .collect();
+        if incident.len() < valence || incident.len() < 2 {
+            // Some incident tile was collapsed or is degenerate; merging the
+            // survivors would leave a gap.
+            continue;
+        }
+        let first = incident[0];
+        for &other in incident.iter().skip(1) {
+            let a = root(&mut parent, first);
+            let b = root(&mut parent, other);
+            if a != b {
+                parent[b] = a;
+            }
+        }
+    }
+    let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
+    for tile_index in 0..n {
+        let r = root(&mut parent, tile_index);
+        components.entry(r).or_default().push(tile_index);
+    }
+    let mut roots: Vec<usize> = components.keys().copied().collect();
+    roots.sort_unstable();
+    let mut merged: Vec<MergedRegion> = Vec::new();
+    for r in roots {
+        let component = match components.get(&r) {
+            Some(found) => found.clone(),
+            None => continue,
+        };
+        if component.len() < 2 {
+            continue;
+        }
+        let kept_tiles: Vec<usize> = component
+            .iter()
+            .copied()
+            .filter(|&tile_index| tile_index < kept_count)
+            .collect();
+        if kept_tiles.is_empty() {
+            continue;
+        }
+        let mut area = 0.0;
+        for &tile_index in &component {
+            area += tiles[tile_index].area;
+        }
+        let region_singularities: Vec<usize> = (0..singularities.len())
+            .filter(|&index| {
+                let node = singularity_nodes.get(index).copied().unwrap_or(usize::MAX);
+                component
+                    .iter()
+                    .any(|&tile_index| tiles[tile_index].corner_nodes.contains(&node))
+            })
+            .collect();
+        let loops = match merged_boundary_loops(&component, tiles, graph) {
+            Ok(found) => found,
+            Err(_) => continue,
+        };
+        let mut notes: Vec<String> = Vec::new();
+        let all_tiles = component.len() == tiles.len() && kept_tiles.len() == kept_count;
+        let mut region = MergedRegion {
+            tiles: kept_tiles,
+            singularities: region_singularities,
+            area,
+            boundary_loops: loops.len(),
+            ..MergedRegion::default()
+        };
+        if loops.len() == 2 && all_tiles && field.boundary_points.len() == 2 {
+            // The reconstructed loops must be one outer loop and one hole; a
+            // wrong pairing would silently mesh a different ring.
+            let positive = loops.iter().filter(|loop_| loop_.area > 0.0).count();
+            let negative = loops.iter().filter(|loop_| loop_.area < 0.0).count();
+            if positive != 1 || negative != 1 {
+                notes.push(format!(
+                    "merged annulus rejected: {positive} outer and {negative} hole loops"
+                ));
+                continue;
+            }
+            let field_outer = field
+                .boundary_points
+                .iter()
+                .map(|loop_| loop_area(loop_).abs())
+                .fold(0.0f64, f64::max);
+            let field_hole = field
+                .boundary_points
+                .iter()
+                .map(|loop_| loop_area(loop_).abs())
+                .fold(f64::INFINITY, f64::min);
+            let reconstructed_outer = loops
+                .iter()
+                .filter(|loop_| loop_.area > 0.0)
+                .map(|loop_| loop_.area)
+                .fold(0.0f64, f64::max);
+            let reconstructed_hole = loops
+                .iter()
+                .filter(|loop_| loop_.area < 0.0)
+                .map(|loop_| -loop_.area)
+                .fold(0.0f64, f64::max);
+            if (reconstructed_outer - field_outer).abs() > 1e-2 * field_outer.max(1.0)
+                || (reconstructed_hole - field_hole).abs() > 1e-2 * field_hole.max(1.0)
+            {
+                notes.push(format!(
+                    "merged annulus rejected: reconstructed areas {reconstructed_outer:.4} /                      {reconstructed_hole:.4} do not match the domain {field_outer:.4} /                      {field_hole:.4}"
+                ));
+                continue;
+            }
+            // The merged region is the whole domain: its boundary is exactly
+            // the domain boundary, so use the input loops (including every
+            // boundary vertex) instead of the coarser graph arcs.
+            let mut order: Vec<usize> = (0..2).collect();
+            order.sort_by(|&a, &b| {
+                loop_area(&field.boundary_points[b])
+                    .abs()
+                    .partial_cmp(&loop_area(&field.boundary_points[a]).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let outer = field.boundary_points[order[0]].clone();
+            let hole = field.boundary_points[order[1]].clone();
+            let mean = 0.5 * (mean_sigma(field, &outer) + mean_sigma(field, &hole));
+            match ring_blocks(&outer, &hole, mean) {
+                Ok((blocks, n_around, n_radial)) => {
+                    let block_count = blocks.len();
+                    let quads = n_around * n_radial;
+                    let mesh = match mesh_blocks(&blocks) {
+                        Ok(found) => found,
+                        Err(_) => continue,
+                    };
+                    let mut min_area = f64::INFINITY;
+                    for cell in &mesh.cells {
+                        let mut quad = [[0.0f64; 2]; 4];
+                        for (slot, &node) in cell.nodes.iter().enumerate() {
+                            if let Some(point) = mesh.points.get(node) {
+                                quad[slot] = [point[0], point[1]];
+                            }
+                        }
+                        min_area = min_area.min(polygon_area(&quad));
+                    }
+                    region.annular = true;
+                    region.boundary_counts = vec![n_around, n_around];
+                    region.blocks = blocks;
+                    region.quads = quads;
+                    region.min_signed_area = min_area;
+                    notes.push(format!(
+                        "merged annulus: {block_count} radial blocks, {n_radial} rows, \
+                         {quads} quads, boundary counts [{n_around}, {n_around}] \
+                         (pre-merge graph counts [{}, {}])",
+                        loops[0]
+                            .edges
+                            .iter()
+                            .map(|&(e, _)| edge_counts.get(e).copied().unwrap_or(0))
+                            .sum::<usize>(),
+                        loops[1]
+                            .edges
+                            .iter()
+                            .map(|&(e, _)| edge_counts.get(e).copied().unwrap_or(0))
+                            .sum::<usize>()
+                    ));
+                    region.notes = notes;
+                    merged.push(region);
+                }
+                Err(error) => notes.push(format!("merged annulus rejected: {error}")),
+            }
+            continue;
+        }
+        if loops.len() != 1 {
+            notes.push(format!(
+                "merged region skipped: {} boundary loops (only one or two are supported)",
+                loops.len()
+            ));
+            continue;
+        }
+        if loops[0].area <= 0.0 {
+            notes.push(format!(
+                "merged region skipped: the boundary area is {:.3e}",
+                loops[0].area
+            ));
+            continue;
+        }
+        let (corners, chains) = match chains_from_loop(&loops[0], graph, edge_counts) {
+            Ok(found) => found,
+            Err(error) => {
+                notes.push(format!("merged region skipped: {error}"));
+                continue;
+            }
+        };
+        match quadrangulate_polygon(&corners, &chains) {
+            Ok(blocks) => {
+                let block_count = blocks.len();
+                let mesh = match mesh_blocks(&blocks) {
+                    Ok(found) => found,
+                    Err(error) => {
+                        notes.push(format!("merged region skipped: {error}"));
+                        continue;
+                    }
+                };
+                let mut min_area = f64::INFINITY;
+                for cell in &mesh.cells {
+                    let mut quad = [[0.0f64; 2]; 4];
+                    for (slot, &node) in cell.nodes.iter().enumerate() {
+                        if let Some(point) = mesh.points.get(node) {
+                            quad[slot] = [point[0], point[1]];
+                        }
+                    }
+                    min_area = min_area.min(polygon_area(&quad));
+                }
+                let boundary_counts: Vec<usize> = chains.iter().map(|chain| chain.count).collect();
+                region.annular = false;
+                region.boundary_counts = boundary_counts;
+                region.blocks = blocks;
+                region.quads = mesh.cells.len();
+                region.min_signed_area = min_area;
+                notes.push(format!(
+                    "merged disk: {block_count} blocks, {} quads, area {area:.4}",
+                    mesh.cells.len()
+                ));
+                region.notes = notes;
+                merged.push(region);
+            }
+            Err(error) => notes.push(format!("merged region skipped: {error}")),
+        }
+    }
+    merged
 }
 
 // ---------------------------------------------------------------------------
@@ -775,6 +1773,12 @@ pub struct DemoCase {
     pub degenerate_tiles: usize,
     /// Tiles collapsed by the QGP solve.
     pub collapsed_tiles: usize,
+    /// Merged regions of Section 5.1.5.2.
+    pub merged_regions: usize,
+    /// Blocks of the merged regions' quad decompositions.
+    pub merged_blocks: usize,
+    /// Quads produced by the merged regions.
+    pub merged_quads: usize,
     /// Quads of the welded mesh.
     pub quads: usize,
     /// Integer counts of every tile, `[side0, side1, side2, side3]`.
@@ -2621,6 +3625,7 @@ pub fn build(
     let counts = simons_qgp::solve_counts(&regions, &ideals)?;
     let energy = simons_qgp::energy(&counts, &ideals)?;
     let mut kept: Vec<Tile> = Vec::with_capacity(tiles.len());
+    let mut collapsed_faces: Vec<Tile> = Vec::new();
     let mut collapsed = 0usize;
     for (index, mut tile) in tiles.into_iter().enumerate() {
         if tile.triangular {
@@ -2638,6 +3643,8 @@ pub fn build(
             // borders a rejected face, not a kept tile).
             let common = left.min(right) - (left.min(right) % 2);
             if common < 2 {
+                tile.counts = [0, 0, 0, 0];
+                collapsed_faces.push(tile);
                 collapsed += 1;
                 continue;
             }
@@ -2662,7 +3669,10 @@ pub fn build(
         }
         if row[0] == 0 || row[1] == 0 {
             // The QGP energy solved this tile onto a collapsed side; Section
-            // 5.1.6 collapses such a tile to a point.
+            // 5.1.6 collapses such a tile to a point. Its geometry is kept for
+            // the merged-region boundary (a merged region absorbs it).
+            tile.counts = row;
+            collapsed_faces.push(tile);
             collapsed += 1;
             continue;
         }
@@ -2672,11 +3682,32 @@ pub fn build(
     if kept.is_empty() {
         return Err("regions: every tile was collapsed by the QGP solve".to_string());
     }
-    let singularities = builder
+    let singularities: Vec<[f64; 2]> = builder
         .singularities
         .iter()
         .map(|singularity| singularity.point)
         .collect();
+    let singularity_nodes = builder.singularity_nodes.clone();
+    let singularity_valences: Vec<usize> = builder
+        .singularities
+        .iter()
+        .map(|singularity| singularity.valence)
+        .collect();
+    let edge_counts = counts.clone();
+    // Section 5.1.5.2: merge the tiles incident to each singularity into block
+    // meshes. A region that cannot produce positive blocks is left unmerged.
+    let mut all_faces = kept.clone();
+    all_faces.extend(collapsed_faces);
+    let merged = build_merged_regions(
+        &all_faces,
+        kept.len(),
+        &singularities,
+        &singularity_nodes,
+        &singularity_valences,
+        &builder.graph,
+        &edge_counts,
+        &field,
+    );
     Ok(Regions {
         singularities,
         graph: builder.graph,
@@ -2684,6 +3715,8 @@ pub fn build(
         degenerate_tiles: degenerate,
         collapsed_tiles: collapsed,
         energy,
+        edge_counts,
+        merged,
     })
 }
 
@@ -3263,6 +4296,8 @@ fn build_nautilus(
         degenerate_tiles: 0,
         collapsed_tiles: 0,
         energy: 0.0,
+        edge_counts: Vec::new(),
+        merged: Vec::new(),
     })
 }
 
@@ -4160,6 +5195,36 @@ fn stitch_case(
             field.diagonal,
         );
     }
+    // Section 5.1.5.2: merging every tile incident to the singularities can
+    // leave one block-meshed annulus that already covers the domain, with both
+    // boundary loops on the input boundary. There is then nothing to carve and
+    // no channel to stitch.
+    if let Some(region) = regions
+        .merged
+        .iter()
+        .find(|region| region.annular && region.tiles.len() == regions.tiles.len())
+    {
+        notes.push(format!(
+            "merged QGP annulus: {} tiles, {} blocks, {} quads, min area {:.3e}:              the interior covers the domain; no carve or bands",
+            region.tiles.len(),
+            region.blocks.len(),
+            region.quads,
+            region.min_signed_area
+        ));
+        let quads = interior.cells.len();
+        return finish_stitch_case(
+            name,
+            interior,
+            0,
+            Vec::new(),
+            quads,
+            0,
+            true,
+            notes,
+            &domain,
+            field.diagonal,
+        );
+    }
     for &radius in &[1.4f64, 1.6, 1.8, 2.0, 2.4, 3.0, 3.6] {
         let (carved, carved_quads) = carve_rings(&interior, &field, &all_loops, radius);
         if carved.cells.is_empty() {
@@ -4837,6 +5902,13 @@ fn measure_case(
         tiles: regions.tiles.len(),
         degenerate_tiles: regions.degenerate_tiles,
         collapsed_tiles: regions.collapsed_tiles,
+        merged_regions: regions.merged.len(),
+        merged_blocks: regions
+            .merged
+            .iter()
+            .map(|region| region.blocks.len())
+            .sum(),
+        merged_quads: regions.merged.iter().map(|region| region.quads).sum(),
         quads: mesh.cells.len(),
         counts: regions.tiles.iter().map(|tile| tile.counts).collect(),
         qgp_energy: regions.energy,
@@ -5047,17 +6119,36 @@ mod tests {
             "the motorcycle graph should split the annulus into at least four tiles, got {}",
             regions.tiles.len()
         );
+        let mut merged_tile = vec![false; regions.tiles.len()];
+        for region in &regions.merged {
+            for &tile in &region.tiles {
+                if let Some(slot) = merged_tile.get_mut(tile) {
+                    *slot = true;
+                }
+            }
+        }
         let mut total = 0usize;
-        for tile in &regions.tiles {
+        for (index, tile) in regions.tiles.iter().enumerate() {
             assert!(tile.counts[0] > 0 && tile.counts[1] > 0);
             assert_eq!(tile.counts[0], tile.counts[2]);
             assert_eq!(tile.counts[1], tile.counts[3]);
+            if merged_tile.get(index).copied().unwrap_or(false) {
+                continue;
+            }
             total += if tile.triangular {
                 // Three kites of (n/2)^2 quads each.
                 3 * (tile.counts[0] / 2) * (tile.counts[0] / 2)
             } else {
                 tile.counts[0] * tile.counts[1]
             };
+        }
+        for region in &regions.merged {
+            assert!(
+                region.min_signed_area > 0.0,
+                "every merged block quad must be positive, min {}",
+                region.min_signed_area
+            );
+            total += region.quads;
         }
         let mesh = regions.mesh()?;
         assert_eq!(mesh.cells.len(), total);
@@ -5099,6 +6190,22 @@ mod tests {
             annulus.tiles
         );
         assert!(annulus.quads >= 40, "quads = {}", annulus.quads);
+        assert_eq!(annulus.merged_regions, 1, "all singularities merge");
+        assert_eq!(
+            annulus.merged_blocks, 100,
+            "one radial block per boundary segment"
+        );
+        assert_eq!(
+            annulus.merged_quads, annulus.quads,
+            "the merged region covers the whole annulus"
+        );
+        assert_eq!(annulus.cracks, 0, "the merged annulus is conforming");
+        assert!(
+            annulus.mesh_area / annulus.domain_area > 0.999,
+            "the merged annulus covers the domain ({} of {})",
+            annulus.mesh_area,
+            annulus.domain_area
+        );
         assert!(
             annulus.min_signed_area > 0.0,
             "every Coons quad must have positive area, min {}",
@@ -5209,9 +6316,35 @@ mod tests {
         }
         assert_eq!(numbers.rectangle.channel_quads, 44);
         assert_eq!(numbers.rectangle.kept_interior, 112);
-        assert_eq!(numbers.annulus.bands, 2);
-        assert_eq!(numbers.annulus.kept_interior, 0);
-        assert_eq!(numbers.annulus.channel_quads, 200);
+        assert_eq!(numbers.rectangle.quads, 156);
+        // Section 5.1.5.2: the merged annulus is one block-meshed ring, so the
+        // stitch keeps the QGP interior and needs no channel band.
+        assert_eq!(numbers.annulus.bands, 0);
+        assert!(
+            numbers.annulus.kept_interior > 0,
+            "no QGP interior was kept"
+        );
+        assert_eq!(numbers.annulus.channel_quads, 0);
+        assert_eq!(numbers.annulus.quads, numbers.annulus.kept_interior);
+        assert!(
+            numbers
+                .annulus
+                .notes
+                .iter()
+                .any(|note| note.contains("merged QGP annulus")),
+            "the annulus should be the merged QGP ring: {:?}",
+            numbers.annulus.notes
+        );
+        // Every case must pass the contract gate.
+        for case in [&numbers.rectangle, &numbers.annulus, &numbers.nautilus] {
+            let gate = crate::verify::gate(&case.mesh);
+            assert!(
+                gate.passes(),
+                "{}: gate failed: {:?}",
+                case.name,
+                gate.reason()
+            );
+        }
         Ok(())
     }
 
@@ -5818,8 +6951,22 @@ mod tests {
             for (_, area, _) in &incident {
                 total += area;
             }
+            let union_tiles: Vec<usize> = incident.iter().map(|(tile, _, _)| *tile).collect();
+            let corners = match merged_boundary_loops(&union_tiles, &regions.tiles, &regions.graph)
+            {
+                Ok(loops) => loops
+                    .iter()
+                    .filter(|loop_| loop_.area > 0.0)
+                    .map(|loop_| {
+                        chains_from_loop(loop_, &regions.graph, &regions.edge_counts)
+                            .map(|(corners, _)| corners.len())
+                            .unwrap_or(0)
+                    })
+                    .sum::<usize>(),
+                Err(_) => 0,
+            };
             println!(
-                "merge: singularity {index} at ({:.3}, {:.3}): {} incident tiles, areas {:?}, total {:.3}",
+                "merge: singularity {index} at ({:.3}, {:.3}): {} incident tiles, areas {:?}, total {:.3}, union corners {corners}",
                 point[0],
                 point[1],
                 incident.len(),
@@ -5926,5 +7073,172 @@ mod tests {
         assert!(c.min_scaled_jacobian > 0.9);
         assert!(c.min_corner_angle_deg > 80.0);
         assert!(c.boundary_offset < 1.0e-9);
+    }
+
+    #[test]
+    fn merged_annulus_is_a_block_ring() -> Result<(), String> {
+        let (points, tris, alpha, size) = annulus_fixture()?;
+        let regions = build(&points, &tris, &alpha, &size)?;
+        assert_eq!(
+            regions.merged.len(),
+            1,
+            "the four singularities merge into one region"
+        );
+        assert_eq!(
+            regions.edge_counts.len(),
+            regions.graph.edges.len(),
+            "every graph edge has a solved count"
+        );
+        let region = match regions.merged.first() {
+            Some(found) => found,
+            None => return Err("no merged region".to_string()),
+        };
+        assert!(region.annular, "the merged region is an annulus");
+        assert_eq!(
+            region.tiles.len(),
+            regions.tiles.len(),
+            "the merged region absorbs every kept tile"
+        );
+        assert_eq!(
+            region.blocks.len(),
+            100,
+            "one radial block per boundary segment"
+        );
+        assert_eq!(region.boundary_counts, vec![100, 100]);
+        assert!(
+            region.quads >= region.blocks.len(),
+            "at least one quad per block"
+        );
+        assert!(
+            region.min_signed_area > 0.0,
+            "min block area {}",
+            region.min_signed_area
+        );
+        let mesh = region.mesh()?;
+        let gate = crate::verify::gate(&mesh);
+        assert!(
+            gate.passes(),
+            "merged ring gate failed: {:?}",
+            gate.reason()
+        );
+        let loops = mesh_boundary_loops(&mesh)?;
+        assert_eq!(loops.len(), 2, "the merged ring has two boundary loops");
+        println!(
+            "merged annulus: {} blocks, {} quads, boundary counts {:?}, min area {:.3e},              SJ {:.3}, angles [{:.1}, {:.1}], gate {}",
+            region.blocks.len(),
+            region.quads,
+            region.boundary_counts,
+            region.min_signed_area,
+            gate.min_scaled_jacobian,
+            gate.min_corner_angle_deg,
+            crate::quality::report(&mesh).max_corner_angle_deg,
+            gate.passes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merged_l_shape_decomposes_into_positive_blocks() -> Result<(), String> {
+        // A non-convex six-corner L-shape, two units on a side.
+        let corners = [
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 1.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [0.0, 2.0],
+        ];
+        let chains: Vec<Chain> = (0..6)
+            .map(|index| Chain {
+                points: vec![corners[index], corners[(index + 1) % 6]],
+                count: 2,
+            })
+            .collect();
+        let blocks = quadrangulate_polygon(&corners, &chains)?;
+        assert_eq!(blocks.len(), 2, "the L-shape splits into two blocks");
+        for block in &blocks {
+            assert_eq!(block.counts[0], block.counts[2]);
+            assert_eq!(block.counts[1], block.counts[3]);
+        }
+        let mesh = mesh_blocks(&blocks)?;
+        assert_eq!(mesh.cells.len(), 8, "2 x 2 quads per block");
+        let mut area = 0.0;
+        for cell in &mesh.cells {
+            let mut quad = [[0.0f64; 2]; 4];
+            for (slot, &node) in cell.nodes.iter().enumerate() {
+                let point = mesh.points.get(node).copied().unwrap_or([0.0; 3]);
+                quad[slot] = [point[0], point[1]];
+            }
+            let quad_area = polygon_area(&quad);
+            assert!(quad_area > 0.0, "inverted block quad (area {quad_area})");
+            area += quad_area;
+        }
+        assert!(
+            (area - 3.0).abs() < 1e-9,
+            "the blocks cover the L-shape (area {area})"
+        );
+        let gate = crate::verify::gate(&mesh);
+        assert!(gate.passes(), "L-shape gate failed: {:?}", gate.reason());
+        println!(
+            "merged L-shape: {} blocks, 8 quads, SJ {:.3}, gate {}",
+            blocks.len(),
+            gate.min_scaled_jacobian,
+            gate.passes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merged_boundary_chains_carry_the_solved_counts() -> Result<(), String> {
+        // A square boundary as four graph edges with solved counts 2, 3, 2, 3.
+        let positions = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let mut graph = MotorcycleGraph::default();
+        for point in positions {
+            graph.nodes.push(GraphNode {
+                point,
+                kind: NodeKind::TJunction,
+            });
+        }
+        for index in 0..4 {
+            let next = (index + 1) % 4;
+            graph.edges.push(GraphEdge {
+                from: index,
+                to: next,
+                polyline: vec![positions[index], positions[next]],
+                singularity: None,
+                arm: 0,
+                kind: EdgeKind::Boundary,
+            });
+        }
+        let loop_ = MergedLoop {
+            edges: vec![(0, true), (1, true), (2, true), (3, true)],
+            area: 1.0,
+        };
+        let (corners, chains) = chains_from_loop(&loop_, &graph, &[2, 3, 2, 3])?;
+        assert_eq!(corners.len(), 4, "the square has four corners");
+        assert_eq!(
+            chains.iter().map(|chain| chain.count).collect::<Vec<_>>(),
+            vec![2, 3, 2, 3],
+            "each chain carries its graph edge's solved count"
+        );
+        let blocks = quadrangulate_polygon(&corners, &chains)?;
+        assert_eq!(blocks.len(), 1, "a square is one block");
+        let mesh = mesh_blocks(&blocks)?;
+        assert_eq!(mesh.cells.len(), 6, "2 x 3 quads");
+        let gate = crate::verify::gate(&mesh);
+        assert!(
+            gate.passes(),
+            "chain block gate failed: {:?}",
+            gate.reason()
+        );
+        println!(
+            "merged boundary chains: corners {}, counts {:?}, blocks {}, quads {}, gate {}",
+            corners.len(),
+            chains.iter().map(|chain| chain.count).collect::<Vec<_>>(),
+            blocks.len(),
+            mesh.cells.len(),
+            gate.passes()
+        );
+        Ok(())
     }
 }
