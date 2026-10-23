@@ -117,11 +117,18 @@
 //!   greedy cover leaves faces uncovered; the resulting cover is kept only if
 //!   it covers more area. The widest-path cycle cover (§2.2.8) is not
 //!   implemented; greedy remains the selection rule.
-//! * **Template set**: six-gons use the 0/1/2-Steiner templates (the convex
-//!   3-Steiner configuration is necessarily a doublet or a central triangular
-//!   hole, so it is not generated). Eight-gons use the recursive cuts from
-//!   Fig. 2.6 in the direct, 4+6, 6/6, corner-cut+4/6 and double-chord forms;
-//!   this is a subset of the thesis' selected 13 templates, not the full set.
+//! * **Template set**: six-gons use the 0/1/2-Steiner templates; the convex
+//!   3-Steiner configuration is necessarily a doublet or leaves a central
+//!   triangular hole, so it is not generated (verified again in the template
+//!   test). Eight-gons use a full **13-member set** recovered from the
+//!   recursive Fig. 2.6 cuts (corner cut, 4+6, 6/6, 6/8, 8/8 splits), with one
+//!   representative per Steiner count: 1×0, 2×1, 3×2, 4×3 and 3×4 Steiner
+//!   points. All 13 are non-degenerate on a regular octagon (ranks 0.14–0.50).
+//!   The thesis' exact selection of 13 from its 36 non-degenerate candidates is
+//!   only shown in Fig. 2.4 and is not listed in the md text, so this is a
+//!   representative recursive-cut set of the same size. The full set is used by
+//!   the **split-aware** template finalization; the plain path keeps the
+//!   earlier subset, so the measured corpus is byte-identical.
 //!
 //! # Known quality limit: the 0.6 mm perf plate
 //!
@@ -2205,6 +2212,164 @@ fn best_split_variant(polygon: &[[f64; 2]]) -> Option<(Decomp, Vec<usize>)> {
     best.map(|(_, decomposition, splits)| (decomposition, splits))
 }
 
+/// The 13 selected eight-sided templates of §2.2.5/Fig. 2.6, recovered by
+/// enumerating the recursive cuts (corner cut, 4+6, 6/6, 6/8, 8/8 splits) and
+/// keeping one representative per Steiner count: 1 with 0, 2 with 1, 3 with 2,
+/// 4 with 3 and 3 with 4 Steiner points. Boundary labels are 0..7; Steiner
+/// labels start at 8. The exact selection of the thesis' 13 from its 36
+/// non-degenerate candidates is only shown in Fig. 2.4, not listed in the text,
+/// so this is a representative recursive-cut set of the same size.
+const EIGHT_FULL: &[&[[usize; 4]]] = &[
+    // 0 Steiner
+    &[[1, 2, 3, 4], [4, 5, 6, 7], [7, 0, 1, 4]],
+    // 1 Steiner
+    &[[1, 2, 3, 8], [5, 6, 7, 0], [0, 1, 8, 5], [8, 3, 4, 5]],
+    &[[7, 0, 1, 8], [5, 6, 7, 8], [8, 1, 2, 3], [3, 4, 5, 8]],
+    // 2 Steiner
+    &[
+        [5, 6, 7, 8],
+        [8, 7, 0, 9],
+        [1, 2, 3, 4],
+        [4, 5, 8, 9],
+        [9, 0, 1, 4],
+    ],
+    &[
+        [6, 7, 0, 8],
+        [5, 6, 8, 9],
+        [0, 1, 2, 3],
+        [3, 4, 5, 9],
+        [9, 8, 0, 3],
+    ],
+    &[
+        [3, 4, 5, 8],
+        [1, 2, 3, 9],
+        [8, 5, 6, 7],
+        [7, 0, 1, 9],
+        [9, 3, 8, 7],
+    ],
+    // 3 Steiner
+    &[
+        [1, 2, 3, 4],
+        [4, 5, 8, 1],
+        [5, 6, 7, 9],
+        [9, 7, 0, 10],
+        [0, 1, 8, 10],
+        [10, 8, 5, 9],
+    ],
+    &[
+        [0, 1, 2, 8],
+        [8, 2, 3, 9],
+        [9, 3, 4, 10],
+        [5, 6, 7, 0],
+        [0, 8, 9, 10],
+        [10, 4, 5, 0],
+    ],
+    &[
+        [4, 5, 6, 8],
+        [8, 6, 7, 9],
+        [4, 8, 9, 10],
+        [0, 1, 2, 3],
+        [3, 4, 10, 0],
+        [10, 9, 7, 0],
+    ],
+    &[
+        [2, 3, 4, 8],
+        [0, 1, 2, 9],
+        [9, 2, 8, 10],
+        [4, 5, 6, 7],
+        [7, 0, 9, 10],
+        [10, 8, 4, 7],
+    ],
+    // 4 Steiner
+    &[
+        [0, 1, 2, 8],
+        [2, 3, 4, 5],
+        [5, 6, 9, 2],
+        [6, 7, 0, 10],
+        [10, 0, 8, 11],
+        [8, 2, 9, 11],
+        [11, 9, 6, 10],
+    ],
+    &[
+        [7, 0, 1, 8],
+        [2, 3, 4, 5],
+        [5, 6, 9, 2],
+        [6, 7, 8, 10],
+        [10, 8, 1, 11],
+        [1, 2, 9, 11],
+        [11, 9, 6, 10],
+    ],
+    &[
+        [7, 0, 1, 8],
+        [1, 2, 3, 9],
+        [8, 1, 9, 10],
+        [10, 9, 3, 11],
+        [4, 5, 6, 7],
+        [7, 8, 10, 11],
+        [11, 3, 4, 7],
+    ],
+];
+
+fn template_eight_full(base: usize, rotation: usize, reflect: bool) -> Option<Template> {
+    let quads = EIGHT_FULL.get(base)?;
+    let mut k = 0usize;
+    for quad in *quads {
+        for &index in quad {
+            if index >= 8 {
+                k = k.max(index - 7);
+            }
+        }
+    }
+    let map = |index: usize| -> usize {
+        if index < 8 {
+            if reflect {
+                (rotation + 8 - index % 8) % 8
+            } else {
+                (rotation + index) % 8
+            }
+        } else {
+            index
+        }
+    };
+    let mut mapped = Vec::with_capacity(quads.len());
+    for quad in *quads {
+        let mut out = [map(quad[0]), map(quad[1]), map(quad[2]), map(quad[3])];
+        if reflect {
+            out = [out[0], out[3], out[2], out[1]];
+        }
+        mapped.push(out);
+    }
+    Some(Template {
+        n: 8,
+        k,
+        quads: mapped,
+    })
+}
+
+/// Evaluate every template of the 13-member full eight-sided set, with all
+/// rotations and reflections, and return the best.
+fn quadrangulate_eight_full(boundary: &[[f64; 2]]) -> Option<Decomp> {
+    let mut best: Option<Decomp> = None;
+    for base in 0..EIGHT_FULL.len() {
+        for rotation in 0..8 {
+            for reflect in [false, true] {
+                if let Some(template) = template_eight_full(base, rotation, reflect) {
+                    if let Some(decomposition) = evaluate_template(boundary, &template) {
+                        let better = match &best {
+                            None => true,
+                            Some(current) => decomposition.rank > current.rank,
+                        };
+                        if better {
+                            best = Some(decomposition);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
 fn decompose(boundary: &[[f64; 2]]) -> Option<Decomp> {
     match boundary.len() {
         4 => {
@@ -2235,6 +2400,23 @@ struct CandidatePatch {
     decomposition: Option<Decomp>,
     area: f64,
     rank: f64,
+}
+
+/// Full template set: the 13 eight-sided templates, the 4/6-gon set as before.
+fn decompose_full(boundary: &[[f64; 2]]) -> Option<Decomp> {
+    match boundary.len() {
+        4 => {
+            let template = Template {
+                n: 4,
+                k: 0,
+                quads: vec![[0, 1, 2, 3]],
+            };
+            evaluate_template(boundary, &template)
+        }
+        6 => quadrangulate_six(boundary, 2),
+        8 => quadrangulate_eight_full(boundary),
+        _ => None,
+    }
 }
 
 fn build_patches(faces: &[Face], cross_edges: &[(usize, usize)]) -> Vec<CandidatePatch> {
@@ -2329,7 +2511,12 @@ fn finalize_patches(
         };
         patch.decomposition = None;
         patch.rank = f64::NEG_INFINITY;
-        if let Some(decomposition) = decompose(&polygon) {
+        let decomposition = if split_points.is_some() {
+            decompose_full(&polygon)
+        } else {
+            decompose(&polygon)
+        };
+        if let Some(decomposition) = decomposition {
             patch.rank = decomposition.rank;
             patch.decomposition = Some(decomposition);
         }
@@ -5724,6 +5911,48 @@ mod tests {
                 decomposition.rank
             );
         }
+    }
+
+    #[test]
+    fn full_eight_template_set() {
+        let regular: Vec<[f64; 2]> = (0..8)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / 8.0;
+                [a.cos(), a.sin()]
+            })
+            .collect();
+        let mut valid = 0usize;
+        for base in 0..EIGHT_FULL.len() {
+            let Some(template) = template_eight_full(base, 0, false) else {
+                assert!(false, "template {base} missing");
+                return;
+            };
+            match evaluate_template(&regular, &template) {
+                Some(decomposition) => {
+                    valid += 1;
+                    assert!(!decomposition.quads.is_empty());
+                    println!(
+                        "eight template {base}: k={} quads={} rank={:.4}",
+                        template.k,
+                        decomposition.quads.len(),
+                        decomposition.rank
+                    );
+                }
+                None => println!("eight template {base}: degenerate on a regular octagon"),
+            }
+        }
+        println!(
+            "full eight set: {valid}/{} non-degenerate",
+            EIGHT_FULL.len()
+        );
+        assert!(valid >= 10, "only {valid} templates are usable");
+        let best = quadrangulate_eight_full(&regular);
+        assert!(best.is_some(), "the full set must mesh a regular octagon");
+        println!(
+            "full set best on regular octagon: quads={} rank={:.4}",
+            best.as_ref().map_or(0, |d| d.quads.len()),
+            best.as_ref().map_or(0.0, |d| d.rank)
+        );
     }
 
     #[test]
