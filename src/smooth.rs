@@ -128,7 +128,8 @@ pub struct SmoothOptions {
     /// all-quad meshes only; a mesh with triangles skips it).
     pub shape_pass: bool,
 
-    /// Weight of the **target-area** term (default 0.0, opt-in). The term is
+    /// Weight of the **target-area** term (default 0.0, opt-in; the target is
+    /// each node's local size from the input mesh, see [`smooth`]). The term is
     /// `1 / (1 + w * |ln(sqrt(area) / target)|)`, with `target` the mean of the
     /// quad's four node targets, so a graded size field is honoured and a quad
     /// twice too large scores like one twice too small. `0` disables the term
@@ -138,7 +139,13 @@ pub struct SmoothOptions {
     /// corpus loses passes (crossfield 4→3, untangle 3→1) because the route's
     /// nominal size is not the local one, so the term is **opt-in**: it is meant
     /// for a real graded size field (the pipeline), where it improves the size
-    /// accuracy. A moderate weight (0.3–0.5) is the cautious choice.
+    /// accuracy. A moderate weight (0.2–0.3) is the cautious choice; the local
+    /// target is better than the nominal one. Measured at 0.2 on the uniform
+    /// corpus: passes are kept (the `better`/gate acceptance forbids a lost
+    /// pass) but the gate margin drops on some routes (qmorph SJ 0.679→0.488,
+    /// angle 48.9→35.8; decompose angle 41.7→32.2) while the aspect tail
+    /// improves (paving 14.9→10.7, bipartite 7.8→2.3) — it is a trade, not a
+    /// free win.
     pub size_weight: f64,
 }
 
@@ -198,8 +205,46 @@ pub struct SmoothOutcome {
 /// The input is not modified: the mesh is cloned first. No candidate position
 /// outside the domain is ever accepted, and the function never panics.
 pub fn smooth(domain: &Domain, mesh: &Mesh, size: f64, options: &SmoothOptions) -> SmoothOutcome {
-    let targets = vec![size; mesh.points.len()];
+    // A local target: each node's target is the mean `sqrt(area)` of its
+    // incident quads in the input mesh, so the area term regularises the local
+    // size (it does not fight the route's global scale, which a single nominal
+    // value did — measured: weight 1.0 with the nominal size lost corpus
+    // passes). Nodes without a quad fall back to the requested size.
+    let targets = local_targets(mesh, size);
     smooth_with_targets(domain, mesh, &targets, options)
+}
+
+/// Per-node local target size: the mean `sqrt(area)` of the node's incident
+/// quads, falling back to `fallback` for a boundary-only node.
+fn local_targets(mesh: &Mesh, fallback: f64) -> Vec<f64> {
+    let n = mesh.points.len();
+    let mut sum = vec![0.0f64; n];
+    let mut count = vec![0usize; n];
+    for cell in &mesh.cells {
+        if cell.kind != Kind::Quad4 {
+            continue;
+        }
+        let area = quality::volume(cell, &mesh.points).abs();
+        if !area.is_finite() || area <= 0.0 {
+            continue;
+        }
+        let local = area.sqrt();
+        for &node in &cell.nodes {
+            if node < n {
+                sum[node] += local;
+                count[node] += 1;
+            }
+        }
+    }
+    (0..n)
+        .map(|v| {
+            if count[v] > 0 {
+                sum[v] / count[v] as f64
+            } else {
+                fallback
+            }
+        })
+        .collect()
 }
 
 /// Mesh a planar domain with a **per-node target size** (the size field).

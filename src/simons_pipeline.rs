@@ -185,6 +185,13 @@ pub struct Options {
     /// Constant-size and general domains keep the QGP/stitch and channel
     /// routes.
     pub graded: bool,
+
+    /// Weight of the **target-area** term in the final product-smoother pass
+    /// (default 1.0: the pipeline's whole point is to realise the size field).
+    /// The term pulls `sqrt(area)` towards `sigma` at each node; 0 disables it.
+    /// It runs after the thesis angle + stretch smoothing and is kept only if
+    /// the gate survives (see [`crate::smooth::smooth_with_targets`]).
+    pub size_weight: f64,
 }
 
 impl Default for Options {
@@ -195,6 +202,7 @@ impl Default for Options {
             smooth: true,
             tiles: (0, 0),
             graded: true,
+            size_weight: 1.0,
         }
     }
 }
@@ -425,7 +433,7 @@ where
     };
 
     let (mesh, smoothing_error) = if options.smooth {
-        match smooth_mesh(domain, &mesh, sigma) {
+        match smooth_mesh(domain, &mesh, sigma, options.size_weight) {
             Ok((smoothed, smoothing)) => {
                 trace.smoothing = Some(smoothing);
                 (smoothed, None)
@@ -836,7 +844,12 @@ where
 
 /// Smooth with the thesis angle + stretch objective, boundary fixed, then with
 /// the product smoother's **target-area** term against the size field.
-fn smooth_mesh<F>(domain: &Domain, mesh: &Mesh, sigma: &F) -> Result<(Mesh, Smoothing), String>
+fn smooth_mesh<F>(
+    domain: &Domain,
+    mesh: &Mesh,
+    sigma: &F,
+    size_weight: f64,
+) -> Result<(Mesh, Smoothing), String>
 where
     F: Fn(f64, f64) -> f64,
 {
@@ -863,7 +876,7 @@ where
         &smoothed,
         &targets,
         &crate::smooth::SmoothOptions {
-            size_weight: 1.0,
+            size_weight,
             ..crate::smooth::SmoothOptions::default()
         },
     );
