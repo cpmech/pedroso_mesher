@@ -14,11 +14,12 @@
 //! interior. Feeding the GODF/QGP interior into the channel is the remaining
 //! integration step, documented in the vault.
 //!
-//! Supported: the six planar corpus parts — rectangle-like domains with holes
-//! (plate-hole 4/2/1 mm: 262/1240/5324 quads, SJ 0.608/0.564/0.481 after the
-//! shared smoother + shape pass), the rectilinear non-convex parts (l-bracket,
-//! stepped: 600/2300 quads as perfect grids) and the quarter annulus (ring: 48
-//! quads, SJ 0.998, 87.5°, through the two-chain strip fallback)
+//! Supported: **all seven corpus parts** — rectangle-like domains with holes
+//! (plate-hole 4/2/1/0.6 mm: 262/1240/5324/15520 quads, SJ 0.608/0.564/0.481/
+//! 0.513 after the shared smoother + shape pass), the rectilinear non-convex
+//! parts (l-bracket, stepped: 600/2300 quads as perfect grids) and the quarter
+//! annulus (ring: 48 quads, SJ 0.998, 87.5°, through the two-chain strip
+//! fallback)
 //! where the adaptive channel width (thesis 1.4 h, then 1.0 h, then 0.7 h) lets
 //! the interior grid reach close enough to the boundary for the cover to close
 //! the remaining band. The quarter-annulus ring still fails: its curved
