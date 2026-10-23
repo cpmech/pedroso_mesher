@@ -1,10 +1,12 @@
 //! Right-angled triangle mesh + bipartite labelling, the indirect all-quad route
 //! of Georgiadis, Reberol and Remacle, *Indirect all-quadrilateral meshing based
-//! on bipartite topological labeling*, Engineering with Computers (2022).
+//! on bipartite topological labeling* (Engineering with Computers, 2022; corpus
+//! id `georgiadis-2022`).
 //!
-//! The route starts from the plane triangulation the crate already produces
-//! (`two_d::triangulate`) and converts it to quads by **pairing triangles along
-//! a set of edges picked by a 2-colouring of the mesh vertices**:
+//! The route starts from a plane triangulation of the domain (the field-aligned
+//! CDT below, falling back to the crate's `two_d::triangulate`) and converts it
+//! to quads by **pairing triangles along a set of edges picked by a 2-colouring
+//! of the mesh vertices**:
 //!
 //! * §5: the vertices are labelled with two colours. Every triangle has three
 //!   vertices and two colours, so it carries either one monochromatic edge (two
@@ -32,7 +34,9 @@
 //!   nothing to do). On the corpus this lifts the interior valence-4 share from
 //!   ~60 % to 74-97 %.
 //! * §5.1/§5.2: after the boundary alternation the interior labels are chosen
-//!   greedily and improved by label smoothing. A label is scored by:
+//!   greedily (grown from the boundary, not the paper's random §5.1 or
+//!   cross-field-guided §5.2 initial labelling) and improved by label smoothing.
+//!   A label is scored by:
 //!
 //!   - the scaled Jacobian of the quad its monochromatic edge would create,
 //!     with a large penalty for a non-convex (folded) quad;
@@ -55,6 +59,17 @@
 //!   reflex vertices are unfolded, the crate's two-quad re-split is applied, and
 //!   a transactional label-flip retry is tried when a fold or a flat quad
 //!   remains.
+//!
+//! Measured result
+//! ---------------
+//! Seven-part corpus (`alts/results/bipartite.txt`): all-quad and 7/7 PASS raw
+//! and 7/7 PASS after the common post-pass, with a paired fraction of 1.000 on
+//! every part (`mono_left = 0`, 0 leftover triangles, 264 Steiner points and
+//! 26 482 quads in total). Raw SJ 0.49-0.68 and corner 33.8-45.0 degrees; post
+//! SJ 0.69-0.82 and corner 47.5-61.8 degrees; total route time 1.03 s raw and
+//! 17.28 s post (the common post-pass dominates). The §5.3 doublet merge is what
+//! removed the raw overlaps: two quads sharing two edges are merged into one,
+//! and the gate now reports `overlapping = 0` on every part.
 //!
 //! Not implemented: the paper's frontal point generation and cross-field (§3 and
 //! the cross-field part of §5.2), the full set of local modifications of §4
@@ -123,21 +138,38 @@ const REPOSITION_ROUNDS: usize = 8;
 /// Tuning of the right-angled + bipartite-labelling route.
 ///
 /// The defaults reproduce the constants the route was measured with, so
-/// [`Options::default`] leaves every result unchanged.
+/// [`Options::default`] leaves every result unchanged. Every field is a budget:
+/// raising it gives the optimisation more room at more run time, and zero
+/// disables the corresponding pass (except `steiner_fraction`, where zero leaves
+/// only the fixed allowance of 32 Steiner points).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Options {
-    /// Upper bound on the right-angle flip sweeps (§4).
+    /// Upper bound on right-angle flip sweeps (§4). One sweep scans every
+    /// interior edge once; the pass stops early when a sweep flips nothing.
+    /// Unit: sweeps; default 60.
     pub flip_rounds: usize,
-    /// Upper bound on label-smoothing sweeps per call (§5.1/§5.2).
+
+    /// Upper bound on label-smoothing sweeps per call (§5.1/§5.2). The initial
+    /// pass and the smoothing after every repair round each get this budget, and
+    /// the pass stops at a sweep that flips nothing. Unit: sweeps; default 80.
     pub label_passes: usize,
-    /// Upper bound on monochromatic-triangle repair rounds (§5.1).
+
+    /// Upper bound on monochromatic-triangle repair rounds (§5.1). Each round
+    /// splits one edge per remaining monochromatic triangle, re-triangulates and
+    /// re-smooths. Unit: rounds; default 200.
     pub repair_rounds: usize,
-    /// Upper bound on Steiner points, as a fraction of the input triangle
-    /// count (§5.1).
+
+    /// Cap on Steiner points as a fraction of the input triangle count (§5.1),
+    /// plus a fixed allowance of 32 points for tiny meshes. Unit: fraction of
+    /// `tris.len()`; default 0.25. The cap protects the size field; when it is
+    /// reached, the remaining monochromatic triangles are reported as leftover
+    /// `Tri3` cells instead of being split further.
     pub steiner_fraction: f64,
 }
 
 impl Default for Options {
+    /// The measured constants: 60 flip sweeps, 80 label passes, 200 repair
+    /// rounds and a Steiner budget of 0.25 x the input triangle count.
     fn default() -> Self {
         Self {
             flip_rounds: FLIP_ROUNDS,
@@ -149,45 +181,83 @@ impl Default for Options {
 }
 
 /// Measurements of one [`mesh_with_stats`] run.
+///
+/// The counters are snapshots of pipeline stages, not a conservation law:
+/// `input_triangles` counts before degenerate removal and boundary splits,
+/// `triangles_final` after every split, and `quads` is smaller than half of
+/// `triangles_final` when doublets are merged. [`Stats::paired_fraction`] is the
+/// one derived quantity.
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
-    /// Triangles in the input triangulation, before any preprocessing.
+    /// Triangles in the input triangulation, before any preprocessing. Unit:
+    /// triangles.
     pub input_triangles: usize,
-    /// Zero-area triangles dropped from the input.
+
+    /// Zero-area triangles dropped from the input (twice the area at most
+    /// `1e-10 * size^2`). Unit: triangles.
     pub degenerate_triangles: usize,
-    /// Boundary edges split to make an odd boundary loop even.
+
+    /// Boundary edges split by `parity::even_boundary_loops`, one per boundary
+    /// cycle with an odd edge count. Unit: edges.
     pub boundary_loop_splits: usize,
-    /// Interior edge flips taken by the right-angle pass.
+
+    /// Interior edge flips accepted by the right-angle pass (§4). Unit: flips.
     pub right_angle_flips: usize,
-    /// Near-right angles over all triangles before/after the flip pass.
+
+    /// Near-right triangle corners (within 10 degrees of 90) over all triangles
+    /// before the flip pass. Unit: corners, not triangles.
     pub right_angles_before: usize,
+
+    /// The same corner count after the flip pass.
     pub right_angles_after: usize,
-    /// Monochromatic triangles left after the initial labelling and smoothing.
+
+    /// Monochromatic triangles left after the initial labelling and smoothing,
+    /// before any repair. Unit: triangles.
     pub mono_initial: usize,
-    /// Label changes accepted by the smoothing (initial and post-repair).
+
+    /// Label changes accepted by smoothing: the initial pass, the smoothing
+    /// after each repair round, and the transactional retry flips. Unit: flips.
     pub label_flips: usize,
-    /// Steiner points inserted to break monochromatic triangles.
+
+    /// Steiner points inserted to break monochromatic triangles (§5.1). Each is
+    /// an edge midpoint carrying the opposite label. Unit: points.
     pub steiner_points: usize,
-    /// Monochromatic triangles that could not be eliminated.
+
+    /// Monochromatic triangles that could not be eliminated; non-zero means the
+    /// mesh carries leftover `Tri3` cells. Unit: triangles.
     pub mono_left: usize,
-    /// Triangles after every split, i.e. the triangles the quads consume.
+
+    /// Triangles after every repair split, i.e. the triangles the pairing
+    /// consumes. Unit: triangles.
     pub triangles_final: usize,
+
+    /// Quads after extraction, doublet merge and the local corrections. Unit:
+    /// quads; a doublet merge folds two quads into one.
     pub quads: usize,
-    /// Triangles left over (only non-zero when `mono_left > 0`).
+
+    /// Triangles emitted as `Tri3` cells (only non-zero when `mono_left > 0`).
+    /// Unit: triangles.
     pub leftover_triangles: usize,
-    /// Folded (non-convex) quads after the unfolder pass.
+
+    /// Folded (non-convex) quads left after the last unfolder pass. Unit: quads.
     pub inverted_left: usize,
-    /// Unfolder sweeps used.
+
+    /// Unfolder sweeps used by both unfolder calls together. Unit: sweeps.
     pub unfold_rounds: usize,
+
     /// Local two-quad swaps taken to remove folded quads (§5.3 correction).
+    /// Unit: swaps.
     pub quad_swaps: usize,
+
     /// Pairs of quads sharing two edges merged into one quad (§5.3 doublet fix).
+    /// Unit: merges.
     pub merged_quads: usize,
 }
 
 impl Stats {
-    /// Share of the final triangles that ended in a quad. A doublet merge folds
-    /// two quads into one, so this is one minus the leftover share.
+    /// Share of the final triangles that ended in a quad: one minus the leftover
+    /// triangle share. It is 1.0 when every triangle was consumed, even though a
+    /// doublet merge makes `quads` smaller than half of `triangles_final`.
     pub fn paired_fraction(&self) -> f64 {
         if self.triangles_final == 0 {
             0.0
@@ -197,17 +267,28 @@ impl Stats {
     }
 }
 
-/// Mesh the domain with the right-angled + bipartite-labelling route.
+/// Mesh the domain with the right-angled + bipartite-labelling route
+/// (`georgiadis-2022`).
+///
+/// Pipeline: field-aligned CDT (falling back to the crate's Ruppert
+/// triangulation), drop zero-area triangles, make every boundary cycle even,
+/// right-angle flips, bipartite labelling + smoothing, Steiner repair of the
+/// remaining monochromatic triangles, pair across the monochromatic edges,
+/// merge doublets, unfold/reposition and validate. Returns an all-quad mesh when
+/// the repair budget suffices; leftover monochromatic triangles are emitted as
+/// `Tri3` cells (visible in [`Stats::leftover_triangles`]) rather than dropped.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
     mesh_with_options(domain, sizing, &Options::default())
 }
 
-/// Same as [`mesh`], returning the run's measurements as well.
+/// Same as [`mesh`], returning the run's measurements as well; see [`Stats`] for
+/// the stage counters and [`Stats::paired_fraction`] for the pairing rate.
 pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats), String> {
     mesh_with_options_and_stats(domain, sizing, &Options::default())
 }
 
-/// Same as [`mesh`], with explicit [`Options`].
+/// Same as [`mesh`], with explicit [`Options`] controlling the flip, smoothing,
+/// repair and Steiner budgets.
 pub fn mesh_with_options(
     domain: &Domain,
     sizing: &Sizing,
@@ -216,7 +297,14 @@ pub fn mesh_with_options(
     mesh_with_options_and_stats(domain, sizing, options).map(|(mesh, _)| mesh)
 }
 
-/// Same as [`mesh_with_options`], returning the run's measurements as well.
+/// The full pipeline behind [`mesh_with_options`], also returning [`Stats`].
+///
+/// The post-labelling half is factored into `assemble`; when that leaves a
+/// folded quad or an overlap, a bounded transactional retry flips single labels
+/// (and then pairs of labels) around the folds and keeps the attempt with the
+/// best smallest Jacobian. Errors are returned only when the input is
+/// unusable (no triangles, an odd boundary cycle, an open/non-manifold
+/// boundary) or the final mesh fails `Mesh::validate`.
 pub fn mesh_with_options_and_stats(
     domain: &Domain,
     sizing: &Sizing,
@@ -377,17 +465,41 @@ pub fn mesh_with_options_and_stats(
     Ok((mesh, stats))
 }
 
-/// Result of the post-labelling half of the route.
+/// Result of the post-labelling half of the route: the quad (and leftover
+/// triangle) cells plus the counters that are copied into [`Stats`].
 struct Assembled {
+    /// Quads after pairing, doublet merge, swap and repositioning, as
+    /// counter-clockwise node ids of length four.
     quads: Vec<[usize; 4]>,
+
+    /// Triangles the pairing could not consume. Empty on every passing corpus
+    /// part; non-empty only when the repair budget ran out.
     leftover: Vec<[usize; 3]>,
+
+    /// Steiner points inserted by this call (see [`Stats::steiner_points`]).
     steiner: usize,
+
+    /// Label flips accepted by the repair's smoothing; the caller adds the
+    /// transactional retry flips.
     repair_flips: usize,
+
+    /// Doublet merges taken (see [`Stats::merged_quads`]).
     merged: usize,
+
+    /// Two-quad swaps taken by `sun::repair_degenerate_quads`.
     swaps: usize,
+
+    /// Total unfolder sweeps of both [`unfold`] calls.
     unfold_rounds: usize,
+
+    /// Non-convex quads left after the second unfolder pass.
     inverted: usize,
+
+    /// Unordered quad pairs sharing more than one edge ([`overlap_count`]).
     overlaps: usize,
+
+    /// Smallest quad scaled Jacobian in the result, or `+inf` when there is no
+    /// quad. Used to rank the corrective label-flip retries.
     min_sj: f64,
 }
 
@@ -463,7 +575,9 @@ fn assemble(
     }
 }
 
-/// Number of pairs of quads sharing more than one edge.
+/// Number of unordered quad pairs sharing more than one edge. That is the
+/// topological overlap the gate reports and the only overlap a labelling can
+/// create; it is counted through an edge-owner map, not geometrically.
 fn overlap_count(quads: &[[usize; 4]]) -> usize {
     let mut owners: HashMap<Edge, Vec<usize>> = HashMap::new();
     for (id, q) in quads.iter().enumerate() {
@@ -488,6 +602,11 @@ fn overlap_count(quads: &[[usize; 4]]) -> usize {
 
 /// Free vertices of the folded quads and their quad-mesh neighbours, the
 /// candidates for a corrective label flip.
+///
+/// A boundary vertex is never a candidate: its label is fixed by the alternating
+/// boundary colouring, so flipping it would also make a boundary edge
+/// monochromatic. The one-ring expansion gives the retry a chance to fix a fold
+/// whose cause is the label of a neighbouring quad rather than a folded corner.
 fn fold_neighbourhood(points: &[Node], quads: &[[usize; 4]]) -> Vec<usize> {
     // A vertex is on the boundary when it belongs to an edge used once.
     let mut edge_uses: HashMap<Edge, usize> = HashMap::new();
@@ -530,7 +649,11 @@ fn fold_neighbourhood(points: &[Node], quads: &[[usize; 4]]) -> Vec<usize> {
     candidates
 }
 
-/// Drop points no cell uses and renumber the cells.
+/// Drop points no cell uses and renumber the cells in place.
+///
+/// The doublet merge and the repairs can orphan a point (the merged doublet's
+/// centre); `Mesh::validate` rejects an unused point, so the final mesh is
+/// compacted. The order of the surviving points and of the cells is preserved.
 fn compact(points: Vec<Node>, quads: &mut [[usize; 4]], leftover: &mut [[usize; 3]]) -> Vec<Node> {
     let mut used = vec![false; points.len()];
     for q in quads.iter() {
@@ -573,11 +696,11 @@ fn compact(points: Vec<Node>, quads: &mut [[usize; 4]], leftover: &mut [[usize; 
 ///
 /// The paper gets a grid-like right-angled triangulation from its frontal
 /// point generation guided by a cross-field. Without the cross-field we use the
-/// domain's axes as the field: points on a `size` lattice, at least
-/// `0.65 * size` from the boundary, plus the boundary samples themselves. The
-/// constrained Delaunay triangulation then only has to fill a one-cell boundary
-/// band, which keeps most interior vertices on a square lattice — where the
-/// labelling can pair the triangles into squares.
+/// domain's axes as the field: one ring of points `0.8 * size` inside the
+/// boundary, plus a `size` lattice at least `1.7 * size` from it (and clear of
+/// the ring). The constrained Delaunay triangulation then only has to fill a
+/// one-cell boundary band, which keeps most interior vertices on a square
+/// lattice — where the labelling can pair the triangles into squares.
 fn field_aligned_triangulation(
     domain: &Domain,
     sizing: &Sizing,
@@ -736,11 +859,14 @@ fn field_aligned_triangulation(
 // small geometry helpers
 // --------------------------------------------------------------------------- //
 
+/// Undirected edge key: the two node ids with the smaller one first.
 #[inline]
 fn edge_key(a: usize, b: usize) -> Edge {
     (a.min(b), a.max(b))
 }
 
+/// Twice the signed area of a triangle; positive when counter-clockwise.
+/// Millimetres squared (the factor 2 is never divided out).
 fn tri_area2(points: &[Node], t: &[usize; 3]) -> f64 {
     let a = points[t[0]];
     let b = points[t[1]];
@@ -779,12 +905,15 @@ fn triangle_angles(points: &[Node], t: &[usize; 3]) -> [f64; 3] {
     angles
 }
 
+/// Smallest corner angle of a triangle, in degrees; used as the triangle's
+/// quality proxy by the unfolder.
 fn min_corner_angle(points: &[Node], t: &[usize; 3]) -> f64 {
     triangle_angles(points, t)
         .into_iter()
         .fold(f64::INFINITY, f64::min)
 }
 
+/// Number of the three angles within `RIGHT_ANGLE_TOLERANCE_DEG` of 90 degrees.
 fn count_right(angles: &[f64; 3]) -> usize {
     angles
         .iter()
@@ -792,6 +921,8 @@ fn count_right(angles: &[f64; 3]) -> usize {
         .count()
 }
 
+/// Near-right corners over all triangles (three per triangle), the quantity the
+/// §4 flip pass tries to raise.
 fn count_right_angles(points: &[Node], tris: &[[usize; 3]]) -> usize {
     tris.iter()
         .map(|t| count_right(&triangle_angles(points, t)))
@@ -818,6 +949,8 @@ fn quad_min_sj(points: &[Node], q: &[usize; 4]) -> f64 {
     worst
 }
 
+/// Signed area of a quad (shoelace sum halved), positive when counter-clockwise.
+/// Millimetres squared.
 fn quad_area2(points: &[Node], q: &[usize; 4]) -> f64 {
     let mut area = 0.0;
     for i in 0..4 {
@@ -845,6 +978,9 @@ fn strictly_convex(points: &[Node], q: &[usize; 4]) -> bool {
     true
 }
 
+/// Longest edge of a triangle as an undirected [`Edge`] key. §5.1 splits this
+/// edge for an isolated monochromatic triangle, which is the least damaging
+/// choice for the size field.
 fn longest_edge(points: &[Node], t: &[usize; 3]) -> Edge {
     let mut best = edge_key(t[0], t[1]);
     let mut best_length = squared_length(points, best);
@@ -859,6 +995,8 @@ fn longest_edge(points: &[Node], t: &[usize; 3]) -> Edge {
     best
 }
 
+/// Squared length of an edge, in millimetres squared. Only used for
+/// comparisons, so the square root is skipped.
 fn squared_length(points: &[Node], edge: Edge) -> f64 {
     let a = points[edge.0];
     let b = points[edge.1];
@@ -869,6 +1007,9 @@ fn squared_length(points: &[Node], edge: Edge) -> f64 {
 // connectivity
 // --------------------------------------------------------------------------- //
 
+/// Map every undirected edge to the triangles that use it: one owner is a
+/// boundary edge, two an interior edge. A triangle with a repeated vertex would
+/// add the same edge twice; the input triangulation is assumed valid.
 fn edge_owners(tris: &[[usize; 3]]) -> HashMap<Edge, Vec<usize>> {
     let mut map: HashMap<Edge, Vec<usize>> = HashMap::new();
     for (id, t) in tris.iter().enumerate() {
@@ -881,6 +1022,8 @@ fn edge_owners(tris: &[[usize; 3]]) -> HashMap<Edge, Vec<usize>> {
     map
 }
 
+/// Vertex -> incident triangle ids, indexed by node id. Built once per
+/// [`Labeller`] so a label flip only touches its own stencil.
 fn triangles_by_vertex(n: usize, tris: &[[usize; 3]]) -> Vec<Vec<usize>> {
     let mut map: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (id, t) in tris.iter().enumerate() {
@@ -974,15 +1117,29 @@ fn mono_edge(t: &[usize; 3], colour: &[u8]) -> Option<(usize, usize, usize)> {
 /// the smoothing need is precomputed once, so a label flip is a handful of
 /// neighbour lookups.
 struct Labeller<'a> {
+    /// Node coordinates, borrowed from the caller. Millimetres.
     points: &'a [Node],
+
+    /// Triangles, borrowed from the caller; the labelling never changes them.
     tris: &'a [[usize; 3]],
+
+    /// Edge -> incident triangle ids. `len() == 1` marks a boundary edge.
     owners: &'a HashMap<Edge, Vec<usize>>,
+
+    /// Per-vertex "label is fixed" flag (the boundary). Resized to the node
+    /// count, so Steiner points added later default to free.
     fixed: Vec<bool>,
+
+    /// Vertex -> incident triangle ids, indexed by node id.
     by_vertex: Vec<Vec<usize>>,
+
+    /// Vertex -> sorted unique one-ring neighbours, indexed by node id.
     neighbours: Vec<Vec<usize>>,
 }
 
 impl<'a> Labeller<'a> {
+    /// True when edge `a-b` is used by exactly one triangle, i.e. it lies on
+    /// the boundary. Unknown edges are not boundary edges.
     fn boundary_edge(&self, a: usize, b: usize) -> bool {
         self.owners
             .get(&edge_key(a, b))
@@ -990,6 +1147,9 @@ impl<'a> Labeller<'a> {
             .unwrap_or(false)
     }
 
+    /// Precompute the per-vertex incidence and neighbour tables and copy the
+    /// fixed-label flags. `fixed` is resized to the current node count, so a
+    /// Steiner point inserted later is a free vertex.
     fn new(
         points: &'a [Node],
         tris: &'a [[usize; 3]],
@@ -1110,6 +1270,16 @@ impl<'a> Labeller<'a> {
 
 /// Colour the boundary alternately and then grow the labels inwards, choosing at
 /// each vertex the label that scores better against the already coloured ring.
+///
+/// This is the deterministic approximation of the paper's §5.1 random initial
+/// labelling (and of the §5.2 cross-field guidance): a breadth-first walk from
+/// the boundary labels each new vertex by trying both colours and keeping the
+/// higher [`Labeller::local_score`]. A finished quad mesh has a unique 2-colouring
+/// once one boundary cycle is coloured, but the triangle graph has odd cycles, so
+/// the colour cannot simply be propagated across it. The greedy walk leaves some
+/// monochromatic triangles, which [`smooth_labels`] and
+/// [`repair_monochromatic`] then remove. Vertices unreachable from the boundary
+/// default to label 0. Returns `(colour, fixed)`.
 fn label(
     points: &[Node],
     tris: &[[usize; 3]],
@@ -1191,6 +1361,8 @@ fn smooth_labels(
     flips
 }
 
+/// Number of triangles whose three labels are equal. Unlabelled (`FREE`)
+/// vertices never count as a match.
 fn count_mono(tris: &[[usize; 3]], colour: &[u8]) -> usize {
     tris.iter()
         .filter(|t| {
@@ -1206,7 +1378,17 @@ fn count_mono(tris: &[[usize; 3]], colour: &[u8]) -> usize {
 
 /// Flip interior edges while that strictly raises the number of near-right
 /// angles, without making the quadrilateral of the two triangles non-convex and
-/// without dropping the smallest corner angle by more than `FLIP_ANGLE_DROP_DEG`.
+/// without dropping the smallest corner angle by more than `FLIP_ANGLE_DROP_DEG`
+/// (or below `FLIP_MIN_CORNER_DEG`).
+///
+/// One sweep collects the interior edges in sorted order, so the result is
+/// deterministic, and tolerates edges that an earlier flip in the same sweep has
+/// already removed. A swap is refused when either new triangle has twice its
+/// area below `1e-3 * size^2` (sliver guard). The sweep loop stops after a sweep
+/// with no accepted flip, and a hard cap of 200 000 flips bounds a pathological
+/// input.
+/// Section 4 of the paper; this is its tractable edge-swap core, not the full
+/// split/collapse point-replacement pipeline.
 fn right_angle_flips(points: &[Node], tris: &mut [[usize; 3]], rounds: usize, size: f64) -> usize {
     let mut total = 0usize;
     for _ in 0..rounds {
@@ -1272,6 +1454,12 @@ fn right_angle_flips(points: &[Node], tris: &mut [[usize; 3]], rounds: usize, si
                 + old_angles[1].into_iter().fold(f64::INFINITY, f64::min);
             let new_sum = new_angles[0].into_iter().fold(f64::INFINITY, f64::min)
                 + new_angles[1].into_iter().fold(f64::INFINITY, f64::min);
+            // Lexicographic acceptance: more near-right corners first, provided
+            // no new corner falls below FLIP_MIN_CORNER_DEG and the sum of the
+            // two minimum angles drops by at most FLIP_ANGLE_DROP_DEG. With an
+            // unchanged right-angle count, only a strictly better minimum-angle
+            // sum is accepted. This blocks the classic "right angle bought with
+            // a sliver" swap.
             let accept = if new_right > old_right {
                 new_floor >= FLIP_MIN_CORNER_DEG && new_sum >= old_sum - FLIP_ANGLE_DROP_DEG
             } else {
@@ -1312,10 +1500,17 @@ fn edge_with_opposite(t: &[usize; 3], edge: Edge) -> Option<(usize, usize, usize
 // monochromatic-triangle repair (§5.1, Fig. 9)
 // --------------------------------------------------------------------------- //
 
-/// Split one edge of every remaining monochromatic triangle and give the
-/// midpoint the opposite label. A pair of adjacent monochromatic triangles gets
-/// its common edge split, an isolated one its longest edge. The new triangles
-/// each carry exactly one monochromatic edge, so the construction continues.
+/// §5.1 bipartite topological correction: split one edge of every remaining
+/// monochromatic triangle and give the midpoint the opposite label. A pair of
+/// adjacent monochromatic triangles gets its common edge split (one midpoint
+/// repairs both); an isolated one gets its longest edge split. Each new triangle
+/// then carries exactly one monochromatic edge, so the pairing construction
+/// continues.
+///
+/// The split targets are collected in a `BTreeMap` keyed by edge, which makes
+/// the insertion order deterministic. After every round the triangles are
+/// rebuilt by [`split_triangle`] and the labels are smoothed again. The cap is
+/// `32 + steiner_fraction * tris.len()` points. Returns `(steiner, label_flips)`.
 fn repair_monochromatic(
     points: &mut Vec<Node>,
     tris: &mut Vec<[usize; 3]>,
@@ -1323,6 +1518,9 @@ fn repair_monochromatic(
     fixed: &mut Vec<bool>,
     options: &Options,
 ) -> (usize, usize) {
+    // Fixed allowance so a tiny mesh can always be repaired, plus the measured
+    // fraction of the input triangle count. The cap is what keeps the repair
+    // from destroying the size field on a pathological input.
     let split_cap = 32 + (tris.len() as f64 * options.steiner_fraction) as usize;
     let mut steiner = 0usize;
     let mut label_flips = 0usize;
@@ -1583,6 +1781,9 @@ fn reposition(
     }
 }
 
+/// Quality of a vertex stencil: the smallest scaled Jacobian among its quads and
+/// the smallest corner angle / 90 among its triangles. `+inf` when the stencil
+/// has no incident cell (never used in that case). Higher is better.
 fn stencil_quality(
     incident: &[(bool, usize)],
     quads: &[[usize; 4]],
@@ -1609,6 +1810,8 @@ fn stencil_quality(
 /// two-edge sharing, and leaves the surrounding quads untouched. The merge is
 /// taken only when `B` belongs to no other quad (so it becomes an unused point,
 /// compacted away later) and the merged quad is convex with a usable Jacobian.
+/// This is the correction that removed the raw overlaps measured before it: the
+/// gate now reports `overlapping = 0` on every corpus part.
 fn merge_doublets(points: &[Node], quads: &mut Vec<[usize; 4]>) -> usize {
     let mut merged = 0usize;
     for _ in 0..64 {
@@ -1766,7 +1969,9 @@ fn corners_of(points: &[Node], q: &[usize; 4]) -> [f64; 4] {
     out
 }
 
-/// Mirror `x` across the line through `a` and `b`.
+/// Mirror `x` across the line through `a` and `b`; returns `x` itself for a
+/// degenerate line. The mirror of a reflex corner across the chord of its two
+/// neighbours is the direct way to unfold a nearly flat quad.
 fn reflect_across(x: Node, a: Node, b: Node) -> [f64; 2] {
     let ab = [b[0] - a[0], b[1] - a[1]];
     let length2 = ab[0] * ab[0] + ab[1] * ab[1];

@@ -1,7 +1,8 @@
 //! PAVING: direct all-quad generation by advancing rows of quads.
 //!
 //! Implemented from Blacker & Stephenson (1991), *Paving: a new approach to
-//! automated quadrilateral mesh generation*, §2. The route works on ordered,
+//! automated quadrilateral mesh generation* (IJNME 32(4):811-847, corpus id
+//! `blacker-1991`), §2. The route works on ordered,
 //! closed front loops – the outer loop counter-clockwise and every hole
 //! clockwise, so that the material is always on the left of the loop – and
 //! advances each loop towards the interior by one row at a time. Every row is
@@ -56,6 +57,20 @@
 //!   lowers the interior `sum |valence - 4|` and both new quads stay above the
 //!   gate. No element is deleted. The common post-pass is run again by the
 //!   example.
+//!
+//! Measured result
+//! ---------------
+//! On the seven-part corpus the route is all-quad and passes the gate raw and
+//! after the common post-pass (7/7; measured raw SJ 0.62-0.70, corner 38-45
+//! degrees, about 15 200 quads on the 0.6 mm part). [`Stats`] measures how much
+//! of that is actual paving. With the §2.8 seam off, rows contribute 17-45 % of
+//! the quads (the 4 mm plate-hole is 128/328 = 39 %;
+//! `alts/results/paving.txt`). The seam was added for the 4 mm plate-hole, where
+//! the hole front meets the plate front head-on: it raises the row share from
+//! 39 % (128 row + 200 core) to 57 % (192 row + 143 core). The rest of every
+//! mesh is the matched core. The smallest measured share is the stepped part at
+//! 17 % (376/2158), whose single front stops after two rows at its concave
+//! corners.
 //!
 //! What is not implemented
 //! -----------------------
@@ -115,26 +130,55 @@ const SEAM_REACH: f64 = 1.5;
 const MAX_ROW_ROUNDS: usize = 32;
 
 /// Options for the PAVING route.
+///
+/// Every field is a tuning choice; [`Default`] reproduces the constants the
+/// route was measured with. Lengths are multiples of the element size `h`
+/// (`Sizing::size`) because the row generator has no size field.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Options {
-    /// Distance from a sharp corner to the first sampled boundary node, in sizes.
+    /// Distance from a sharp corner (a turn whose magnitude exceeds 30 degrees)
+    /// to the first sampled boundary node, as a multiple of `h`. Must be `>= 0`;
+    /// default 2.4.
+    ///
+    /// The clearance is what gives the row generator room to keep more than one
+    /// corner row alive; 1.25 also works but stops after one row, and a node
+    /// exactly `h` from the corner collapses the corner quads.
     pub corner_margin: f64,
-    /// The smallest front edge length a row may produce, in sizes.
+
+    /// Smallest front edge a row may produce, as a fraction of `h`. Must be
+    /// `> 0`; default 0.08. A projected front edge shorter than this refuses the
+    /// row: the matching quad would be a sliver the smoother cannot recover.
     pub min_edge_fraction: f64,
-    /// New fronts closer than this to another front are refused, in sizes.
+
+    /// Clearance a new front must keep from every other live front, as a
+    /// multiple of `h`. Must be `> 0`; default 1.2. Closer than this the row is
+    /// seamed onto the met front when `seam` is set, otherwise refused; the gap
+    /// keeps two unrelated fronts from crossing.
     pub front_gap: f64,
-    /// Rounds of rows before the residual closure takes over.
+
+    /// Upper bound on the outer row sweeps, one sweep visiting every live loop
+    /// smallest perimeter first. Unit: sweeps, not rows. Default 32; each sweep
+    /// may commit one row per live loop, so the measured [`Stats::row_rounds`]
+    /// exceeds this value (33 on the 0.6 mm part) even before the residual
+    /// closure takes over.
     pub max_row_rounds: usize,
-    /// Seam a row onto the front it meets instead of refusing it (§2.8).
+
+    /// Seam a row onto the front it meets instead of refusing it
+    /// (Blacker & Stephenson 1991, §2.8). Default `true`. Turning it off
+    /// reproduces the pre-seam route exactly: measured 4 mm plate-hole 128 row
+    /// quads + 200 core quads, against 192 + 143 with the seam on.
     #[serde(default = "default_seam")]
     pub seam: bool,
 }
 
+/// Serde default for [`Options::seam`]: seaming is on.
 fn default_seam() -> bool {
     true
 }
 
 impl Default for Options {
+    /// The measured constants: corner margin 2.4, min edge 0.08, front gap 1.2,
+    /// 32 row sweeps and the §2.8 seam on.
     fn default() -> Self {
         Self {
             corner_margin: CORNER_MARGIN,
@@ -147,15 +191,26 @@ impl Default for Options {
 }
 
 /// How the quads of a run were produced.
+///
+/// The two quad counters partition the final mesh: the cleanup passes only move
+/// nodes and swap diagonals (they never add, delete or change the kind of a
+/// cell), so `row_quads + core_quads == mesh.cells.len()`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
-    /// Quads produced by paving rows (including small-front closure).
+    /// Quads produced by paving rows, including the §2.5 four- and six-node
+    /// front closures. Unit: quads.
     pub row_quads: usize,
-    /// Quads produced by the residual Delaunay + matching (or fan) fallback.
+
+    /// Quads produced by the residual Delaunay + triangle-matching fallback
+    /// (or by its fan closure when the matching is obstructed). Unit: quads.
     pub core_quads: usize,
-    /// Paving rows committed.
+
+    /// Paving rows committed: one increment per committed row (`commit_row`),
+    /// not one per [`Options::max_row_rounds`] sweep. Unit: rows.
     pub row_rounds: usize,
-    /// Rows committed by seaming a row onto the front it met.
+
+    /// Rows committed by seaming the projected row onto the front it met
+    /// (§2.8). A subset of `row_rounds`; zero when `Options::seam` is off.
     pub seam_rows: usize,
 }
 
@@ -171,25 +226,46 @@ impl Stats {
     }
 }
 
-/// A closed front loop and the mesh built behind it.
+/// The live state of one paving run: storage, fronts and the counters that are
+/// copied into [`Stats`] at the end.
 struct Paving {
+    /// Every node built so far, in creation order, `[x, y, 0]` in millimetres.
     points: Vec<Node>,
-    /// True for a node the caller gave us on the permanent boundary.
+
+    /// Parallel to `points`: `true` for a node sampled on the permanent input
+    /// boundary, `false` for a row, closure or Steiner node. The smoother must
+    /// not move the former, or `verify::boundary_offset` would stop being zero.
     fixed: Vec<bool>,
-    /// Active front loops. Material is on the left of every loop.
+
+    /// Live front loops as ordered node-id cycles. Material is on the left of
+    /// every loop, so the outer loop is counter-clockwise and each hole is
+    /// clockwise; empty loops are never stored.
     loops: Vec<Vec<usize>>,
+
+    /// Quads committed so far, as counter-clockwise node ids of length four.
     quads: Vec<[usize; 4]>,
+
+    /// Quads committed by rows, including small-front closure (§2.5).
     row_quads: usize,
+
+    /// Quads committed by the residual matched core (`fill_residual`).
     core_quads: usize,
+
+    /// Rows committed (one per `commit_row`, so not the sweep count).
     row_rounds: usize,
+
+    /// Committed rows whose `merge_other` was set (§2.8 seam).
     seam_rows: usize,
 }
 
 impl Paving {
+    /// Coordinates of node `i` as a 2-vector; the stored `z` is always zero.
     fn coord(&self, i: usize) -> [f64; 2] {
         [self.points[i][0], self.points[i][1]]
     }
 
+    /// Append a point with its permanent-boundary flag and return the new node
+    /// id. Nothing is ever removed, so a returned id stays valid for the run.
     fn push_point(&mut self, p: [f64; 2], fixed: bool) -> usize {
         self.points.push([p[0], p[1], 0.0]);
         self.fixed.push(fixed);
@@ -197,16 +273,20 @@ impl Paving {
     }
 }
 
-/// Mesh a planar domain with rows of quads.
+/// Mesh a planar domain with rows of quads (Blacker & Stephenson 1991).
 ///
 /// Constant size only: `sizing.size` is used at every boundary segment and on
-/// every front. The result is all-quad unless [`Mesh::topology`] reports a
-/// crack, which the tests check.
+/// every front; anisotropic sizing is not implemented. Boundary sampling, row
+/// generation, the §2.8 seam, the §2.5 small-front closure and the residual
+/// matched core are all in [`mesh_with_stats_options`]. The result is all-quad;
+/// an error is returned for a bad size, a degenerate domain, or a mesh the final
+/// topology check rejects.
 pub fn mesh(domain: &Domain, sizing: &Sizing) -> Result<Mesh, String> {
     mesh_with_options(domain, sizing, &Options::default())
 }
 
-/// Like [`mesh`], but with explicit [`Options`].
+/// Like [`mesh`], but with explicit [`Options`] (see [`mesh_with_stats_options`]
+/// for what each stage does).
 pub fn mesh_with_options(
     domain: &Domain,
     sizing: &Sizing,
@@ -215,13 +295,21 @@ pub fn mesh_with_options(
     mesh_with_stats_options(domain, sizing, options).map(|(mesh, _)| mesh)
 }
 
-/// Like [`mesh`], but also reports how much of the mesh came from paving rows
-/// and how much from the residual matching fallback.
+/// Like [`mesh`], but also reports the row/core split in [`Stats`], so the
+/// caller can measure how much of the mesh is actual paving rather than the
+/// residual matched core.
 pub fn mesh_with_stats(domain: &Domain, sizing: &Sizing) -> Result<(Mesh, Stats), String> {
     mesh_with_stats_options(domain, sizing, &Options::default())
 }
 
-/// Like [`mesh_with_stats`], but with explicit [`Options`].
+/// The full PAVING pipeline: validate, sample the boundary, advance rows,
+/// close four- and six-node fronts, seam or refuse contacts, close the residual
+/// core, then smooth and clean up.
+///
+/// It returns the mesh together with [`Stats`]. Errors are `String`s for an
+/// invalid size/domain, a boundary sampling failure, an unclosed residual, or a
+/// final topology check that finds a crack or a non-manifold edge. The mesh is
+/// all-quad on success.
 pub fn mesh_with_stats_options(
     domain: &Domain,
     sizing: &Sizing,
@@ -342,6 +430,8 @@ pub fn mesh_with_stats_options(
 // boundary sampling
 // --------------------------------------------------------------------------- //
 
+/// Signed shoelace area of a closed point list: positive counter-clockwise.
+/// Used to orient every loop so the material is on its left.
 fn signed_area(points: &[[f64; 2]]) -> f64 {
     let mut sum = 0.0;
     for i in 0..points.len() {
@@ -352,6 +442,9 @@ fn signed_area(points: &[[f64; 2]]) -> f64 {
     sum / 2.0
 }
 
+/// Signed turn at vertex `i`, in radians: `atan2(cross, dot)` of the incoming
+/// and outgoing edges. Positive is a left turn (convex on a CCW loop); a
+/// magnitude above `CORNER_TURN` marks a geometric corner.
 fn turn_at(points: &[[f64; 2]], i: usize) -> f64 {
     let n = points.len();
     let prev = points[(i + n - 1) % n];
@@ -364,9 +457,16 @@ fn turn_at(points: &[[f64; 2]], i: usize) -> f64 {
     cross.atan2(dot)
 }
 
-/// Sample one closed loop. Every input vertex is kept; extra nodes are placed
-/// at no more than `h` apart, and no extra node is placed within
-/// `options.corner_margin * h` of a sharp corner on a straight segment.
+/// Sample one closed loop at the requested size.
+///
+/// Every input vertex is kept (duplicates and a repeated closing point are
+/// dropped) and the loop is oriented so its signed area has the sign of `ccw`.
+/// Each segment reserves `options.corner_margin * h` at a sharp end, then gets
+/// `round(span / h)` interior nodes placed at the centres of the reserved span,
+/// or is kept whole when `span < 0.6 h`. A paving boundary needs an
+/// even number of nodes, so an odd total adds one sample on the longest spanned
+/// segment; that only refines that segment and never moves a corner node.
+/// Returns at least four even nodes, or an error.
 fn sample_loop(
     input: &[[f64; 2]],
     h: f64,
@@ -483,6 +583,9 @@ fn sample_loop(
     Ok(out)
 }
 
+/// Sample the outer loop counter-clockwise and every hole clockwise, append
+/// their points as fixed nodes and return the initial one-loop-per-cycle
+/// [`Paving`] state.
 fn sample(domain: &Domain, h: f64, options: &Options) -> Result<Paving, String> {
     let mut paving = Paving {
         points: Vec::new(),
@@ -514,18 +617,33 @@ fn sample(domain: &Domain, h: f64, options: &Options) -> Result<Paving, String> 
 // one row
 // --------------------------------------------------------------------------- //
 
+/// One validated row, ready to commit.
+///
+/// [`next_row`] and [`seam_row`] build a complete `Row` without mutating the
+/// mesh; [`commit_row`] is the only place that appends. A candidate that fails
+/// any check is dropped whole, so the partial mesh is always conforming.
 struct Row {
-    /// Node ids of the front left after the row (all new ids for a plain row;
-    /// the merged loop for a seam row).
+    /// Node ids of the front left after the row: all fresh ids for a plain row,
+    /// or the spliced loop for a seam row. Empty when a seam consumed both
+    /// loops (`commit_row` then removes both).
     new_loop: Vec<usize>,
-    /// Points to append, in the order their predicted ids were assigned.
+
+    /// Coordinates to append, in the order their predicted ids were assigned.
+    /// A seam row appends only its unseamed nodes; merged nodes keep the met
+    /// front's ids and are not duplicated.
     new_points: Vec<[f64; 2]>,
+
+    /// New quads as counter-clockwise node ids. They may reference old front
+    /// ids, predicted fresh ids, and (for a seam) ids of the met front.
     quads: Vec<[usize; 4]>,
+
     /// Set when the row was seamed onto loop `other`: that loop disappears and
     /// its unseamed part is merged into `new_loop`.
     merge_other: Option<usize>,
 }
 
+/// Perimeter of live loop `li` in millimetres, or `+inf` for a stale index so
+/// the smallest-perimeter sort stays a total order.
 fn front_length(paving: &Paving, li: usize) -> f64 {
     let Some(loop_ids) = paving.loops.get(li) else {
         return f64::INFINITY;
@@ -546,6 +664,12 @@ fn front_length(paving: &Paving, li: usize) -> f64 {
 /// interior bisector at `h / sin(alpha / 2)`: the paper's row-side projection
 /// with a constant size, and the row-corner projection when the angle is a
 /// corner.
+///
+/// Returns `None` when an adjacent edge is degenerate or the interior angle
+/// `alpha` is so acute that the miter would explode (`sin(alpha/2) < 0.2`, i.e.
+/// `alpha < ~23 degrees`); the caller then refuses the whole row. The distance
+/// is capped at `3 h` so a near-cusp cannot place a node far outside the domain.
+/// `round_corner` adds `0.25 h` at a convex turn (see the comment at `extra`).
 fn project(
     prev: [f64; 2],
     cur: [f64; 2],
@@ -593,6 +717,9 @@ fn project(
     ])
 }
 
+/// True only for a strict interior crossing of two open segments. Collinear or
+/// endpoint-touching segments return `false`: adjacent edges of a simple loop
+/// share an endpoint and must not be reported as a self-intersection.
 fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
     let cross = |p: [f64; 2], q: [f64; 2], r: [f64; 2]| {
         (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
@@ -605,6 +732,9 @@ fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
         && ((d3 > 1e-12 && d4 < -1e-12) || (d3 < -1e-12 && d4 > 1e-12))
 }
 
+/// True when the closed polyline `ids` has no strict self-crossing. The O(n^2)
+/// pair scan skips adjacent edges (including the wrap-around pair), which is
+/// exact for a polygon with distinct vertices.
 fn loop_is_simple(points: &[Node], ids: &[usize]) -> bool {
     let n = ids.len();
     if n < 3 {
@@ -627,6 +757,8 @@ fn loop_is_simple(points: &[Node], ids: &[usize]) -> bool {
     true
 }
 
+/// Euclidean distance from `p` to the closed segment `a-b` (the projection is
+/// clamped to the segment). Millimetres.
 fn point_segment_distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     let ab = [b[0] - a[0], b[1] - a[1]];
     let length2 = ab[0] * ab[0] + ab[1] * ab[1];
@@ -638,6 +770,8 @@ fn point_segment_distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt()
 }
 
+/// Shortest distance from `p` to the polyline of live loop `li`, in
+/// millimetres; `+inf` for a stale index.
 fn loop_distance(paving: &Paving, p: [f64; 2], li: usize) -> f64 {
     let Some(ids) = paving.loops.get(li) else {
         return f64::INFINITY;
@@ -651,6 +785,12 @@ fn loop_distance(paving: &Paving, p: [f64; 2], li: usize) -> f64 {
     best
 }
 
+/// Row-acceptance gate for one candidate quad: every corner scaled Jacobian must
+/// be finite and above 0.02, and every corner angle must lie strictly between 5
+/// and 175 degrees. These floors are deliberately looser than the final gate
+/// (SJ 0.2 / 30 degrees) but reject anything the cleaner cannot recover; a row
+/// is refused whole rather than committing a quad that would stay a defect,
+/// since the cleanup never deletes a cell.
 fn quad_ok(points: &[Node], quad: [usize; 4]) -> bool {
     let cell = Cell::quad4(quad);
     let sj = quality::scaled_jacobian(&cell, points);
@@ -663,12 +803,24 @@ fn quad_ok(points: &[Node], quad: [usize; 4]) -> bool {
         .all(|&a| a.is_finite() && a > 5.0 && a < 175.0)
 }
 
+/// Build, but do not commit, the next row of loop `li`.
+///
+/// Every front node is projected once ([`project`] with corner rounding). The
+/// candidate is rejected whole when any projection is invalid, leaves the
+/// domain or comes within `0.05 h` of its boundary, produces an edge shorter
+/// than `options.min_edge_fraction * h`, makes the new front non-simple, or
+/// makes a quad fail [`quad_ok`]. A front closer than `options.front_gap * h`
+/// to another front is offered to [`seam_row`] (§2.8) and otherwise refused.
+/// Returns a fully validated [`Row`]; `li` keeps its old loop until commit.
+/// A loop shorter than six nodes is left to the small-front closure.
 fn next_row(paving: &Paving, li: usize, domain: &Domain, h: f64, options: &Options) -> Option<Row> {
     let old = paving.loops.get(li)?.clone();
     let n = old.len();
     if n < 6 {
         return None;
     }
+    // One projection per front node; a single rejected projection refuses the
+    // whole row, so a row can never be committed half-built.
     let mut new_points = Vec::with_capacity(n);
     for i in 0..n {
         let prev = paving.coord(old[(i + n - 1) % n]);
@@ -755,17 +907,28 @@ fn next_row(paving: &Paving, li: usize, domain: &Domain, h: f64, options: &Optio
 
 /// A run of row nodes that lines up with a run of nodes of the front it meets.
 struct SeamRun {
-    /// First row node of the run.
+    /// Index in the projected row (`0..n`) of the first node of the run.
     start: usize,
-    /// Number of row nodes in the run (and edges, one fewer).
+
+    /// Number of row nodes in the run; at least 2 (one node is not an edge), at
+    /// most `min(n, m)`, and never a whole loop unless it is a whole loop on
+    /// both sides (otherwise the unseamed remainder would not close).
     len: usize,
-    /// Index in the other loop of the node matched to `start`.
+
+    /// Index in the met loop of the node matched to `start`. The run walks the
+    /// met loop in reverse, one node per row node.
     other_start: usize,
-    /// Worst node-to-node distance of the run, in sizes.
+
+    /// Worst node-to-node distance of the run, in multiples of `h`; at most
+    /// `SEAM_REACH`. Used to prefer the tightest of two equally long runs.
     worst: f64,
 }
 
 /// Seam the projected row `new_points` (from loop `li`) onto loop `other`.
+///
+/// A run is accepted only when every row node in it is within `SEAM_REACH * h`
+/// of its matched node. The measured 4 mm plate-hole is the case the seam was
+/// added for: it raises that part's row share from 39 % to 57 %.
 ///
 /// §2.8 performs a seam by combining two nodes into one. Here a *run* of
 /// consecutive row nodes is matched to consecutive nodes of the met front (in
@@ -791,7 +954,8 @@ fn seam_row(
         return None;
     }
     let reach = SEAM_REACH * h;
-    // Nearest node of the met front for every row node.
+    // Nearest node of the met front for every row node (O(n m); the fronts here
+    // are small). Only runs whose nodes are all within `reach` can seam.
     let mut nearest: Vec<(usize, f64)> = Vec::with_capacity(n);
     for p in new_points {
         let mut best = (usize::MAX, f64::INFINITY);
@@ -969,6 +1133,8 @@ fn seam_is_sound(paving: &Paving, points: &[Node], quads: &[[usize; 4]]) -> bool
     true
 }
 
+/// Axis-aligned bounding box of a quad as `[min_x, min_y, max_x, max_y]`, in
+/// millimetres. Used only to skip the separating-axis test for distant pairs.
 fn quad_bbox(points: &[Node], q: [usize; 4]) -> [f64; 4] {
     let mut b = [
         f64::INFINITY,
@@ -1024,6 +1190,11 @@ fn quads_overlap(points: &[Node], a: [usize; 4], b: [usize; 4]) -> bool {
     true
 }
 
+/// Commit a row that [`next_row`] or [`seam_row`] has already validated:
+/// append its fresh points and quads, update the [`Stats`] counters and
+/// replace (or splice) the live loop. A seam removes loop `other`; when the row
+/// consumed both loops (`new_loop` empty) both are removed. Every index in
+/// `row.quads` is valid before this call, so the mesh stays conforming.
 fn commit_row(paving: &mut Paving, li: usize, row: Row) {
     for p in row.new_points {
         paving.push_point(p, false);
@@ -1061,6 +1232,11 @@ fn commit_row(paving: &mut Paving, li: usize, row: Row) {
 // small-front closure (§2.5)
 // --------------------------------------------------------------------------- //
 
+/// §2.5 small-front closure. A four-node front becomes one quad (winding
+/// normalised, then checked by [`quad_ok`]); a six-node front becomes the best
+/// valid two-quad fan pairing ([`best_six_closure`]). Both count as row quads
+/// because they are the paper's paving closure, not the residual core. Other
+/// sizes, or a template that fails its check, are left for `fill_residual`.
 fn close_small_fronts(paving: &mut Paving) {
     let mut li = 0;
     while li < paving.loops.len() {
@@ -1090,6 +1266,8 @@ fn close_small_fronts(paving: &mut Paving) {
     }
 }
 
+/// Signed shoelace area of a quad, positive when counter-clockwise. Millimetres
+/// squared.
 fn signed_quad_area(points: &[Node], q: [usize; 4]) -> f64 {
     let mut sum = 0.0;
     for i in 0..4 {
@@ -1106,6 +1284,8 @@ fn best_six_closure(points: &[Node], ids: &[usize]) -> Option<([usize; 4], [usiz
     if ids.len() != 6 {
         return None;
     }
+    // The three shifts cover the three ways to pair the six fan triangles; the
+    // shift decides which two triangles are merged into the first quad.
     let mut best: Option<([usize; 4], [usize; 4], f64)> = None;
     for shift in 0..3 {
         let v: Vec<usize> = (0..6).map(|i| ids[(i + shift) % 6]).collect();
@@ -1138,6 +1318,8 @@ fn best_six_closure(points: &[Node], ids: &[usize]) -> Option<([usize; 4], [usiz
 // residual closure (deviation from §2.10)
 // --------------------------------------------------------------------------- //
 
+/// Even-odd ray-casting point-in-polygon test over every live loop: true when
+/// `p` lies in the material (inside the outer loop and outside every hole).
 fn point_in_loops(paving: &Paving, p: [f64; 2]) -> bool {
     let mut inside = false;
     for ids in &paving.loops {
@@ -1156,6 +1338,9 @@ fn point_in_loops(paving: &Paving, p: [f64; 2]) -> bool {
     inside
 }
 
+/// Shortest distance from `p` to the union of all live front polylines, in
+/// millimetres. Used to keep residual seed points and split points clear of the
+/// fronts.
 fn distance_to_fronts(paving: &Paving, p: [f64; 2]) -> f64 {
     let mut best = f64::INFINITY;
     for ids in &paving.loops {
@@ -1169,6 +1354,18 @@ fn distance_to_fronts(paving: &Paving, p: [f64; 2]) -> f64 {
     best
 }
 
+/// Close what paving left, by the documented deviation from the paper's
+/// §2.10 perimeter connection: seed a jittered square lattice inside the live
+/// loops, constrain the front edges, and match triangles into quads.
+///
+/// The grid is at `h` with `0.55 h` clearance from every front and node, so a
+/// thin residual simply gets no interior point and is triangulated from its two
+/// boundary chains. [`match_residual`] is tried up to five times; each failure
+/// splits the longest interior edge of every unpaired triangle
+/// ([`add_edge_points`]). If matching still fails and exactly one simply
+/// connected front remains, [`fan_fill`] closes it unconditionally; otherwise
+/// the run returns an error. This fallback, not further paving rows, is why the
+/// route finishes on every corpus part.
 fn fill_residual(paving: &mut Paving, domain: &Domain, h: f64) -> Result<(), String> {
     // Interior grid points, at the size, away from the front polylines. A thin
     // residual receives none and is triangulated from its two boundary chains.
@@ -1421,6 +1618,12 @@ fn fan_fill(paving: &mut Paving, domain: &Domain) -> Result<(), String> {
     Ok(())
 }
 
+/// Constrained Delaunay triangulation of the residual region: every live front
+/// node and front edge, plus the interior `extra` points. Faces whose centroid
+/// is outside the live loops are dropped (a hole is a constraint, so its inside
+/// is triangulated by `spade` too). Returns counter-clockwise triangles with
+/// the paving node ids, or an error when a point or constraint cannot be
+/// inserted.
 fn triangulate_residual(paving: &Paving, extra: &[usize]) -> Result<Vec<[usize; 3]>, String> {
     let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
     let mut present: HashMap<(u64, u64), ()> = HashMap::new();
@@ -1497,6 +1700,10 @@ fn triangulate_residual(paving: &Paving, extra: &[usize]) -> Result<Vec<[usize; 
     Ok(tris)
 }
 
+/// True when every live front edge appears exactly once among the residual
+/// triangles. A constrained boundary edge belongs to one face; zero or two
+/// occurrences means the CDT lost or duplicated a front edge and the pairing
+/// would leave a crack.
 fn front_edges_covered(paving: &Paving, tris: &[[usize; 3]]) -> bool {
     let mut counts: HashMap<(usize, usize), usize> = HashMap::new();
     for t in tris {
@@ -1638,6 +1845,8 @@ fn valence_cleanup(mesh: &mut Mesh, max_rounds: usize) {
     }
 }
 
+/// Four node ids in counter-clockwise order, or `None` for a cell that is not a
+/// quad or has (near) zero area. Reversing does not change the cycle.
 fn quad_ccw(points: &[Node], nodes: &[usize]) -> Option<[usize; 4]> {
     if nodes.len() != 4 {
         return None;
@@ -1674,6 +1883,10 @@ fn shared_hexagon(
     None
 }
 
+/// Cleanup gate for a swapped quad: positive area, every corner scaled
+/// Jacobian at least 0.3 and every angle in `35..=160` degrees. This is
+/// stricter than the final 0.2 / 30 degree gate because the following node
+/// perturb may still shave the margin.
 fn quad_gate_ok(points: &[Node], q: [usize; 4]) -> bool {
     if signed_quad_area(points, q) <= 1e-12 {
         return false;
@@ -1689,6 +1902,10 @@ fn quad_gate_ok(points: &[Node], q: [usize; 4]) -> bool {
         .all(|&a| a.is_finite() && (35.0..=160.0).contains(&a))
 }
 
+/// Interior irregularity `sum |valence - 4|` over the four free corners
+/// (`u`, `v`, `g1`, `g2`), with boundary nodes excluded. With `new` the swap
+/// deltas are applied: `u` and `v` lose one incident quad, `g1` and `g2` gain
+/// one. Used as the exact gain test for a candidate edge swap.
 fn valence_cost(
     valence: &[i32],
     boundary: &[bool],

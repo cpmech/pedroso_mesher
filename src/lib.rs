@@ -1,9 +1,25 @@
-//! `pedroso_mesher` — unstructured quad and hex meshing for finite element
-//! analysis, MIT licensed.
-//!
-//! This is **P0**: the data model, the quality contract and the benchmark
-//! corpus. The meshing algorithms of P1 onward are built on these, and every
-//! one of them is judged by [`quality::report`].
+//! `pedroso_mesher` — clean-room, pure-Rust, MIT-licensed unstructured quad and
+//! hex mesh generation for finite element analysis. The module map is: `mesh`
+//! is the data model (`Mesh`, `Cell`, `Node`, `Topology`); `two_d` is the
+//! planar substrate and the default quad-dominant `mesh_2d`; `quad` is the
+//! gate-checked all-quad pipeline (Q-Morph + Sun closure); `config` is the
+//! shipped API that selects any of the nine routes and applies the shared
+//! smoother; `qmorph`, `parity`, `twostage`, `sun`, `recovery`, `grid`, `smooth`
+//! and `quality` are the shared stages; `stats`, `verify` and `bench` are the
+//! measurements; `draw`, `io` and `msh` are the I/O and diagnostics;
+//! `alt_paving`, `alt_bipartite`, `alt_quadtree`, `alt_decompose`, `alt_hybrid`,
+//! `alt_crossfield`, `alt_untangle` and `alt_l1` are the alternative routes.
+//! The rules are: every algorithm is implemented from public journal papers and
+//! university theses (the clean-room policy in `AGENTS.md` and the corpus
+//! `INDEX.md`); no code is ported or copied, BSD code needs prior authorization,
+//! non-MIT code is never read, nothing is driven from a commercial product, and
+//! the crate must build for `wasm32-unknown-unknown`. The Cargo lints forbid
+//! `unsafe`, `unwrap`, `expect`, `panic!`, `todo!` and `unimplemented!` in
+//! non-test code, so failures are `Result` values through the crate's error
+//! types. The acceptance contract is [`quality::report`] and [`verify::Gate`]
+//! (all-quad, scaled Jacobian >= 0.2, corner angle >= 30 degrees, watertight,
+//! no overlapping cells); a route that cannot meet it reports the measured
+//! failure instead of shipping the mesh.
 //!
 //! ```
 //! use pedroso_mesher::{Cell, Mesh, quality};
@@ -62,4 +78,24 @@ pub mod alt_crossfield;
 
 pub mod config;
 
+pub mod simons_godf;
+
+pub mod simons_qgp;
+
+pub mod simons_sizefamily;
+
 pub mod simons_channel;
+
+pub mod sized;
+
+pub mod simons_smooth;
+
+pub mod simons_regions;
+
+pub mod simons_features;
+
+pub mod simons_limit;
+
+pub mod simons_pipeline;
+
+pub mod simons_graded;
