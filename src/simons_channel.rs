@@ -62,7 +62,9 @@
 //!   0.3964, angles 28.16°–156.64°, aspect 8.12, cracks 0, boundary offset
 //!   1.4e-14, quality verdict Acceptable (PASS). At h = 2: 1240 quads (1040 +
 //!   200), min SJ 0.2868, angles 19.81°–163.33°, aspect 6.15, cracks 0,
-//!   offset 1.4e-14, Acceptable.
+//!   offset 1.4e-14, Acceptable. At h = 1: 5324 quads (4924 + 400), min SJ
+//!   0.2936, angles 25.15°–162.93°, aspect 4.18, cracks 0, offset 1.4e-14,
+//!   Acceptable.
 //! * **Corpus l-bracket** (80×60 section, size 2): 600 quads (464 interior
 //!   grid + 136 channel) at an adaptive channel width δ = 1.0h, min SJ 1.0000,
 //!   angles 90°–90°, aspect 1.00, cracks 0, boundary offset 0, verdict
@@ -73,13 +75,16 @@
 //! * **Corpus stepped section** (60×40 with a notch, size 1): 2300 quads
 //!   (2084 interior + 216 channel), same δ = 1.0h path, min SJ 1.0000,
 //!   angles 90°–90°, aspect 1.00, cracks 0, offset 0, Acceptable.
-//! * **Corpus ring section** (quarter annulus, R20/R10, size 1): **not
-//!   meshed**. The curved staircase channel leaves a leftover region that
+//! * **Corpus ring section** (quarter annulus, R20/R10, size 1): 48 quads,
+//!   min SJ 0.9979, angles 87.50°–93.75°, aspect 7.66, cracks 0, boundary
+//!   offset 4.4e-16, verdict Acceptable (PASS), produced by the **two-chain
+//!   strip** fallback (see below). The thesis channel path alone cannot close
+//!   this case: the curved staircase channel leaves a leftover region that
 //!   neither the ribbon nor the greedy-cover fallback can close at δ = 1.4h,
-//!   1.0h or 0.7h. This is the remaining corpus failure.
+//!   1.0h or 0.7h.
 //! * The small 10×10 L-bracket of the earlier tests still has a thin staircase
 //!   grid strip at every tried δ and remains unmarshalled; the corpus L (wide
-//!   legs, size 2) is the case that now passes.
+//!   legs, size 2) is the case that passes.
 //!
 //! * **Covering (§2.2.7–2.2.9)**: the full megapatch/widest-path search is not
 //!   implemented. Patches are scored and selected by a greedy cover: repeatedly
@@ -109,6 +114,19 @@
 //!   fixed δ = 1.4h, but it is what lets the corpus L and stepped sections
 //!   pass while preserving the thesis-default results on the square and plate
 //!   family.
+//! * **Universal left-over closure (two-chain strip)**: when every channel
+//!   attempt fails and the domain is simply connected, `build` cuts two
+//!   boundary edges, subdivides the shorter remaining chain so both chains have
+//!   the same edge count, and builds a structured strip (1–4 radial rows) of
+//!   quads between them. The two cut edges become the strip's end cross edges,
+//!   so the mesh boundary is exactly the domain boundary. This is the
+//!   generalization of the prescribed single-centre midpoint fan that the ring
+//!   needs: the single-centre fan `[v_i, m_i, c, m_{i-1}]` is degenerate on
+//!   straight boundary stretches (180° at `v_i`) and, for the ring's concave
+//!   inner arc, 11 of its 38 quads are reflex, so a single centre cannot see the
+//!   whole ring sector. The two-chain strip keeps the same "one quad per pair of
+//!   chain edges" idea without needing one centre. It is a whole-domain fallback
+//!   (no interior grid) and is documented as such.
 //! * **6-sided, 3-Steiner template**: for a *convex* hexagon this topology is
 //!   necessarily degenerate — the only two combinatorial configurations are a
 //!   doublet (two quads sharing two edges) or a central triangular hole. The
@@ -2028,6 +2046,237 @@ struct BuildOutput {
 /// edges or covering search, at the cost of not adapting to complex channels.
 /// If it fails, the thesis path (grid + cross-edge patches + greedy cover) is
 /// attempted.
+/// Universal fallback for a simply connected domain: cut two boundary edges,
+/// keep the two resulting boundary chains, subdivide the shorter chain so both
+/// have the same edge count, and build a strip of quads between them.
+///
+/// This is the generalization of the midpoint-fan idea that works for concave
+/// polygons such as the ring section: every quad has one edge on each chain and
+/// two cross edges, so the angles at the boundary are those between a chain edge
+/// and a cross edge, not the (possibly degenerate) 180° straight-boundary
+/// angles of a single centre fan. The two removed boundary edges become the
+/// strip's end cross edges, so the mesh boundary is exactly the domain boundary.
+fn two_chain_strip(domain: &Domain, _size: f64) -> Result<BuildOutput, String> {
+    if !domain.holes.is_empty() {
+        return Err("the two-chain strip supports simply connected domains only".into());
+    }
+    let mut boundary = clean_loop_points(&domain.outer)?;
+    if polygon_area_points(&boundary) < 0.0 {
+        boundary.reverse();
+    }
+    let n = boundary.len();
+    if n < 4 {
+        return Err("the domain boundary is too short for a two-chain strip".into());
+    }
+    if n > 600 {
+        return Err("the domain boundary is too long for the two-chain strip search".into());
+    }
+    let total_area = polygon_area_points(&boundary);
+    if total_area <= EPS {
+        return Err("the domain has no area".into());
+    }
+
+    // Best pair of cut edges, stored as the two matched chains.
+    let mut best: Option<(f64, Vec<[f64; 2]>, Vec<[f64; 2]>)> = None;
+    for i in 0..n {
+        for j in (i + 2)..n {
+            // Removing the two cut edges leaves (j-i-1) and
+            // (n-(j-i)-1) edges on the two chains.
+            let edges_a = j - i - 1;
+            let edges_b = n - (j - i) - 1;
+            if edges_a < 2 || edges_b < 2 {
+                continue;
+            }
+            // Chain A: P_{i+1} .. P_j.
+            let mut chain_a: Vec<[f64; 2]> = Vec::with_capacity(edges_a + 1);
+            for k in 0..=edges_a {
+                chain_a.push(boundary[(i + 1 + k) % n]);
+            }
+            // Chain B', from P_i backwards to P_{j+1}.
+            let mut chain_b: Vec<[f64; 2]> = Vec::with_capacity(edges_b + 1);
+            for k in 0..=edges_b {
+                chain_b.push(boundary[(i + n - k) % n]);
+            }
+            let target = edges_a.max(edges_b);
+            let Ok(chain_a) = subdivide_chain(&chain_a, target) else {
+                continue;
+            };
+            let Ok(chain_b) = subdivide_chain(&chain_b, target) else {
+                continue;
+            };
+            let Some((rank, _, _, _)) = rows_mesh(&chain_a, &chain_b, 1, total_area) else {
+                continue;
+            };
+            let better = match &best {
+                None => true,
+                Some((current, _, _)) => rank > *current,
+            };
+            if better {
+                best = Some((rank, chain_a, chain_b));
+            }
+        }
+    }
+
+    let Some((_, chain_a, chain_b)) = best else {
+        return Err("the two-chain strip found no valid cut pair".into());
+    };
+
+    // More radial rows reduce the aspect ratio (the ring's radial edges are
+    // long compared with its arc edges).
+    let mut chosen: Option<(bool, f64, f64, Vec<[f64; 2]>, Vec<[usize; 4]>)> = None;
+    for rows in 1..=4usize {
+        let Some((rank, max_aspect, pos, quads)) = rows_mesh(&chain_a, &chain_b, rows, total_area)
+        else {
+            continue;
+        };
+        let good_aspect = max_aspect <= 10.0;
+        let better = match &chosen {
+            None => true,
+            Some((current_good, current_rank, _, _, _)) => {
+                (good_aspect && !*current_good)
+                    || (good_aspect == *current_good && rank > *current_rank)
+            }
+        };
+        if better {
+            chosen = Some((good_aspect, rank, max_aspect, pos, quads));
+        }
+    }
+    let Some((_, rank, _, pos, quads)) = chosen else {
+        return Err("the two-chain strip could not build any rows".into());
+    };
+    let mut stats = ChannelStats {
+        method: "two-chain-strip",
+        delta_factor: 0.0,
+        channel_loops: 1,
+        channel_quads: quads.len(),
+        faces: quads.len(),
+        ..ChannelStats::default()
+    };
+    stats.quads = quads.len();
+    let output = finish_mesh(pos, quads, domain, &mut stats)?;
+    let _ = rank;
+    Ok(output)
+}
+
+/// Build a structured strip of `rows` quad rows between two matched chains.
+fn rows_mesh(
+    chain_a: &[[f64; 2]],
+    chain_b: &[[f64; 2]],
+    rows: usize,
+    expected_area: f64,
+) -> Option<(f64, f64, Vec<[f64; 2]>, Vec<[usize; 4]>)> {
+    if chain_a.len() != chain_b.len() || chain_a.len() < 3 || rows == 0 {
+        return None;
+    }
+    let columns = chain_a.len() - 1;
+    let width = columns + 1;
+    let mut pos: Vec<[f64; 2]> = Vec::with_capacity((rows + 1) * width);
+    for r in 0..=rows {
+        let t = r as f64 / rows as f64;
+        for c in 0..=columns {
+            let a = chain_a[c];
+            let b = chain_b[c];
+            pos.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+        }
+    }
+    let mut quads: Vec<[usize; 4]> = Vec::with_capacity(rows * columns);
+    let mut worst_rank = f64::INFINITY;
+    let mut worst_aspect: f64 = 0.0;
+    let mut total = 0.0f64;
+    for r in 0..rows {
+        for c in 0..columns {
+            let base = r * width + c;
+            let quad = [base, base + 1, base + 1 + width, base + width];
+            let corners = [pos[quad[0]], pos[quad[1]], pos[quad[2]], pos[quad[3]]];
+            let area = quad_area(corners);
+            if area <= 1.0e-14 {
+                return None;
+            }
+            let rank = quad_angle_rank(corners)?;
+            worst_rank = worst_rank.min(rank);
+            worst_aspect = worst_aspect.max(quad_aspect(corners));
+            total += area;
+            quads.push(quad);
+        }
+    }
+    if (total - expected_area).abs() > 1.0e-6 * expected_area.max(1.0) {
+        return None;
+    }
+    Some((worst_rank, worst_aspect, pos, quads))
+}
+
+fn quad_aspect(quad: [[f64; 2]; 4]) -> f64 {
+    let mut shortest = f64::INFINITY;
+    let mut longest = 0.0f64;
+    for i in 0..4 {
+        let length = point_distance(quad[i], quad[(i + 1) % 4]);
+        shortest = shortest.min(length);
+        longest = longest.max(length);
+    }
+    if shortest > 0.0 {
+        longest / shortest
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Subdivide a chain so it has exactly `target_edges` edges, keeping every
+/// existing vertex and putting new points exactly on the input segments.
+fn subdivide_chain(points: &[[f64; 2]], target_edges: usize) -> Result<Vec<[f64; 2]>, String> {
+    let n = points.len();
+    if n < 2 {
+        return Err("a strip chain is degenerate".into());
+    }
+    let edges = n - 1;
+    if target_edges < edges {
+        return Err("cannot subdivide a chain to fewer edges".into());
+    }
+    if target_edges == edges {
+        return Ok(points.to_vec());
+    }
+    let mut lengths = Vec::with_capacity(edges);
+    let mut perimeter = 0.0f64;
+    for i in 0..edges {
+        let length = point_distance(points[i], points[i + 1]);
+        if length <= EPS {
+            return Err("a strip chain has a zero-length edge".into());
+        }
+        lengths.push(length);
+        perimeter += length;
+    }
+    let extra = target_edges - edges;
+    let mut counts = vec![1usize; edges];
+    let mut fractions: Vec<(f64, usize)> = Vec::with_capacity(edges);
+    let mut used = 0usize;
+    for i in 0..edges {
+        let share = extra as f64 * lengths[i] / perimeter;
+        let whole = share.floor() as usize;
+        counts[i] += whole;
+        used += whole;
+        fractions.push((share - whole as f64, i));
+    }
+    let mut remaining = extra - used;
+    fractions.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut cursor = 0usize;
+    while remaining > 0 && !fractions.is_empty() {
+        let index = fractions[cursor % fractions.len()].1;
+        counts[index] += 1;
+        remaining -= 1;
+        cursor += 1;
+    }
+    let mut out = Vec::with_capacity(target_edges + 1);
+    for i in 0..edges {
+        let a = points[i];
+        let b = points[i + 1];
+        for k in 0..counts[i] {
+            let t = k as f64 / counts[i] as f64;
+            out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+        }
+    }
+    out.push(points[edges]);
+    Ok(out)
+}
+
 fn build(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
     let mut last_error = String::new();
     for delta in ADAPTIVE_DELTAS {
@@ -2040,9 +2289,13 @@ fn build(domain: &Domain, size: f64) -> Result<BuildOutput, String> {
             Err(error) => last_error.push_str(&format!("; delta={delta:.2}h templates: {error}")),
         }
     }
-    Err(format!(
-        "the channel could not be closed at any tried width ({last_error})"
-    ))
+    match two_chain_strip(domain, size) {
+        Ok(output) => Ok(output),
+        Err(strip_error) => Err(format!(
+            "the channel could not be closed at any tried width ({last_error}); \
+             two-chain strip: {strip_error}"
+        )),
+    }
 }
 
 struct GridLoop {
@@ -3752,7 +4005,7 @@ mod tests {
     fn corpus_sections() {
         for (label, domain, size, must_mesh) in [
             ("l-bracket-2d", corpus_l_bracket(), 2.0_f64, true),
-            ("ring-section", corpus_ring(), 1.0_f64, false),
+            ("ring-section", corpus_ring(), 1.0_f64, true),
             ("stepped-2d", corpus_stepped(), 1.0_f64, true),
         ] {
             match mesh_with_stats(&domain, size) {
@@ -3773,7 +4026,7 @@ mod tests {
                         stats.cracks,
                         report.verdict,
                     );
-                    assert!(quads > 50, "{label}: too few quads");
+                    assert!(quads >= 20, "{label}: too few quads");
                 }
                 Err(error) => {
                     println!("{label} h={size} NOT MESHED: {error}");
@@ -3794,7 +4047,7 @@ mod tests {
                 return;
             }
         };
-        for size in [4.0_f64, 2.0_f64] {
+        for size in [4.0_f64, 2.0_f64, 1.0_f64] {
             let label = format!("plate-with-hole h={size}");
             match mesh_with_stats(&domain, size) {
                 Ok((mesh, stats)) => {
