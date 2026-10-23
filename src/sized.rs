@@ -80,6 +80,40 @@ mod tests {
     }
 
     #[test]
+    fn the_ring_and_l_bracket_pass_the_gate() {
+        let arc = |r: f64, a0: f64, a1: f64, n: usize| -> Vec<[f64; 2]> {
+            (0..=n)
+                .map(|i| {
+                    let a = a0 + (a1 - a0) * i as f64 / n as f64;
+                    [r * a.cos(), r * a.sin()]
+                })
+                .collect()
+        };
+        let mut pts = arc(20.0, 0.0, std::f64::consts::FRAC_PI_2, 24);
+        pts.extend(arc(10.0, std::f64::consts::FRAC_PI_2, 0.0, 12));
+        let ring = Domain::new(pts, vec![]).unwrap();
+        let ring_mesh = mesh(&ring, &Sizing::uniform(1.0).unwrap()).unwrap();
+        let stats = crate::stats::MeshStatistics::of(&ring, &ring_mesh);
+        assert_eq!(stats.triangles, 0);
+        assert!(stats.passes, "{}", stats.line());
+        let lb = Domain::new(
+            vec![
+                [0.0, 0.0],
+                [80.0, 0.0],
+                [80.0, 20.0],
+                [20.0, 20.0],
+                [20.0, 60.0],
+                [0.0, 60.0],
+            ],
+            vec![],
+        )
+        .unwrap();
+        let lb_mesh = mesh(&lb, &Sizing::uniform(2.0).unwrap()).unwrap();
+        let stats = crate::stats::MeshStatistics::of(&lb, &lb_mesh);
+        assert!(stats.passes, "{}", stats.line());
+    }
+
+    #[test]
     fn the_options_are_serde_compatible() {
         let text = serde_json::to_string(&Options::default()).unwrap();
         let _back: Options = serde_json::from_str(&text).unwrap();

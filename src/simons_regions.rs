@@ -3349,6 +3349,7 @@ pub fn demo() -> Result<DemoNumbers, String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -3658,6 +3659,16 @@ mod tests {
         let mesh = regions.mesh()?;
         assert!(!mesh.cells.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn stitched_rectangle_is_crack_free() {
+        let numbers = stitch_demo().unwrap();
+        let c = &numbers.rectangle;
+        assert_eq!(c.cracks, 0, "{}", c.notes.join("; "));
+        assert!(c.coverage > 0.999, "coverage {}", c.coverage);
+        assert!(c.min_scaled_jacobian > 0.2);
+        assert!(c.channel_quads > 0);
     }
 
     #[test]
