@@ -2385,16 +2385,24 @@ impl<'a> Builder<'a> {
                         }
                     };
                 }
-                let free_side = (0..3).find(|&side| {
-                    !tri_sides[side].is_empty()
-                        && tri_sides[side].iter().all(|&edge| {
+                // The free side is the one with the most boundary edges: it may
+                // be a sub-chain (a boundary edge plus a separatrix), in which
+                // case the separatrix part is not shared with any kept tile and
+                // the fan fills it too.
+                let boundary_edges = |side: &Vec<usize>| -> usize {
+                    side.iter()
+                        .filter(|&&edge| {
                             self.graph
                                 .edges
                                 .get(edge)
                                 .map(|found| found.kind == EdgeKind::Boundary)
                                 .unwrap_or(false)
                         })
-                });
+                        .count()
+                };
+                let free_side = (0..3)
+                    .filter(|&side| boundary_edges(&tri_sides[side]) > 0)
+                    .max_by_key(|&side| boundary_edges(&tri_sides[side]));
                 let usable = convex && !tri_failed && tri_lines.iter().all(|line| line.len() >= 2);
                 if let (true, Some(free_side)) = (usable, free_side) {
                     let mut sides: [Vec<usize>; 4] = Default::default();
@@ -2595,12 +2603,16 @@ pub fn build(
                 "DEBUG triangular tile {index}: seps {left} vs {right} ({} sides)",
                 tile.sides[1].len() + tile.sides[2].len()
             );
-            // The three-kite fan needs an even side of at least four segments.
-            if left == 0 || left != right || !left.is_multiple_of(2) || left < 4 {
+            // The three-kite fan needs a common even side count. When the two
+            // seps were solved to different counts, use the largest even count
+            // that fits both; the odd sep then keeps one segment unmeshed (it
+            // borders a rejected face, not a kept tile).
+            let common = left.min(right) - (left.min(right) % 2);
+            if common < 2 {
                 collapsed += 1;
                 continue;
             }
-            tile.counts = [left, left, left, left];
+            tile.counts = [common, common, common, common];
             kept.push(tile);
             continue;
         }
@@ -2955,8 +2967,8 @@ pub fn triangle_fan_quads(
     base: &[[f64; 2]],
     side_segments: usize,
 ) -> Result<(Vec<[[f64; 2]; 4]>, usize), String> {
-    if !side_segments.is_multiple_of(2) || side_segments < 4 {
-        return Err("triangle fan: an even side with at least four segments".to_string());
+    if !side_segments.is_multiple_of(2) || side_segments < 2 {
+        return Err("triangle fan: an even side with at least two segments".to_string());
     }
     let half = side_segments / 2;
     let base_nodes = resample_open(base, side_segments);
