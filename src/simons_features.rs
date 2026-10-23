@@ -1,9 +1,10 @@
 //! Interior constraints for the Simons 2024 all-quad pipeline.
 //!
 //! Thesis reference: Simons, *Size-Driven All-Quad Meshing for Geographic Data*
-//! (2024).  This module implements the **interior features** of the input PSLG
-//! described in Chapter 2, §2.2.1, and the split/stitch idea used when an
-//! interior path divides a region (Chapter 5, §5.1.8.2: the interior mesh is
+//! (2024). This module implements the **interior features** of the input PSLG
+//! of Chapter 2 §2.2.1, the planar subdivision induced by a set of through-going
+//! paths, the **channel** carve of §2.2.2 for terminating paths, and the
+//! stitching/welding of the pieces (Chapter 5 §5.1.8.2: the interior mesh is
 //! stitched to the perimeter/channel).
 //!
 //! # What the thesis says and what this file does
@@ -13,104 +14,121 @@
 //!   subregions. Both sides of any path that terminates in the interior are
 //!   included in the boundary of the region ... Interior paths that split the
 //!   region must also have an even number of edges."  This file validates that
-//!   kind of input (a [`Features`] set of open polylines) and implements the
-//!   two cases.
-//! * **Through-going feature** (both endpoints on the outer boundary).  The
-//!   outer loop is split by the feature into two loops (a planar subdivision of
-//!   one loop into two).  The feature is *sampled once* at the element size;
-//!   the sampled nodes are inserted into **both** sub-domain loops.  Each
-//!   sub-domain is meshed by an existing all-quad route and the two meshes are
-//!   welded into one.  Because the two boundary chains along the feature carry
-//!   the same coordinates, the weld makes every feature edge an interior edge
-//!   used by one quad on each side: `Mesh::topology().cracks == 0`, no
-//!   T-junction and no duplicated seam.
-//! * **Terminating feature** (one endpoint on the boundary, the other strictly
+//!   input (a [`Features`] set of open polylines), classifies every path, and
+//!   implements both cases.
+//! * **Through-going features** (both endpoints on the outer boundary).  The
+//!   outer loop is subdivided successively: for each feature, every piece
+//!   between two crossings with the current region boundaries is inserted into
+//!   the region that contains it, splitting that region's loop in two.  The
+//!   result is the planar subdivision induced by the features.  Features may
+//!   cross each other (the crossing is inserted on the fly and needs no input
+//!   vertex).  Every feature is *sampled once* at the element size and the same
+//!   sampled chain is used on both sides of every seam.  Each face is meshed by
+//!   an existing all-quad route and all faces are welded into one mesh.  Because
+//!   both sides carry the same coordinates, every feature edge is an interior
+//!   edge used by one quad per side: `topology().cracks == 0`, no T-junction
+//!   and no duplicated seam.
+//! * **Terminating features** (one endpoint on the boundary, the other strictly
 //!   inside).  The thesis turns both sides of the path into boundary and carves
-//!   a thin channel around it.  The simplest faithful version is implemented:
-//!   the stub is offset into a thin closed *slot* (two parallel polylines plus
-//!   a round tip), and the slot is submitted to the mesher as a **hole**.  The
-//!   feature is therefore represented by a boundary loop, exactly as the thesis
-//!   wants, but the slot has a finite width instead of the thesis' zero-width
-//!   slit (see [`SLOT_WIDTH_FACTOR`] and [`SLOT_GAP_FACTOR`]).
+//!   a thin channel around it.  Two representations are implemented, selected
+//!   by [`Options::terminating`]:
+//!   - [`TerminatingMode::Slot`] (default): the stub is offset into a thin
+//!     closed *slot* (two parallel polylines plus a round tip) submitted as a
+//!     **hole**, i.e. a boundary loop, exactly as the thesis wants, with a
+//!     finite width [`SLOT_WIDTH_FACTOR`] instead of the zero-width slit;
+//!   - [`TerminatingMode::Channel`]: the stub is a **carved channel**. Its two
+//!     sides (a slit of [`CHANNEL_SLIT_FACTOR`]) form the feature boundary, a
+//!     band of width [`CHANNEL_WIDTH_FACTOR`] (§2.2.2's δ = 1.4h) along it is
+//!     built as one quad per chain edge (a meshed boundary layer), and the
+//!     remainder of the region is meshed by a route and welded to the band's
+//!     outer chain.  The feature is therefore a boundary of the mesh with a
+//!     meshed band, not a hole.
+//! * **Mixed sets** are supported: the through features subdivide first, then
+//!   each terminating feature becomes a slot or channel inside the face that
+//!   contains it.
 //!
 //! # Faithful
 //!
 //! * PSLG validation of §2.2.1: each path has at least two points, lies inside
-//!   the domain, has no self-intersection, and its classification is exactly
-//!   "terminates inside" or "divides the region".
-//! * The planar loop split for a through feature: one loop becomes two loops
-//!   that share the feature polyline; the domain's holes are assigned to the
-//!   sub-domain that contains them.
-//! * The feature is sampled once at the requested size and the same sampled
-//!   coordinates are used on both sides, which is what makes the merged mesh
-//!   conforming.
-//! * The terminating feature becomes a boundary (a slot hole), so its two sides
-//!   are boundary edges of the output mesh.
+//!   the domain, has no self-intersection, and is classified exactly as
+//!   "terminates inside" or "divides the region"; two through features may
+//!   cross (a planar arrangement), while any other feature-feature contact and
+//!   any collinear overlap is rejected.
+//! * The planar loop subdivision and loop split: one loop becomes two loops
+//!   that share a feature chain; holes are assigned to the sub-domain that
+//!   contains them.
+//! * One sampling per through feature at the requested size, used unchanged on
+//!   both sides of every seam, which is what makes the welded mesh conforming.
+//! * The terminating feature becomes boundary geometry in both modes (a hole
+//!   loop in slot mode, the band's inner chain in channel mode).
+//! * The channel band follows §2.2.2: a thin band between the feature and the
+//!   interior mesh, meshed separately and joined to the interior.
 //!
 //! # Simplified or not implemented
 //!
-//! * **One through feature per call.**  A through feature plus a terminating
-//!   feature in the same call is rejected ("not supported yet"); several
-//!   through features are rejected as well.  Several **terminating** features
-//!   are supported (one slot per feature) as long as they are disjoint.
-//! * **A feature that touches neither boundary is rejected.**  Treating a
-//!   floating polyline as a stub would invent a connection to the boundary
-//!   that the input does not contain, so the module returns a clear `Err`
-//!   instead (the behaviour is fixed and documented, not silent).
-//! * **Route order and the seam.**  A through feature is first split with the
-//!   *sampled* loops and meshed by [`crate::sized`] (Chapter 2's grid +
-//!   channel).  On the square demo this route does keep the sampled seam and
-//!   returns two perfect 5x10 grids.  When a route re-samples the boundary
-//!   (the channel ribbon may re-discretise it to the inner grid loop) the two
-//!   seam chains differ or the sampled nodes are missing; that attempt is then
-//!   rejected.  Plain loops (only the feature's own vertices) are tried with
-//!   every route afterwards, and the seam-preserving routes
-//!   ([`crate::alt_decompose`], [`crate::alt_bipartite`],
-//!   [`crate::alt_untangle`], which discretise the boundary once and keep
-//!   input vertices) provide the candidates that can honour a prescribed seam
-//!   at any size.  The first attempt that (a) gives the same seam chain on
-//!   both sides, (b) welds to zero cracks and (c) passes
-//!   [`crate::verify::gate`] is returned.  The chosen route and whether the
-//!   sampled seam was kept are reported by [`demo`].
-//! * **Slot geometry.**  The slot width is one element size
-//!   ([`SLOT_WIDTH_FACTOR`] = 1.0) and the slot starts half a width inside the
-//!   boundary ([`SLOT_GAP_FACTOR`] = 0.5).  The inset keeps the slot a genuine
-//!   closed hole instead of a hole tangent to the outer loop; the price is that
-//!   the last half width of the stub is not represented.  A general polyline
-//!   stub is offset with averaged vertex normals (a bevel at bends), not with a
-//!   full miter/round join; a self-intersecting offset is rejected.
-//! * No Chapter 2 channel is built *around* the feature: the feature itself is
-//!   the boundary of the sub-domains (through) or of the slot (terminating).
-//!   The channel of [`crate::sized`] is still the interior route when it can
-//!   close, which is where the thesis' stitching happens.
+//! * **Seam preservation is a route property.**  A through feature is split
+//!   with the *sampled* loops and meshed by the route that can honour the
+//!   sampled chains.  The seam-preserving routes (`sized`'s grid fits the demo
+//!   case; [`crate::alt_bipartite`], [`crate::alt_untangle`] and
+//!   [`crate::alt_decompose`] discretise the boundary once and keep input
+//!   vertices) provide the candidates.  The first route that gives the same
+//!   chain on both sides and welds to zero cracks, zero overlapping pairs and a
+//!   passing gate is returned; if no route preserves the samples, the plain
+//!   feature vertices are retried and the route then chooses the seam.
+//! * **Slot geometry.**  Slot width is one element size ([`SLOT_WIDTH_FACTOR`])
+//!   and the slot starts half a width inside the boundary ([`SLOT_GAP_FACTOR`]);
+//!   the inset keeps the slot a genuine closed hole.  A general polyline stub
+//!   is offset with averaged vertex normals (a bevel at bends), and a
+//!   self-intersecting offset is rejected.
+//! * **Channel geometry.**  The band has one node per inner-chain edge; both
+//!   mouth ends are projected onto the region boundary and must lie on a
+//!   straight boundary segment, so the stub has to meet the boundary roughly
+//!   perpendicularly.  The river slit is 0.5h wide (the thesis' zero-width slit
+//!   is not a polygon) and the band width is δ = 1.4h, constant as in §2.2.2
+//!   (`Sizing` is uniform here, so there is no size field to grade it with).
+//!   A stub bent tighter than the band radius produces a distorted band quad,
+//!   and one whose band would cross a through seam leaves its face; both are
+//!   rejected with the measured reason.  There is no patch/template cover
+//!   *inside* the band (the band is a regular strip), and §2.2.10 smoothing is
+//!   the crate's shared smoother, not the thesis' angle/stretch Nelder-Mead.
+//! * **A channel in a subdivided face** is attempted, but a narrow face (the
+//!   band plus the through seam) may leave a remainder that no route can mesh
+//!   while preserving the band's outer chain; such a run is rejected with that
+//!   reason.  The mixed through + terminating case is demonstrated with the
+//!   default slot representation.
+//! * The interior of each face is meshed by a whole-domain route; this module
+//!   does not inlay a separate interior grid in every face (the routes build
+//!   their own interior).
 //!
 //! # Public API
 //!
 //! ```text
 //! simons_features::mesh(&domain, &features, &sizing) -> Result<Mesh, String>
-//! simons_features::demo()                           -> Result<DemoNumbers, String>
+//! simons_features::mesh_with_options(&domain, &features, &sizing, &options)
+//! simons_features::demo() -> Result<DemoNumbers, String>
 //! ```
 //!
-//! Every mesh returned by [`mesh`] is all-quad, has `topology().cracks == 0`
-//! and passes [`crate::verify::gate`]; the return value is an error otherwise.
-//! Boundary nodes lie on the geometry the mesh was built for (the original
-//! domain for a through feature, the domain with its slot holes for a
-//! terminating feature), so the boundary offset is round-off.
+//! Every mesh returned by [`mesh`]/[`mesh_with_options`] is all-quad, has
+//! `topology().cracks == 0` and passes [`crate::verify::gate`]; the return value
+//! is an error otherwise. Boundary nodes lie on the geometry the mesh was built
+//! for (the original domain, plus the slot or river-slit holes), so the boundary
+//! offset is round-off.
 //!
-//! # Measured (demo, size 1)
+//! # Measured (demo, size 1, 10x10 square)
 //!
-//! * 10x10 square, vertical through feature `(5,0)-(5,10)`: route `sized`,
-//!   100 quads (two 5x10 halves), min SJ 1.0000, angles 90/90, cracks 0,
-//!   boundary offset 0, gate PASS, 11 seam nodes (the sampled feature).
-//! * 10x10 square, stub `(5,0)-(5,5)`: route `bipartite`, 106 quads, min SJ
-//!   0.7071, angles 45/90, cracks 0, boundary offset 4.4e-16 (against the
-//!   domain with its slot), gate PASS, slot width 1.0, start gap 0.5.
+//! | case | route | quads | SJ | angle min/max | cracks | offset | gate |
+//! |---|---|---|---|---|---|---|---|
+//! | vertical through `(5,0)-(5,10)` | sized | 100 | 1.0000 | 90.0/90.0 | 0 | 0 | PASS |
+//! | stub slot `(5,0)-(5,5)` | bipartite | 106 | 0.7071 | 45.0/90.0 | 0 | 4.4e-16 | PASS |
+//! | cross (vertical + horizontal) | sized | 100 | 1.0000 | 90.0/90.0 | 0 | 0 | PASS |
+//! | through + stub `(2,0)-(2,5)` | bipartite | 112 | 0.6073 | 38.8/90.0 | 0 | 4.4e-16 | PASS |
+//! | stub channel | sized | 90 (18 band) | 0.6226 | 38.5/90.0 | 0 | 1.8e-15 | PASS |
 //!
-//! The tests assert the two required square cases and the rejected inputs.  A
-//! diagonal through feature, a bent through feature, a bent stub, two disjoint
-//! stubs and a through feature beside a hole were also exercised during
-//! development and all returned conforming gate-passing meshes; they are not
-//! asserted here to keep the suite small.
+//! The cross has 4 sub-domains and 21 seam nodes (11 + 11 canonical samples, the
+//! centre shared); the mixed case has 2 sub-domains and one slot; the channel
+//! case has one river slit as its measured hole and an 18-quad band.  The tests
+//! assert these cases, the sampled seams (every canonical sample is a node and
+//! each seam edge is used by exactly two quads), and the rejected inputs.
 
 #![allow(
     clippy::needless_range_loop,
@@ -119,6 +137,8 @@
 )]
 
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 use crate::mesh::{Cell, Mesh, Node};
 use crate::two_d::{Domain, Sizing};
@@ -149,6 +169,59 @@ const SEAM_TOL: f64 = 1.0e-7;
 
 /// Segments on the round tip of a slot.
 const SLOT_TIP_SEGMENTS: usize = 8;
+
+/// Width of the channel band of a terminating feature, in units of the element
+/// size.  The thesis uses δ = 1.4h for the channel that separates the interior
+/// mesh from the boundary (§2.2.2); the band option reuses that measured value.
+pub const CHANNEL_WIDTH_FACTOR: f64 = 1.4;
+
+/// Width of the (unmeshed) river slit inside a channel band, in units of the
+/// element size.
+///
+/// The thesis leaves the feature a zero-width slit. A zero-width polygon is
+/// degenerate, so the channel's inner boundary is the two sides of the stub
+/// offset by half this width (see [`TerminatingMode::Channel`]).
+pub const CHANNEL_SLIT_FACTOR: f64 = 0.5;
+
+/// How a terminating feature is represented in the mesh.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminatingMode {
+    /// The stub becomes a thin **slot**: a closed hole of width
+    /// [`SLOT_WIDTH_FACTOR`] × size whose start cap is inset by
+    /// [`SLOT_GAP_FACTOR`] × width.  This is the module's original behaviour.
+    #[default]
+    Slot,
+    /// The stub is **carved**: the stub itself (a slit of
+    /// [`CHANNEL_SLIT_FACTOR`] × size) is the feature boundary, a band of
+    /// width [`CHANNEL_WIDTH_FACTOR`] × size along it is meshed as a quad
+    /// strip (the thesis' channel, §2.2.2), and the rest of the region is
+    /// meshed and welded to the band's outer chain.  The feature is therefore
+    /// a boundary of the mesh with a meshed boundary layer, not a hole.
+    Channel,
+}
+
+/// Options of [`mesh_with_options`].
+///
+/// The shipped configuration keeps the measured defaults; the struct is
+/// additive so the orchestrator can expose the channel option (it is embedded
+/// in `MeshConfig::feature_options`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Options {
+    /// How terminating features are represented.
+    pub terminating: TerminatingMode,
+    /// Width of the channel band, in units of the element size.  Only used by
+    /// [`TerminatingMode::Channel`]; the default is [`CHANNEL_WIDTH_FACTOR`].
+    pub channel_width: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            terminating: TerminatingMode::Slot,
+            channel_width: CHANNEL_WIDTH_FACTOR,
+        }
+    }
+}
 
 /// A set of interior feature polylines: rivers, material/political boundaries
 /// and fault lines of §2.2.1.
@@ -357,13 +430,26 @@ impl Features {
             kinds.push(kind);
         }
 
-        // Features may not intersect each other: the slot/split construction
-        // assumes disjoint paths.
+        // Feature pairs.  Two through features may cross: the planar
+        // subdivision splits each of them at the crossing (the crossing needs
+        // no input vertex, it is inserted on the fly).  A collinear overlap and
+        // any contact involving a terminating feature are rejected, because a
+        // slot or a channel cannot be crossed without destroying its boundary.
         for i in 0..self.polylines.len() {
             for j in (i + 1)..self.polylines.len() {
-                if polylines_intersect(&self.polylines[i], &self.polylines[j], tol) {
-                    return Err(format!("features {i} and {j} intersect"));
+                if polylines_overlap_collinear(&self.polylines[i], &self.polylines[j], tol) {
+                    return Err(format!("features {i} and {j} overlap along a segment"));
                 }
+                if !polylines_intersect(&self.polylines[i], &self.polylines[j], tol) {
+                    continue;
+                }
+                if kinds[i] == FeatureKind::Through && kinds[j] == FeatureKind::Through {
+                    continue;
+                }
+                return Err(format!(
+                    "features {i} and {j} intersect; only two through-going features may \
+                     cross (a terminating feature must be disjoint from every feature)"
+                ));
             }
         }
         Ok(kinds)
@@ -379,10 +465,10 @@ impl Features {
 pub struct CaseNumbers {
     /// Case name.
     pub name: String,
-    /// Route that produced the mesh ("sized", "quadtree", "decompose",
-    /// "bipartite", "untangle").
+    /// Route that produced the mesh ("sized", "quadtree", "bipartite",
+    /// "untangle", "decompose").
     pub route: String,
-    /// Whether the sampled seam of a through feature was preserved.
+    /// Whether the sampled seams of the through features were preserved.
     pub sampled_seam: bool,
     /// Number of quads.
     pub quads: usize,
@@ -400,16 +486,25 @@ pub struct CaseNumbers {
     pub boundary_offset: f64,
     /// Whether [`crate::verify::Gate::passes`] holds.
     pub gate_pass: bool,
-    /// Number of nodes shared along the feature seam (through case).
+    /// Nodes on the through-feature seams (all of them, in the merged mesh).
     pub seam_nodes: usize,
-    /// Number of sub-domains (2 for a single through feature, 1 otherwise).
+    /// Number of sub-domains (one per mesh region; 4 for a cross).
     pub subdomains: usize,
-    /// Canonical feature samples requested at the element size (through case).
+    /// Canonical samples requested on all through features (at the element
+    /// size).
     pub feature_samples: usize,
-    /// Slot width (terminating case), in length units.
+    /// Slot width (slot mode), in length units.
     pub slot_width: f64,
-    /// Slot start inset from the boundary (terminating case).
+    /// Slot start inset from the boundary (slot mode).
     pub slot_gap: f64,
+    /// How terminating features were represented ("slot" or "channel").
+    pub terminating_mode: String,
+    /// Channel band width (channel mode), in length units.
+    pub channel_width: f64,
+    /// Quads of the pre-built channel bands (channel mode).
+    pub channel_quads: usize,
+    /// Number of unmeshed removal loops: one per slot or river strip.
+    pub removals: usize,
 }
 
 /// Numbers returned by [`demo`].
@@ -419,115 +514,135 @@ pub struct DemoNumbers {
     pub through_square: CaseNumbers,
     /// 10x10 square with the stub (5,0)-(5,5) as a thin slot.
     pub stub_square: CaseNumbers,
+    /// 10x10 square with a cross: the vertical and the horizontal through
+    /// features at the centre.
+    pub cross_square: CaseNumbers,
+    /// 10x10 square with the vertical through feature and the stub
+    /// (2,0)-(2,5) (mixed through + terminating).
+    pub t_square: CaseNumbers,
+    /// 10x10 square with the stub (5,0)-(5,5) carved as a channel band.
+    pub channel_square: CaseNumbers,
     /// Canonical number of samples on the vertical feature at size 1.
     pub vertical_feature_samples: usize,
 }
 
-/// Mesh a planar domain with interior features.
+/// Mesh a planar domain with interior features, with the default options.
 ///
-/// `domain` is the outer/holes geometry; `features` are the interior paths of
-/// §2.2.1. Both are validated. A through feature is handled by splitting the
-/// outer loop and welding two sub-meshes; terminating features become thin
-/// slot holes. The returned mesh is all-quad, conforming (`topology().cracks ==
-/// 0`) and gate-passing, or an `Err` explains why no such mesh was built.
+/// Same as [`mesh_with_options`] with [`Options::default`] (a terminating
+/// feature becomes a slot).
 ///
 /// # Errors
 ///
 /// Invalid geometry (a short polyline, a point outside, a self-intersection, a
-/// floating feature, crossing features), a feature combination this module does
-/// not support yet (more than one through feature, or a through feature mixed
-/// with terminating ones), and the case where every tried all-quad route fails
-/// to produce a conforming gate-passing mesh.
+/// floating feature, a terminating feature meeting another feature), and the
+/// case where every tried all-quad route fails to produce a conforming
+/// gate-passing mesh.
 pub fn mesh(domain: &Domain, features: &Features, sizing: &Sizing) -> Result<Mesh, String> {
-    let kinds = features.analyze(domain)?;
-    if !sizing.size.is_finite() || sizing.size <= 0.0 {
-        return Err("the element size must be positive and finite".to_string());
-    }
-    if domain.area() <= 0.0 {
-        return Err("the domain has no positive area".to_string());
-    }
-    let through = kinds
-        .iter()
-        .filter(|kind| **kind == FeatureKind::Through)
-        .count();
-    let terminating: Vec<usize> = kinds
-        .iter()
-        .enumerate()
-        .filter(|(_, kind)| **kind == FeatureKind::Terminating)
-        .map(|(index, _)| index)
-        .collect();
-    match (through, terminating.len()) {
-        (0, 0) => Err("no features: the feature set is empty".to_string()),
-        (0, _) => {
-            let stubs: Vec<&[[f64; 2]]> = terminating
-                .iter()
-                .map(|&index| features.polylines[index].as_slice())
-                .collect();
-            mesh_terminating(domain, &stubs, sizing).map(|output| output.mesh)
-        }
-        (1, 0) => {
-            let index = kinds
-                .iter()
-                .position(|kind| *kind == FeatureKind::Through)
-                .ok_or_else(|| "internal error: through feature count mismatched".to_string())?;
-            mesh_through(domain, &features.polylines[index], sizing).map(|output| output.mesh)
-        }
-        (1, _) => Err(
-            "not supported yet: a through-going feature mixed with terminating features \
-             in one call"
-                .to_string(),
-        ),
-        (_, _) => {
-            Err("not supported yet: more than one through-going feature in one call".to_string())
-        }
-    }
+    mesh_with_options(domain, features, sizing, &Options::default())
 }
 
-/// Run the two demo cases and return their measured numbers.
+/// Mesh a planar domain with interior features and explicit options.
+///
+/// `domain` is the outer/holes geometry; `features` are the interior paths of
+/// §2.2.1. Both are validated.
+///
+/// * Several **through-going** features are supported: the outer loop is
+///   subdivided successively into one sub-domain per face of the planar
+///   subdivision (features may cross each other), each face is meshed with the
+///   existing all-quad routes and the sub-meshes are welded on the sampled
+///   seams.
+/// * A **terminating** feature is either a thin slot (the default) or, with
+///   [`TerminatingMode::Channel`], a carved channel band (both selectable in
+///   [`Options`]); terminating and through features may be mixed in one call.
+///
+/// The returned mesh is all-quad, conforming (`topology().cracks == 0`) and
+/// gate-passing, or an `Err` explains why no such mesh was built.
+///
+/// # Errors
+///
+/// Invalid geometry, an option that is not positive and finite, and the case
+/// where every tried all-quad route fails on at least one sub-domain or the
+/// welded mesh fails the gate.
+pub fn mesh_with_options(
+    domain: &Domain,
+    features: &Features,
+    sizing: &Sizing,
+    options: &Options,
+) -> Result<Mesh, String> {
+    mesh_detailed(domain, features, sizing, options).map(|outcome| outcome.mesh)
+}
+
+/// Run the demo cases and return their measured numbers.
 ///
 /// * a 10x10 square with the vertical through feature `(5,0)-(5,10)`, size 1;
-/// * a 10x10 square with the terminating feature `(5,0)-(5,5)`, size 1.
+/// * a 10x10 square with the terminating feature `(5,0)-(5,5)`, size 1 (slot);
+/// * a 10x10 square with the cross `(5,0)-(5,10)` + `(0,5)-(10,5)`, size 1;
+/// * a 10x10 square with the through feature `(5,0)-(5,10)` and the stub
+///   `(2,0)-(2,5)`, size 1 (mixed);
+/// * the same stub as the channel option (band width 1.4).
 pub fn demo() -> Result<DemoNumbers, String> {
     let square = Domain::rectangle(10.0, 10.0).map_err(|error| error.to_string())?;
     let sizing = Sizing::uniform(1.0).map_err(|error| error.to_string())?;
+    let default = Options::default();
 
     let through_feature = vec![[5.0, 0.0], [5.0, 10.0]];
-    let through = mesh_through(&square, &through_feature, &sizing)?;
-    let through_numbers = measure(
-        "square / vertical through feature",
+    let through = mesh_detailed(
         &square,
-        &through.mesh,
-        through.route,
-        through.sampled,
-        through.seam.len(),
-        through.subdomains,
-        through.feature_samples,
-        0.0,
-        0.0,
-    );
+        &Features::new(vec![through_feature.clone()]),
+        &sizing,
+        &default,
+    )?;
+    let through_numbers = measure("square / vertical through feature", &through);
 
     let stub_feature = vec![[5.0, 0.0], [5.0, 5.0]];
-    let stub = mesh_terminating(&square, &[stub_feature.as_slice()], &sizing)?;
-    let mut holes = square.holes.clone();
-    holes.push(stub.slot.clone());
-    let slot_domain =
-        Domain::new(square.outer.clone(), holes).map_err(|error| error.to_string())?;
-    let stub_numbers = measure(
-        "square / stub slot",
-        &slot_domain,
-        &stub.mesh,
-        stub.route,
-        false,
-        0,
-        1,
-        0,
-        stub.slot_width,
-        stub.slot_gap,
-    );
+    let stub = mesh_detailed(
+        &square,
+        &Features::new(vec![stub_feature.clone()]),
+        &sizing,
+        &default,
+    )?;
+    let stub_numbers = measure("square / stub slot", &stub);
+
+    let cross = mesh_detailed(
+        &square,
+        &Features::new(vec![
+            vec![[5.0, 0.0], [5.0, 10.0]],
+            vec![[0.0, 5.0], [10.0, 5.0]],
+        ]),
+        &sizing,
+        &default,
+    )?;
+    let cross_numbers = measure("square / cross of two through features", &cross);
+
+    let mixed = mesh_detailed(
+        &square,
+        &Features::new(vec![
+            vec![[5.0, 0.0], [5.0, 10.0]],
+            vec![[2.0, 0.0], [2.0, 5.0]],
+        ]),
+        &sizing,
+        &default,
+    )?;
+    let t_numbers = measure("square / through + terminating", &mixed);
+
+    let channel_options = Options {
+        terminating: TerminatingMode::Channel,
+        ..Options::default()
+    };
+    let channel = mesh_detailed(
+        &square,
+        &Features::new(vec![stub_feature.clone()]),
+        &sizing,
+        &channel_options,
+    )?;
+    let channel_numbers = measure("square / stub channel", &channel);
 
     Ok(DemoNumbers {
         through_square: through_numbers,
         stub_square: stub_numbers,
+        cross_square: cross_numbers,
+        t_square: t_numbers,
+        channel_square: channel_numbers,
         vertical_feature_samples: sample_polyline(&through_feature, sizing.size)
             .map(|samples| samples.len())
             .unwrap_or(0),
@@ -679,7 +794,6 @@ pub fn slot_loop(stub: &[[f64; 2]], width: f64) -> Result<Vec<[f64; 2]>, String>
 struct Split {
     first: Domain,
     second: Domain,
-    feature: Vec<[f64; 2]>,
 }
 
 /// Split `outer` along `feature` into two positive-area loops.
@@ -759,11 +873,7 @@ fn split_domain(domain: &Domain, feature: &[[f64; 2]], tol: f64) -> Result<Split
     if first.area() <= tol * tol || second.area() <= tol * tol {
         return Err("the split produced a sub-domain with no positive area".to_string());
     }
-    Ok(Split {
-        first,
-        second,
-        feature: snapped,
-    })
+    Ok(Split { first, second })
 }
 
 /// The boundary arc from `from` to `to` in the loop's stored (counter-clockwise)
@@ -893,105 +1003,180 @@ fn push_distinct(out: &mut Vec<[f64; 2]>, point: [f64; 2], tol: f64) {
 // Mesh generation: through features
 // ---------------------------------------------------------------------------
 
-/// One successful through-feature construction.
-struct ThroughOutput {
+/// One successful, fully measured feature construction.
+struct Outcome {
     mesh: Mesh,
     route: &'static str,
     sampled: bool,
-    seam: Vec<[f64; 2]>,
+    seam_nodes: usize,
     subdomains: usize,
     feature_samples: usize,
+    terminating_mode: TerminatingMode,
+    slot_width: f64,
+    slot_gap: f64,
+    channel_width: f64,
+    channel_quads: usize,
+    removals: usize,
+    measured: Domain,
+}
+
+/// One region of the planar subdivision that a route has to mesh.
+struct Piece {
+    /// Geometry handed to the route (a sub-domain with its slot holes, or the
+    /// remainder left after a channel band is carved).
+    domain: Domain,
+    /// A pre-built all-quad channel band, welded to the route's mesh.
+    band: Option<Mesh>,
+    /// Outer chain of the band, which the route's boundary must preserve.
+    band_seam: Vec<[f64; 2]>,
+}
+
+/// The complete plan: one piece per sub-domain, the measurement domain, and the
+/// through seams the sampled check has to find.
+struct Plan {
+    pieces: Vec<Piece>,
+    /// Original outer loop + original holes + every unmeshed removal loop
+    /// (slot or river strip).
+    measured: Domain,
+    through: Vec<Vec<[f64; 2]>>,
+    /// Canonical samples to look for in the merged mesh (empty for the plain
+    /// seam fallback).
+    samples: Vec<Vec<[f64; 2]>>,
+    slot_width: f64,
+    slot_gap: f64,
+    channel_width: f64,
+    channel_quads: usize,
+    removals: usize,
+    mode: TerminatingMode,
 }
 
 /// A route that turns a domain into an all-quad mesh.
 type Mesher = fn(&Domain, &Sizing) -> Result<Mesh, String>;
 
-/// The tried routes, in order.  The first two are the ones named by the task
-/// (`sized` is Chapter 2's grid + channel; `quadtree` is the requested
-/// fallback); the next three discretise the boundary once and keep input
-/// boundary vertices, which is what a prescribed seam needs.
+/// The tried routes, in order.  `sized` is Chapter 2's grid + channel;
+/// `quadtree` is the grid fallback; the last three discretise the boundary
+/// once and keep input boundary vertices, which is what a prescribed seam and
+/// a band chain need.
 const ROUTES: [(&str, Mesher); 5] = [
     ("sized", crate::sized::mesh),
     ("quadtree", crate::alt_quadtree::mesh),
-    ("decompose", crate::alt_decompose::mesh),
-    ("bipartite", crate::alt_bipartite::mesh),
-    ("untangle", crate::alt_untangle::mesh),
-];
-
-/// The route order for a slot (a domain with one or more holes).  The same
-/// sized/quadtree attempts come first; the decomposition route supports only
-/// one hole and is the slowest with a thin slot, so the triangulation-based
-/// routes (which keep every boundary vertex and handle several holes) come
-/// before it.
-const SLOT_ROUTES: [(&str, Mesher); 5] = [
-    ("sized", crate::sized::mesh),
-    ("quadtree", crate::alt_quadtree::mesh),
     ("bipartite", crate::alt_bipartite::mesh),
     ("untangle", crate::alt_untangle::mesh),
     ("decompose", crate::alt_decompose::mesh),
 ];
 
-/// Mesh a through feature by splitting the outer loop and welding two meshes.
-fn mesh_through(
+/// Validation, dispatch, and the sampled-seam / plain-seam fallbacks.
+fn mesh_detailed(
     domain: &Domain,
-    feature: &[[f64; 2]],
+    features: &Features,
     sizing: &Sizing,
-) -> Result<ThroughOutput, String> {
+    options: &Options,
+) -> Result<Outcome, String> {
+    let kinds = features.analyze(domain)?;
+    if !sizing.size.is_finite() || sizing.size <= 0.0 {
+        return Err("the element size must be positive and finite".to_string());
+    }
+    if !options.channel_width.is_finite() || options.channel_width <= 0.0 {
+        return Err("the channel width must be positive and finite".to_string());
+    }
+    if domain.area() <= 0.0 {
+        return Err("the domain has no positive area".to_string());
+    }
     let tol = tolerance(domain);
-    let plain = snap_feature(domain, feature, tol)?;
-    let sampled = sample_polyline(&plain, sizing.size)?;
-    let mut errors: Vec<String> = Vec::new();
+    let through_indices: Vec<usize> = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| **kind == FeatureKind::Through)
+        .map(|(index, _)| index)
+        .collect();
+    let stubs: Vec<Vec<[f64; 2]>> = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| **kind == FeatureKind::Terminating)
+        .map(|(index, _)| features.polylines[index].clone())
+        .collect();
 
-    // Prefer the exact sampled seam; fall back to a route-chosen seam only if
+    // No through feature: the planar subdivision is the domain itself.
+    if through_indices.is_empty() {
+        let plan = build_plan(domain, &[], &stubs, sizing, options, false)?;
+        let (mesh, route) = try_plan(&plan, sizing, tol)?;
+        return Ok(finish_outcome(plan, mesh, route));
+    }
+
+    // Prefer the exact sampled seams; fall back to route-chosen seams only if
     // no seam-preserving route can build the sampled loops.
-    for &(use_sampled, seam_feature) in &[(true, &sampled), (false, &plain)] {
-        let split = match split_domain(domain, seam_feature, tol) {
-            Ok(split) => split,
+    let plain: Vec<Vec<[f64; 2]>> = through_indices
+        .iter()
+        .map(|&index| snap_feature(domain, &features.polylines[index], tol))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sampled: Vec<Vec<[f64; 2]>> = plain
+        .iter()
+        .map(|feature| sample_polyline(feature, sizing.size))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut errors: Vec<String> = Vec::new();
+    for &(use_sampled, lines) in &[(true, &sampled), (false, &plain)] {
+        let plan = match build_plan(domain, lines, &stubs, sizing, options, use_sampled) {
+            Ok(plan) => plan,
             Err(error) => {
-                errors.push(format!(
-                    "{} loops: {error}",
-                    if use_sampled { "sampled" } else { "plain" }
-                ));
+                if errors.len() < 12 {
+                    errors.push(format!(
+                        "{} seams: {error}",
+                        if use_sampled { "sampled" } else { "plain" }
+                    ));
+                }
                 continue;
             }
         };
-        for &(route, mesher) in &ROUTES {
-            match try_pair(domain, &split, sizing, route, mesher, tol) {
-                Ok((mesh, seam)) => {
-                    let seam_tol = seam_tolerance(domain);
-                    if use_sampled && !contains_points(&sampled, &seam, seam_tol) {
-                        if errors.len() < 12 {
-                            errors.push(format!(
-                                "{route} (sampled seam): the sampled feature nodes were \
-                                 not all preserved"
-                            ));
+        match try_plan(&plan, sizing, tol) {
+            Ok((mesh, route)) => return Ok(finish_outcome(plan, mesh, route)),
+            Err(error) => {
+                if errors.len() < 12 {
+                    errors.push(format!(
+                        "{}: {error}",
+                        if use_sampled {
+                            "sampled seams"
+                        } else {
+                            "plain seams"
                         }
-                        continue;
-                    }
-                    return Ok(ThroughOutput {
-                        mesh,
-                        route,
-                        sampled: use_sampled,
-                        seam,
-                        subdomains: 2,
-                        feature_samples: sampled.len(),
-                    });
-                }
-                Err(error) => {
-                    if errors.len() < 12 {
-                        errors.push(format!(
-                            "{route} ({} seam): {error}",
-                            if use_sampled { "sampled" } else { "plain" }
-                        ));
-                    }
+                    ));
                 }
             }
         }
     }
     Err(format!(
-        "no all-quad route produced a conforming through-feature mesh: {}",
+        "no all-quad route produced a conforming feature mesh: {}",
         errors.join("; ")
     ))
+}
+
+/// Package a successful mesh with its measured numbers.
+fn finish_outcome(plan: Plan, mesh: Mesh, route: &'static str) -> Outcome {
+    let tol = seam_tolerance(&plan.measured);
+    let points: Vec<[f64; 2]> = mesh.points.iter().map(|p| [p[0], p[1]]).collect();
+    let seam_nodes = points
+        .iter()
+        .filter(|point| {
+            plan.through
+                .iter()
+                .any(|line| polyline_parameter(line, **point, tol).is_some())
+        })
+        .count();
+    let feature_samples: usize = plan.samples.iter().map(Vec::len).sum();
+    Outcome {
+        mesh,
+        route,
+        sampled: !plan.samples.is_empty(),
+        seam_nodes,
+        subdomains: plan.pieces.len(),
+        feature_samples,
+        terminating_mode: plan.mode,
+        slot_width: plan.slot_width,
+        slot_gap: plan.slot_gap,
+        channel_width: plan.channel_width,
+        channel_quads: plan.channel_quads,
+        removals: plan.removals,
+        measured: plan.measured,
+    }
 }
 
 /// Snap a through feature's endpoints onto the outer loop.
@@ -1010,60 +1195,705 @@ fn snap_feature(domain: &Domain, feature: &[[f64; 2]], tol: f64) -> Result<Vec<[
     Ok(out)
 }
 
-/// Mesh the two sub-domains with one route and weld them.
-fn try_pair(
-    parent: &Domain,
-    split: &Split,
+// ---------------------------------------------------------------------------
+// The planar subdivision and the channel carve
+// ---------------------------------------------------------------------------
+
+/// Build the subdivision plan: one piece per face, then the terminating
+/// features assigned to the face that contains them.
+fn build_plan(
+    domain: &Domain,
+    through: &[Vec<[f64; 2]>],
+    stubs: &[Vec<[f64; 2]>],
     sizing: &Sizing,
-    route: &'static str,
-    mesher: Mesher,
-    tol: f64,
-) -> Result<(Mesh, Vec<[f64; 2]>), String> {
-    let first =
-        mesher(&split.first, sizing).map_err(|error| format!("first sub-domain: {error}"))?;
-    let second =
-        mesher(&split.second, sizing).map_err(|error| format!("second sub-domain: {error}"))?;
-    let seam_tol = seam_tolerance(parent).max(tol);
-    // The smoother never moves a boundary node, so a route whose raw boundary
-    // is already off the sub-domain geometry cannot be repaired by it.
-    // Checking before smoothing avoids spending the smoothing pass on it.
-    for (side, sub_domain, mesh) in [
-        ("first", &split.first, &first),
-        ("second", &split.second, &second),
-    ] {
-        let offset = verify::boundary_offset(sub_domain, mesh);
-        if offset > seam_tol {
+    options: &Options,
+    sampled: bool,
+) -> Result<Plan, String> {
+    let tol = tolerance(domain);
+    let mut regions: Vec<Domain> = vec![domain.clone()];
+    for feature in through {
+        if feature.len() < 2 {
+            return Err("a through feature needs at least two points".to_string());
+        }
+        subdivide(&mut regions, feature, tol)?;
+    }
+    let mut pieces: Vec<Piece> = regions
+        .into_iter()
+        .map(|region| Piece {
+            domain: region,
+            band: None,
+            band_seam: Vec::new(),
+        })
+        .collect();
+
+    let slot_width = SLOT_WIDTH_FACTOR * sizing.size;
+    let slot_gap = SLOT_GAP_FACTOR * slot_width;
+    let channel_width = options.channel_width * sizing.size;
+    let channel_slit = CHANNEL_SLIT_FACTOR * sizing.size;
+    let mut slot_count = 0usize;
+    let mut channel_quads = 0usize;
+    let mut removals: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut keep_out: Vec<Vec<[f64; 2]>> = Vec::new();
+
+    for (number, stub) in stubs.iter().enumerate() {
+        let index = locate_piece(&pieces, stub, tol)
+            .map_err(|error| format!("terminating feature {number}: {error}"))?;
+        if locate_on_loop(&pieces[index].domain.outer, stub[0], tol).is_none() {
             return Err(format!(
-                "{route}: the {side} sub-mesh boundary is {offset:.3e} off the geometry"
+                "terminating feature {number}: the mouth does not lie on the outer boundary \
+                 of its sub-region"
             ));
         }
+        match options.terminating {
+            TerminatingMode::Slot => {
+                let slot = slot_loop(stub, slot_width)
+                    .map_err(|error| format!("terminating feature {number}: {error}"))?;
+                validate_slot(&pieces[index].domain, &slot, tol)
+                    .map_err(|error| format!("terminating feature {number}: {error}"))?;
+                for (other, polygon) in keep_out.iter().enumerate() {
+                    if loop_polygons_intersect(&slot, polygon, tol) {
+                        return Err(format!(
+                            "terminating feature {number} overlaps removal {other} \
+                             (features must be disjoint)"
+                        ));
+                    }
+                }
+                pieces[index].domain.holes.push(slot.clone());
+                removals.push(slot.clone());
+                keep_out.push(slot);
+                slot_count += 1;
+            }
+            TerminatingMode::Channel => {
+                let path = sample_polyline(stub, sizing.size)
+                    .map_err(|error| format!("terminating feature {number}: {error}"))?;
+                let channel = build_channel(
+                    &pieces[index].domain,
+                    &path,
+                    channel_width,
+                    channel_slit,
+                    tol,
+                )
+                .map_err(|error| format!("terminating feature {number}: {error}"))?;
+                for (other, polygon) in keep_out.iter().enumerate() {
+                    if loop_polygons_intersect(&channel.outline, polygon, tol) {
+                        return Err(format!(
+                            "terminating feature {number} overlaps removal {other} \
+                             (features must be disjoint)"
+                        ));
+                    }
+                }
+                channel_quads += channel.quads;
+                removals.push(channel.river.clone());
+                keep_out.push(channel.outline);
+                keep_out.push(channel.river);
+                pieces[index].domain = channel.remainder;
+                pieces[index].band = Some(channel.band);
+                pieces[index].band_seam = channel.outer;
+            }
+        }
     }
-    let first = finish_pair_side(&split.first, first, sizing);
-    let second = finish_pair_side(&split.second, second, sizing);
-    let first_seam = seam_chain(&first, &split.feature, seam_tol)?;
-    let second_seam = seam_chain(&second, &split.feature, seam_tol)?;
-    if first_seam.len() < 2 || second_seam.len() < 2 {
-        return Err(format!(
-            "{route}: the feature is not represented on both sides \
-             ({} and {} seam nodes)",
-            first_seam.len(),
-            second_seam.len()
-        ));
+
+    let mut holes = domain.holes.clone();
+    holes.extend(removals.iter().cloned());
+    let measured = Domain::new(domain.outer.clone(), holes).map_err(|error| error.to_string())?;
+    if measured.area() <= tol * tol {
+        return Err("the removal loops leave the measured domain with no area".to_string());
     }
-    if !same_chain(&first_seam, &second_seam, seam_tol) {
+    let (slot_width, slot_gap, channel_width) = match options.terminating {
+        TerminatingMode::Slot if slot_count > 0 => (slot_width, slot_gap, 0.0),
+        TerminatingMode::Channel => (0.0, 0.0, channel_width),
+        _ => (0.0, 0.0, 0.0),
+    };
+    Ok(Plan {
+        pieces,
+        measured,
+        through: through.to_vec(),
+        samples: if sampled {
+            through.to_vec()
+        } else {
+            Vec::new()
+        },
+        slot_width,
+        slot_gap,
+        channel_width,
+        channel_quads,
+        removals: removals.len(),
+        mode: options.terminating,
+    })
+}
+
+/// The piece whose interior contains the terminating feature's inner end.
+fn locate_piece(pieces: &[Piece], stub: &[[f64; 2]], tol: f64) -> Result<usize, String> {
+    let probe = *stub
+        .last()
+        .ok_or_else(|| "a terminating feature needs at least two points".to_string())?;
+    let mut best: Option<(f64, usize)> = None;
+    for (index, piece) in pieces.iter().enumerate() {
+        if !piece.domain.contains(probe) {
+            continue;
+        }
+        let d = piece.domain.distance_to_boundary(probe);
+        if best.is_none_or(|(best_d, _)| d > best_d) {
+            best = Some((d, index));
+        }
+    }
+    match best {
+        Some((d, index)) if d > tol => Ok(index),
+        Some(_) => Err("the interior end of the feature lies on a sub-region boundary".to_string()),
+        None => Err(
+            "the interior end of the feature lies outside every sub-region (does it cross a \
+             through feature or a hole?)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Split one region at a time until every piece of `feature` lies in one
+/// region.
+fn subdivide(regions: &mut Vec<Domain>, feature: &[[f64; 2]], tol: f64) -> Result<(), String> {
+    let pieces = split_feature_at_regions(feature, regions, tol)?;
+    for piece in pieces {
+        let probe = polyline_point_at(&piece, 0.5);
+        let mut best: Option<(f64, usize)> = None;
+        for (index, region) in regions.iter().enumerate() {
+            if !region.contains(probe) {
+                continue;
+            }
+            let d = region.distance_to_boundary(probe);
+            if best.is_none_or(|(best_d, _)| d > best_d) {
+                best = Some((d, index));
+            }
+        }
+        let (d, index) = best.ok_or_else(|| {
+            "a piece of a through feature lies outside every sub-region".to_string()
+        })?;
+        if d <= tol {
+            return Err(
+                "a piece of a through feature lies on a sub-region boundary; the feature \
+                 has a grazing crossing"
+                    .to_string(),
+            );
+        }
+        let split = split_domain(&regions[index], &piece, tol)?;
+        regions[index] = split.first;
+        regions.push(split.second);
+    }
+    Ok(())
+}
+
+/// Split a through feature at every crossing with the current region
+/// boundaries.
+fn split_feature_at_regions(
+    feature: &[[f64; 2]],
+    regions: &[Domain],
+    tol: f64,
+) -> Result<Vec<Vec<[f64; 2]>>, String> {
+    if feature.len() < 2 {
+        return Err("a through feature needs at least two points".to_string());
+    }
+    let vertex_parameters = polyline_vertex_parameters(feature);
+    let total = *vertex_parameters.last().unwrap_or(&0.0);
+    if total <= tol {
+        return Err("a through feature has no length".to_string());
+    }
+    let mut cuts: Vec<(f64, [f64; 2])> =
+        vec![(0.0, feature[0]), (total, feature[feature.len() - 1])];
+    let mut base = 0.0;
+    for pair in feature.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let length = distance(a, b);
+        if length <= 0.0 {
+            continue;
+        }
+        for region in regions {
+            let n = region.outer.len();
+            if n < 2 {
+                continue;
+            }
+            for index in 0..n {
+                let c = region.outer[index];
+                let d = region.outer[(index + 1) % n];
+                if let Some(t) = segment_intersection_parameter(a, b, c, d, tol) {
+                    cuts.push((
+                        base + t * length,
+                        [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])],
+                    ));
+                }
+            }
+        }
+        base += length;
+    }
+    cuts.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut unique: Vec<(f64, [f64; 2])> = Vec::with_capacity(cuts.len());
+    for (parameter, point) in cuts {
+        if let Some((_, last)) = unique.last() {
+            if distance(*last, point) <= tol {
+                continue;
+            }
+        }
+        unique.push((parameter, point));
+    }
+    let mut pieces = Vec::new();
+    for window in unique.windows(2) {
+        let (s0, p0) = window[0];
+        let (s1, p1) = window[1];
+        if s1 - s0 <= tol {
+            continue;
+        }
+        let mut piece = vec![p0];
+        for (index, point) in feature.iter().enumerate() {
+            let s = vertex_parameters[index];
+            if s > s0 + tol && s < s1 - tol {
+                push_distinct(&mut piece, *point, tol);
+            }
+        }
+        push_distinct(&mut piece, p1, tol);
+        if piece.len() >= 2 {
+            pieces.push(piece);
+        }
+    }
+    if pieces.is_empty() {
+        return Err("the feature could not be split into sub-region pieces".to_string());
+    }
+    Ok(pieces)
+}
+
+/// Parameter `t` on segment `a-b` of the intersection with segment `c-d`.
+///
+/// Endpoints count; parallel (including collinear) segments return `None`, so a
+/// collinear overlap is not silently cut into pieces.  The collinear overlap is
+/// rejected separately by [`polylines_overlap_collinear`].
+fn segment_intersection_parameter(
+    a: [f64; 2],
+    b: [f64; 2],
+    c: [f64; 2],
+    d: [f64; 2],
+    tol: f64,
+) -> Option<f64> {
+    let r = [b[0] - a[0], b[1] - a[1]];
+    let s = [d[0] - c[0], d[1] - c[1]];
+    let r_length = (r[0] * r[0] + r[1] * r[1]).sqrt();
+    let s_length = (s[0] * s[0] + s[1] * s[1]).sqrt();
+    if r_length <= 0.0 || s_length <= 0.0 {
+        return None;
+    }
+    let denominator = r[0] * s[1] - r[1] * s[0];
+    if denominator.abs() <= 1.0e-12 * r_length * s_length {
+        return None;
+    }
+    let q = [c[0] - a[0], c[1] - a[1]];
+    let t = (q[0] * s[1] - q[1] * s[0]) / denominator;
+    let u = (q[0] * r[1] - q[1] * r[0]) / denominator;
+    let t_margin = tol / r_length;
+    let u_margin = tol / s_length;
+    if t < -t_margin || t > 1.0 + t_margin || u < -u_margin || u > 1.0 + u_margin {
+        return None;
+    }
+    Some(t.clamp(0.0, 1.0))
+}
+
+/// Cumulative arc-length parameter of every vertex of a polyline.
+fn polyline_vertex_parameters(points: &[[f64; 2]]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(points.len());
+    let mut total = 0.0;
+    out.push(0.0);
+    for pair in points.windows(2) {
+        total += distance(pair[0], pair[1]);
+        out.push(total);
+    }
+    out
+}
+
+/// Point at a fraction of the polyline's arc length.
+fn polyline_point_at(points: &[[f64; 2]], fraction: f64) -> [f64; 2] {
+    if points.len() < 2 {
+        return points.first().copied().unwrap_or([0.0, 0.0]);
+    }
+    let parameters = polyline_vertex_parameters(points);
+    let total = *parameters.last().unwrap_or(&0.0);
+    if total <= 0.0 {
+        return points[0];
+    }
+    let target = fraction.clamp(0.0, 1.0) * total;
+    for (index, pair) in points.windows(2).enumerate() {
+        let s0 = parameters[index];
+        let s1 = parameters[index + 1];
+        if target <= s1 || index + 2 == points.len() {
+            let length = s1 - s0;
+            if length <= 0.0 {
+                return pair[0];
+            }
+            let t = ((target - s0) / length).clamp(0.0, 1.0);
+            return [
+                pair[0][0] + t * (pair[1][0] - pair[0][0]),
+                pair[0][1] + t * (pair[1][1] - pair[0][1]),
+            ];
+        }
+    }
+    points[points.len() - 1]
+}
+
+/// A carved channel band and the region left around it.
+struct ChannelPiece {
+    band: Mesh,
+    remainder: Domain,
+    /// River slit polygon (a hole of the measured domain).
+    river: Vec<[f64; 2]>,
+    /// Closed outline of the band, used for overlap tests between features.
+    outline: Vec<[f64; 2]>,
+    /// Outer chain (on the remainder side): the route's prescribed seam.
+    outer: Vec<[f64; 2]>,
+    quads: usize,
+}
+
+/// Build the channel band along `path`, carve it out of `region`, and return
+/// both.
+///
+/// The band is the thesis' channel (§2.2.2): the stub is the feature boundary
+/// (two sides offset by half the slit width plus a round tip), a band of
+/// `width` is meshed as one quad per chain edge, and the region left on the far
+/// side of the band is a simple polygon routed and welded back to the band's
+/// outer chain.  The mouth has to lie on a straight boundary segment: both
+/// offset chains are projected onto the region boundary there.
+fn build_channel(
+    region: &Domain,
+    path: &[[f64; 2]],
+    width: f64,
+    slit: f64,
+    tol: f64,
+) -> Result<ChannelPiece, String> {
+    if path.len() < 2 {
+        return Err("a channel needs a stub with at least two points".to_string());
+    }
+    if !width.is_finite() || width <= 0.0 {
+        return Err("the channel width must be positive and finite".to_string());
+    }
+    if !slit.is_finite() || slit <= 0.0 {
+        return Err("the channel slit width must be positive and finite".to_string());
+    }
+    let half = slit / 2.0;
+
+    // Tangents at the stub vertices, averaged at a bend, then the two sides
+    // and a round tip: the inner chain of the band.
+    let mut tangents = Vec::with_capacity(path.len());
+    for i in 0..path.len() {
+        let tangent = if i == 0 {
+            unit_vector(path[0], path[1])?
+        } else if i + 1 == path.len() {
+            unit_vector(path[i - 1], path[i])?
+        } else {
+            let a = unit_vector(path[i - 1], path[i])?;
+            let b = unit_vector(path[i], path[i + 1])?;
+            let sum = [a[0] + b[0], a[1] + b[1]];
+            let length = (sum[0] * sum[0] + sum[1] * sum[1]).sqrt();
+            if length <= 1.0e-9 {
+                return Err("the stub folds back on itself; cannot carve it".to_string());
+            }
+            [sum[0] / length, sum[1] / length]
+        };
+        tangents.push(tangent);
+    }
+    let mut inner: Vec<[f64; 2]> = Vec::with_capacity(2 * path.len() + SLOT_TIP_SEGMENTS);
+    for (point, tangent) in path.iter().zip(tangents.iter()) {
+        let normal = [-tangent[1], tangent[0]];
+        inner.push([point[0] + half * normal[0], point[1] + half * normal[1]]);
+    }
+    let last = path.len() - 1;
+    let end_normal = [-tangents[last][1], tangents[last][0]];
+    let start_angle = end_normal[1].atan2(end_normal[0]);
+    for step in 1..=SLOT_TIP_SEGMENTS {
+        let angle = start_angle - std::f64::consts::PI * step as f64 / SLOT_TIP_SEGMENTS as f64;
+        inner.push([
+            path[last][0] + half * angle.cos(),
+            path[last][1] + half * angle.sin(),
+        ]);
+    }
+    for i in (0..last).rev() {
+        let normal = [-tangents[i][1], tangents[i][0]];
+        inner.push([path[i][0] - half * normal[0], path[i][1] - half * normal[1]]);
+    }
+
+    // The two ends of the chain are the mouth: put them on the region
+    // boundary (a no-op for a stub perpendicular to a straight boundary).
+    let first = project_to_boundary(region, inner[0]);
+    let end = project_to_boundary(region, inner[inner.len() - 1]);
+    inner[0] = first;
+    let inner_len = inner.len();
+    inner[inner_len - 1] = end;
+
+    // Outer chain: offset the inner chain by the band width, away from the
+    // river, and project its mouth ends onto the boundary too.
+    let mut outer: Vec<[f64; 2]> = Vec::with_capacity(inner.len());
+    for i in 0..inner.len() {
+        let tangent = chain_tangent(&inner, i)?;
+        let normal = [-tangent[1], tangent[0]];
+        outer.push([
+            inner[i][0] + width * normal[0],
+            inner[i][1] + width * normal[1],
+        ]);
+    }
+    let outer_len = outer.len();
+    outer[0] = project_to_boundary(region, outer[0]);
+    outer[outer_len - 1] = project_to_boundary(region, outer[outer_len - 1]);
+
+    // The mouth caps have to lie on the boundary; otherwise the band would
+    // cross it.  For a straight boundary segment this is exact.
+    for (a, b) in [
+        (inner[0], outer[0]),
+        (inner[inner_len - 1], outer[outer_len - 1]),
+    ] {
+        let middle = [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])];
+        if region.distance_to_boundary(middle) > tol {
+            return Err(
+                "the channel mouth is not on a straight boundary segment (the stub meets \
+                 the boundary too obliquely for the band)"
+                    .to_string(),
+            );
+        }
+    }
+    for point in inner.iter().chain(outer.iter()) {
+        if !region.contains(*point) && region.distance_to_boundary(*point) > tol {
+            return Err("the channel band leaves the region".to_string());
+        }
+    }
+
+    // The closed band polygon: inner chain A..B, outer chain reversed B'..A'.
+    let mut outline = inner.clone();
+    outline.extend(outer.iter().rev().copied());
+    if !loop_is_simple(&outline, tol) {
+        return Err(
+            "the channel band self-intersects (the stub is too short or too \
+                    sharply bent for this width)"
+                .to_string(),
+        );
+    }
+    if polygon_area(&outline).abs() <= tol * tol {
+        return Err("the channel band has no area".to_string());
+    }
+
+    // Band quads.
+    let n = inner.len();
+    let mut points: Vec<Node> = Vec::with_capacity(2 * n);
+    points.extend(inner.iter().map(|p| [p[0], p[1], 0.0]));
+    points.extend(outer.iter().map(|p| [p[0], p[1], 0.0]));
+    let mut cells = Vec::with_capacity(n - 1);
+    for i in 0..n - 1 {
+        let quad = [i, i + 1, n + i + 1, n + i];
+        let corners = [
+            points[quad[0]],
+            points[quad[1]],
+            points[quad[2]],
+            points[quad[3]],
+        ];
+        let area = (corners[1][0] - corners[0][0]) * (corners[3][1] - corners[0][1])
+            - (corners[1][1] - corners[0][1]) * (corners[3][0] - corners[0][0]);
+        if area <= 0.0 {
+            return Err("the channel band would contain an inverted quad".to_string());
+        }
+        cells.push(Cell::quad4(quad));
+    }
+    let band = Mesh::new(points, cells);
+    band.validate()
+        .map_err(|error| format!("the channel band is invalid: {error}"))?;
+    let quality = crate::quality::report(&band);
+    if quality.min_scaled_jacobian < 0.2 {
         return Err(format!(
-            "{route}: the two sub-meshes have different seam chains ({} vs {} nodes)",
-            first_seam.len(),
-            second_seam.len()
+            "the channel band would contain a distorted quad (min SJ {:.3})",
+            quality.min_scaled_jacobian
         ));
     }
 
-    let weld_tol = seam_tol;
-    let merged = weld(&first, &second, weld_tol)?;
+    // The unmeshed river slit: the inner chain closed across the mouth.
+    let river = inner.clone();
+    if !loop_is_simple(&river, tol) {
+        return Err("the river slit self-intersects".to_string());
+    }
+    if polygon_area(&river).abs() <= tol * tol {
+        return Err("the river slit has no area".to_string());
+    }
+
+    // Carve: the remainder boundary walks the region boundary from the second
+    // mouth point back to the first, then the outer chain.
+    let a_loc = locate_on_loop(&region.outer, outer[0], tol)
+        .ok_or_else(|| "the channel's outer chain does not start on the boundary".to_string())?;
+    let b_loc = locate_on_loop(&region.outer, outer[outer_len - 1], tol)
+        .ok_or_else(|| "the channel's outer chain does not end on the boundary".to_string())?;
+    let mut remainder_outer = boundary_arc(&region.outer, b_loc, a_loc, tol);
+    for point in &outer {
+        push_distinct(&mut remainder_outer, *point, tol);
+    }
+    let remainder_outer = orient_loop(remainder_outer, tol)?;
+    if !loop_is_simple(&remainder_outer, tol) {
+        return Err("the region left around the channel self-intersects".to_string());
+    }
+    let remainder =
+        Domain::new(remainder_outer, region.holes.clone()).map_err(|error| error.to_string())?;
+    if remainder.area() <= tol * tol {
+        return Err("the channel leaves no positive remainder area".to_string());
+    }
+
+    Ok(ChannelPiece {
+        band,
+        remainder,
+        river,
+        outline,
+        outer,
+        quads: n - 1,
+    })
+}
+
+/// Unit tangent at chain vertex `i`, averaged at an interior vertex.
+fn chain_tangent(chain: &[[f64; 2]], i: usize) -> Result<[f64; 2], String> {
+    if chain.len() < 2 || i >= chain.len() {
+        return Err("a chain needs at least two points".to_string());
+    }
+    if i == 0 {
+        return unit_vector(chain[0], chain[1]);
+    }
+    if i + 1 == chain.len() {
+        return unit_vector(chain[i - 1], chain[i]);
+    }
+    let a = unit_vector(chain[i - 1], chain[i])?;
+    let b = unit_vector(chain[i], chain[i + 1])?;
+    let sum = [a[0] + b[0], a[1] + b[1]];
+    let length = (sum[0] * sum[0] + sum[1] * sum[1]).sqrt();
+    if length <= 1.0e-9 {
+        return Err("a channel chain folds back on itself".to_string());
+    }
+    Ok([sum[0] / length, sum[1] / length])
+}
+
+/// Nearest point of the region's outer loop.
+fn project_to_boundary(region: &Domain, point: [f64; 2]) -> [f64; 2] {
+    nearest_on_loop(&region.outer, point).0
+}
+
+/// Nearest point on a closed loop and its distance.
+fn nearest_on_loop(points: &[[f64; 2]], target: [f64; 2]) -> ([f64; 2], f64) {
+    let n = points.len();
+    if n < 2 {
+        return (points.first().copied().unwrap_or([0.0, 0.0]), f64::INFINITY);
+    }
+    let mut best = (points[0], f64::INFINITY);
+    for index in 0..n {
+        let a = points[index];
+        let b = points[(index + 1) % n];
+        let ab = [b[0] - a[0], b[1] - a[1]];
+        let length2 = ab[0] * ab[0] + ab[1] * ab[1];
+        let t = if length2 <= 0.0 {
+            0.0
+        } else {
+            (((target[0] - a[0]) * ab[0] + (target[1] - a[1]) * ab[1]) / length2).clamp(0.0, 1.0)
+        };
+        let candidate = [a[0] + t * ab[0], a[1] + t * ab[1]];
+        let d = distance(candidate, target);
+        if d < best.1 {
+            best = (candidate, d);
+        }
+    }
+    best
+}
+
+/// Whether two polylines overlap along a segment (a collinear shared piece).
+fn polylines_overlap_collinear(first: &[[f64; 2]], second: &[[f64; 2]], tol: f64) -> bool {
+    for a in first.windows(2) {
+        for b in second.windows(2) {
+            if segments_overlap_collinear(a[0], a[1], b[0], b[1], tol) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether two closed segments are collinear and share a piece longer than
+/// `tol`.
+fn segments_overlap_collinear(
+    a: [f64; 2],
+    b: [f64; 2],
+    c: [f64; 2],
+    d: [f64; 2],
+    tol: f64,
+) -> bool {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let length = (ab[0] * ab[0] + ab[1] * ab[1]).sqrt();
+    if length <= 0.0 {
+        return false;
+    }
+    let line_distance =
+        |p: [f64; 2]| ((p[0] - a[0]) * ab[1] - (p[1] - a[1]) * ab[0]).abs() / length;
+    if line_distance(c) > tol || line_distance(d) > tol {
+        return false;
+    }
+    let project = |p: [f64; 2]| ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / (length * length);
+    let tc = project(c);
+    let td = project(d);
+    let low = tc.min(td);
+    let high = tc.max(td);
+    let margin = tol / length;
+    high > margin && low < 1.0 - margin && (high - low) * length > tol
+}
+
+/// Try every route on the whole plan and keep the first conforming result.
+fn try_plan(plan: &Plan, sizing: &Sizing, tol: f64) -> Result<(Mesh, &'static str), String> {
+    let mut errors: Vec<String> = Vec::new();
+    for &(route, mesher) in &ROUTES {
+        match try_plan_route(plan, sizing, mesher, tol) {
+            Ok(mesh) => return Ok((mesh, route)),
+            Err(error) => {
+                if errors.len() < 8 {
+                    errors.push(format!("{route}: {error}"));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "no all-quad route produced a conforming feature mesh: {}",
+        errors.join("; ")
+    ))
+}
+
+/// Mesh every piece with one route, weld the channel bands and the pieces, and
+/// check the merged result.
+fn try_plan_route(plan: &Plan, sizing: &Sizing, mesher: Mesher, tol: f64) -> Result<Mesh, String> {
+    let plan_tol = seam_tolerance(&plan.measured).max(tol);
+    let mut meshes = Vec::with_capacity(plan.pieces.len());
+    for (index, piece) in plan.pieces.iter().enumerate() {
+        let piece_tol = seam_tolerance(&piece.domain).max(tol);
+        let raw = mesher(&piece.domain, sizing)
+            .map_err(|error| format!("piece {index}: the route failed: {error}"))?;
+        // The smoother never moves a boundary node, so a route whose raw
+        // boundary is already off the piece geometry cannot be repaired by it.
+        // Checking before smoothing avoids spending the smoothing pass on it.
+        let offset = verify::boundary_offset(&piece.domain, &raw);
+        if offset > piece_tol {
+            return Err(format!(
+                "piece {index}: the route's boundary is {offset:.3e} off the geometry"
+            ));
+        }
+        let finished = finish_side(&piece.domain, raw, sizing);
+        let mesh = match &piece.band {
+            None => finished,
+            Some(band) => {
+                let seam = seam_chain(&finished, &piece.band_seam, piece_tol)
+                    .map_err(|error| format!("piece {index}: the band chain: {error}"))?;
+                if !same_chain(&seam, &piece.band_seam, piece_tol) {
+                    return Err(format!(
+                        "piece {index}: the route changed the band chain ({} vs {} nodes)",
+                        seam.len(),
+                        piece.band_seam.len()
+                    ));
+                }
+                weld(band, &finished, piece_tol)?
+            }
+        };
+        meshes.push(mesh);
+    }
+    let merged = weld_all(&meshes, plan_tol)?;
     let gate = verify::gate(&merged);
     if !gate.passes() {
         return Err(format!(
-            "{route}: the merged mesh fails the gate: {}",
+            "the merged mesh fails the gate: {}",
             gate.reason()
                 .unwrap_or_else(|| "unknown reason".to_string())
         ));
@@ -1071,24 +1901,47 @@ fn try_pair(
     let topology = merged.topology();
     if topology.cracks != 0 || topology.non_manifold != 0 || topology.inconsistent != 0 {
         return Err(format!(
-            "{route}: the merged mesh is not conforming (cracks {}, non-manifold {}, \
+            "the merged mesh is not conforming (cracks {}, non-manifold {}, \
              inconsistent {})",
             topology.cracks, topology.non_manifold, topology.inconsistent
         ));
     }
-    let offset = verify::boundary_offset(parent, &merged);
-    if offset > seam_tol {
+    let offset = verify::boundary_offset(&plan.measured, &merged);
+    if offset > plan_tol {
         return Err(format!(
-            "{route}: the merged boundary is {offset:.3e} off the input geometry"
+            "the merged boundary is {offset:.3e} off the input geometry"
         ));
     }
-    Ok((merged, first_seam))
+    if !plan.samples.is_empty() {
+        let points: Vec<[f64; 2]> = merged.points.iter().map(|p| [p[0], p[1]]).collect();
+        for (index, samples) in plan.samples.iter().enumerate() {
+            if !contains_points(samples, &points, plan_tol) {
+                return Err(format!(
+                    "through feature {index}: the sampled seam nodes were not all preserved"
+                ));
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Weld a list of meshes pairwise by coordinate.
+fn weld_all(meshes: &[Mesh], tol: f64) -> Result<Mesh, String> {
+    let mut iter = meshes.iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| "internal error: the feature plan has no pieces".to_string())?;
+    let mut merged = first.clone();
+    for mesh in iter {
+        merged = weld(&merged, mesh, tol)?;
+    }
+    Ok(merged)
 }
 
 /// If a route's raw mesh does not pass the gate, try the boundary-preserving
 /// smoother and keep whichever candidate is better.  Boundary nodes are never
 /// moved by the default smoother, so the seam stays valid.
-fn finish_pair_side(domain: &Domain, mesh: Mesh, sizing: &Sizing) -> Mesh {
+fn finish_side(domain: &Domain, mesh: Mesh, sizing: &Sizing) -> Mesh {
     let raw = verify::gate(&mesh);
     if raw.passes() {
         return mesh;
@@ -1262,141 +2115,11 @@ fn polyline_parameter(points: &[[f64; 2]], target: [f64; 2], tol: f64) -> Option
 }
 
 // ---------------------------------------------------------------------------
-// Mesh generation: terminating features
+// Slots
 // ---------------------------------------------------------------------------
 
-/// One successful terminating-feature construction.
-struct TerminatingOutput {
-    mesh: Mesh,
-    route: &'static str,
-    slot: Vec<[f64; 2]>,
-    slot_width: f64,
-    slot_gap: f64,
-}
-
-/// Build the slot holes and mesh the domain with them.
-fn mesh_terminating(
-    domain: &Domain,
-    stubs: &[&[[f64; 2]]],
-    sizing: &Sizing,
-) -> Result<TerminatingOutput, String> {
-    if stubs.is_empty() {
-        return Err("no terminating feature was supplied".to_string());
-    }
-    let tol = tolerance(domain);
-    let width = SLOT_WIDTH_FACTOR * sizing.size;
-    let gap = SLOT_GAP_FACTOR * width;
-    let mut holes = domain.holes.clone();
-    let mut slots: Vec<Vec<[f64; 2]>> = Vec::with_capacity(stubs.len());
-    for (index, stub) in stubs.iter().enumerate() {
-        let slot = slot_loop(stub, width)
-            .map_err(|error| format!("terminating feature {index}: {error}"))?;
-        validate_slot(domain, &slot, tol)
-            .map_err(|error| format!("terminating feature {index}: {error}"))?;
-        for (other_index, other) in slots.iter().enumerate() {
-            if loop_polygons_intersect(&slot, other, tol) {
-                return Err(format!(
-                    "terminating features {other_index} and {index} produce overlapping slots"
-                ));
-            }
-        }
-        slots.push(slot.clone());
-        holes.push(slot);
-    }
-    let domain_with_slots =
-        Domain::new(domain.outer.clone(), holes).map_err(|error| error.to_string())?;
-    if domain_with_slots.area() <= tol * tol {
-        return Err("the slot leaves the domain with no area".to_string());
-    }
-
-    let mut errors = Vec::new();
-    for &(route, mesher) in &SLOT_ROUTES {
-        let mesh = match mesher(&domain_with_slots, sizing) {
-            Ok(mesh) => mesh,
-            Err(error) => {
-                if errors.len() < 8 {
-                    errors.push(format!("{route}: {error}"));
-                }
-                continue;
-            }
-        };
-        // Smoothing preserves every boundary node, so a route whose raw
-        // boundary is off the slot geometry cannot be repaired by it.
-        let raw_offset = verify::boundary_offset(&domain_with_slots, &mesh);
-        if raw_offset > seam_tolerance(domain) {
-            if errors.len() < 8 {
-                errors.push(format!(
-                    "{route}: boundary offset {raw_offset:.3e} is too large"
-                ));
-            }
-            continue;
-        }
-        let mesh = finish_terminating(&domain_with_slots, mesh, sizing);
-        let gate = verify::gate(&mesh);
-        if !gate.passes() {
-            if errors.len() < 8 {
-                errors.push(format!(
-                    "{route}: gate: {}",
-                    gate.reason()
-                        .unwrap_or_else(|| "unknown reason".to_string())
-                ));
-            }
-            continue;
-        }
-        let topology = mesh.topology();
-        if topology.cracks != 0 || topology.non_manifold != 0 || topology.inconsistent != 0 {
-            if errors.len() < 8 {
-                errors.push(format!(
-                    "{route}: not conforming (cracks {}, non-manifold {}, inconsistent {})",
-                    topology.cracks, topology.non_manifold, topology.inconsistent
-                ));
-            }
-            continue;
-        }
-        let offset = verify::boundary_offset(&domain_with_slots, &mesh);
-        if offset > seam_tolerance(domain) {
-            if errors.len() < 8 {
-                errors.push(format!(
-                    "{route}: boundary offset {offset:.3e} is too large"
-                ));
-            }
-            continue;
-        }
-        return Ok(TerminatingOutput {
-            mesh,
-            route,
-            slot: slots.first().cloned().unwrap_or_default(),
-            slot_width: width,
-            slot_gap: gap,
-        });
-    }
-    Err(format!(
-        "no all-quad route produced a conforming slot mesh: {}",
-        errors.join("; ")
-    ))
-}
-
-/// Smooth only if the raw mesh does not already pass the gate.
-fn finish_terminating(domain: &Domain, mesh: Mesh, sizing: &Sizing) -> Mesh {
-    let raw = verify::gate(&mesh);
-    if raw.passes() {
-        return mesh;
-    }
-    let outcome = crate::smooth::smooth(
-        domain,
-        &mesh,
-        sizing.size,
-        &crate::smooth::SmoothOptions::default(),
-    );
-    if gate_score(&verify::gate(&outcome.smoothed)) > gate_score(&raw) {
-        outcome.smoothed
-    } else {
-        mesh
-    }
-}
-
-/// Every slot point must be inside the original domain (or on its boundary) and
-/// the slot must not leave it.
+/// Every slot point must be inside its region (or on the region boundary) and
+/// the slot must not cross it.
 fn validate_slot(domain: &Domain, slot: &[[f64; 2]], tol: f64) -> Result<(), String> {
     for point in slot {
         if !domain.contains(*point) && domain.distance_to_boundary(*point) > tol {
@@ -1419,23 +2142,12 @@ fn validate_slot(domain: &Domain, slot: &[[f64; 2]], tol: f64) -> Result<(), Str
 }
 
 /// Measure one case, used by [`demo`].
-fn measure(
-    name: &str,
-    domain: &Domain,
-    mesh: &Mesh,
-    route: &str,
-    sampled_seam: bool,
-    seam_nodes: usize,
-    subdomains: usize,
-    feature_samples: usize,
-    slot_width: f64,
-    slot_gap: f64,
-) -> CaseNumbers {
-    let stats = crate::stats::MeshStatistics::of(domain, mesh);
+fn measure(name: &str, outcome: &Outcome) -> CaseNumbers {
+    let stats = crate::stats::MeshStatistics::of(&outcome.measured, &outcome.mesh);
     CaseNumbers {
         name: name.to_string(),
-        route: route.to_string(),
-        sampled_seam,
+        route: outcome.route.to_string(),
+        sampled_seam: outcome.sampled,
         quads: stats.quads,
         triangles: stats.triangles,
         min_scaled_jacobian: stats.min_scaled_jacobian,
@@ -1444,11 +2156,18 @@ fn measure(
         cracks: stats.cracks,
         boundary_offset: stats.boundary_offset,
         gate_pass: stats.passes,
-        seam_nodes,
-        subdomains,
-        feature_samples,
-        slot_width,
-        slot_gap,
+        seam_nodes: outcome.seam_nodes,
+        subdomains: outcome.subdomains,
+        feature_samples: outcome.feature_samples,
+        slot_width: outcome.slot_width,
+        slot_gap: outcome.slot_gap,
+        terminating_mode: match outcome.terminating_mode {
+            TerminatingMode::Slot => "slot".to_string(),
+            TerminatingMode::Channel => "channel".to_string(),
+        },
+        channel_width: outcome.channel_width,
+        channel_quads: outcome.channel_quads,
+        removals: outcome.removals,
     }
 }
 
@@ -1856,6 +2575,10 @@ mod tests {
             vec![vec![[1.0, 1.0], [9.0, 9.0], [9.0, 1.0], [1.0, 9.0]]],
             vec![vec![[5.0, 0.0], [5.0, 9.0], [5.0, 2.0]]],
             vec![],
+            // A terminating feature may not end on a through feature.
+            vec![vec![[5.0, 0.0], [5.0, 10.0]], vec![[2.0, 0.0], [5.0, 5.0]]],
+            // Two terminating features may not cross.
+            vec![vec![[2.0, 0.0], [2.0, 5.0]], vec![[0.0, 2.0], [4.0, 2.0]]],
         ];
         for polylines in cases {
             let features = Features::new(polylines);
@@ -1889,13 +2612,189 @@ mod tests {
     }
 
     #[test]
-    fn a_mixed_feature_set_is_rejected() {
+    fn a_cross_of_two_through_features_makes_four_sub_meshes() {
+        let domain = square();
+        let features = Features::new(vec![
+            vec![[5.0, 0.0], [5.0, 10.0]],
+            vec![[0.0, 5.0], [10.0, 5.0]],
+        ]);
+        let outcome = mesh_detailed(&domain, &features, &sizes(), &Options::default()).unwrap();
+        assert!(outcome.sampled, "the sampled seams should be preserved");
+        assert_eq!(outcome.subdomains, 4);
+        // 11 + 11 canonical samples, the centre one shared.
+        assert_eq!(outcome.seam_nodes, 21);
+        let mesh = &outcome.mesh;
+        let stats = crate::stats::MeshStatistics::of(&domain, mesh);
+        assert!(stats.passes, "{:?}", stats.gate.reason());
+        assert_eq!(stats.triangles, 0);
+        assert_eq!(stats.cracks, 0);
+        assert!(stats.boundary_offset < 1.0e-9, "{}", stats.boundary_offset);
+        // Four 5x5 quadrant grids at size 1.
+        assert_eq!(stats.quads, 100, "quads = {}", stats.quads);
+        let points: Vec<[f64; 2]> = mesh.points.iter().map(|p| [p[0], p[1]]).collect();
+        let vertical = vertical_samples();
+        let horizontal: Vec<[f64; 2]> = (0..=10).map(|k| [k as f64, 5.0]).collect();
+        assert!(contains_points(&vertical, &points, 1.0e-7));
+        assert!(contains_points(&horizontal, &points, 1.0e-7));
+        // Both seams are interior edge chains: one quad on each side.
+        for pair in vertical.windows(2) {
+            assert_eq!(edge_uses(mesh, pair[0], pair[1]), 2, "{:?}", pair);
+        }
+        for pair in horizontal.windows(2) {
+            assert_eq!(edge_uses(mesh, pair[0], pair[1]), 2, "{:?}", pair);
+        }
+        // The centre is one node shared by the four quadrants.
+        let centres = mesh
+            .points
+            .iter()
+            .filter(|p| distance([p[0], p[1]], [5.0, 5.0]) < 1.0e-8)
+            .count();
+        assert_eq!(centres, 1);
+    }
+
+    #[test]
+    fn a_cross_at_a_non_sampled_point_still_welds() {
+        // At size 2 the samples are on even coordinates, so the crossing
+        // (5,5) is not a sample of either feature: the subdivision inserts it
+        // into both seam chains.
+        let domain = square();
+        let features = Features::new(vec![
+            vec![[5.0, 0.0], [5.0, 10.0]],
+            vec![[0.0, 5.0], [10.0, 5.0]],
+        ]);
+        let sizing = Sizing::uniform(2.0).unwrap();
+        let outcome = mesh_detailed(&domain, &features, &sizing, &Options::default()).unwrap();
+        assert!(outcome.sampled);
+        assert_eq!(outcome.subdomains, 4);
+        let mesh = &outcome.mesh;
+        let stats = crate::stats::MeshStatistics::of(&domain, mesh);
+        assert!(stats.passes, "{:?}", stats.gate.reason());
+        assert_eq!(stats.triangles, 0);
+        assert_eq!(stats.cracks, 0);
+        assert!(stats.boundary_offset < 1.0e-9, "{}", stats.boundary_offset);
+        let points: Vec<[f64; 2]> = mesh.points.iter().map(|p| [p[0], p[1]]).collect();
+        assert!(contains_points(
+            &(0..=5).map(|k| [5.0, 2.0 * k as f64]).collect::<Vec<_>>(),
+            &points,
+            1.0e-7
+        ));
+        assert!(contains_points(
+            &(0..=5).map(|k| [2.0 * k as f64, 5.0]).collect::<Vec<_>>(),
+            &points,
+            1.0e-7
+        ));
+        // The crossing is one welded node.
+        assert_eq!(
+            mesh.points
+                .iter()
+                .filter(|p| distance([p[0], p[1]], [5.0, 5.0]) < 1.0e-8)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn three_through_features_make_six_sub_meshes() {
+        let domain = square();
+        let features = Features::new(vec![
+            vec![[3.0, 0.0], [3.0, 10.0]],
+            vec![[7.0, 0.0], [7.0, 10.0]],
+            vec![[0.0, 5.0], [10.0, 5.0]],
+        ]);
+        let outcome = mesh_detailed(&domain, &features, &sizes(), &Options::default()).unwrap();
+        assert!(outcome.sampled);
+        assert_eq!(outcome.subdomains, 6);
+        let mesh = &outcome.mesh;
+        let stats = crate::stats::MeshStatistics::of(&domain, mesh);
+        assert!(stats.passes, "{:?}", stats.gate.reason());
+        assert_eq!(stats.triangles, 0);
+        assert_eq!(stats.cracks, 0);
+        assert!(stats.boundary_offset < 1.0e-9, "{}", stats.boundary_offset);
+        assert_eq!(stats.quads, 100, "quads = {}", stats.quads);
+        let points: Vec<[f64; 2]> = mesh.points.iter().map(|p| [p[0], p[1]]).collect();
+        for x in [3.0, 7.0] {
+            assert!(contains_points(
+                &(0..=10).map(|k| [x, k as f64]).collect::<Vec<_>>(),
+                &points,
+                1.0e-7
+            ));
+        }
+        assert!(contains_points(
+            &(0..=10).map(|k| [k as f64, 5.0]).collect::<Vec<_>>(),
+            &points,
+            1.0e-7
+        ));
+    }
+
+    #[test]
+    fn a_through_and_a_terminating_feature_are_mixed() {
         let domain = square();
         let features = Features::new(vec![
             vec![[5.0, 0.0], [5.0, 10.0]],
             vec![[2.0, 0.0], [2.0, 5.0]],
         ]);
-        assert!(mesh(&domain, &features, &sizes()).is_err());
+        let outcome = mesh_detailed(&domain, &features, &sizes(), &Options::default()).unwrap();
+        assert!(outcome.sampled);
+        assert_eq!(outcome.subdomains, 2);
+        assert_eq!(outcome.removals, 1);
+        assert_eq!(outcome.terminating_mode, TerminatingMode::Slot);
+        let mesh = &outcome.mesh;
+        let stats = crate::stats::MeshStatistics::of(&outcome.measured, mesh);
+        assert!(stats.passes, "{:?}", stats.gate.reason());
+        assert_eq!(stats.triangles, 0);
+        assert_eq!(stats.cracks, 0);
+        assert!(stats.boundary_offset < 1.0e-9, "{}", stats.boundary_offset);
+        // The through seam is sampled on both halves and welded.
+        let points: Vec<[f64; 2]> = mesh.points.iter().map(|p| [p[0], p[1]]).collect();
+        assert!(contains_points(&vertical_samples(), &points, 1.0e-7));
+        for pair in vertical_samples().windows(2) {
+            assert_eq!(edge_uses(mesh, pair[0], pair[1]), 2, "{:?}", pair);
+        }
+        // The slot is a boundary of the left half: it is inside the original
+        // square but on the measured domain's boundary.
+        let original_offset = verify::boundary_offset(&domain, mesh);
+        assert!(original_offset > 0.4, "{original_offset}");
+        assert!(stats.quads > 0);
+    }
+
+    #[test]
+    fn a_carved_channel_is_a_meshed_boundary_band() {
+        let domain = square();
+        let features = Features::new(vec![vec![[5.0, 0.0], [5.0, 5.0]]]);
+        let options = Options {
+            terminating: TerminatingMode::Channel,
+            ..Options::default()
+        };
+        let outcome = mesh_detailed(&domain, &features, &sizes(), &options).unwrap();
+        assert_eq!(outcome.terminating_mode, TerminatingMode::Channel);
+        assert!(outcome.channel_quads > 0, "the band has no quads");
+        assert!((outcome.channel_width - CHANNEL_WIDTH_FACTOR).abs() < 1.0e-12);
+        assert_eq!(outcome.slot_width, 0.0);
+        assert_eq!(outcome.removals, 1);
+        let mesh = &outcome.mesh;
+        let stats = crate::stats::MeshStatistics::of(&outcome.measured, mesh);
+        assert!(stats.passes, "{:?}", stats.gate.reason());
+        assert_eq!(stats.triangles, 0);
+        assert_eq!(stats.cracks, 0);
+        assert!(stats.boundary_offset < 1.0e-9, "{}", stats.boundary_offset);
+        // The river slit is the only hole of the measured domain and its
+        // boundary nodes are mesh nodes: the feature is a boundary.
+        assert_eq!(outcome.measured.holes.len(), 1);
+        let river = &outcome.measured.holes[0];
+        let on_river = mesh
+            .points
+            .iter()
+            .filter(|p| {
+                let q = [p[0], p[1]];
+                let n = river.len();
+                (0..n).any(|i| point_segment_distance(q, river[i], river[(i + 1) % n]) < 1.0e-8)
+            })
+            .count();
+        assert!(on_river >= 4, "only {on_river} nodes on the river slit");
+        // The band quads are the newest contributor: the mesh is larger than
+        // the slot mesh at the same size.
+        let slot = mesh_detailed(&domain, &features, &sizes(), &Options::default()).unwrap();
+        assert!(stats.quads > slot.mesh.cells.len() - outcome.channel_quads);
     }
 
     #[test]
@@ -1908,12 +2807,39 @@ mod tests {
         assert_eq!(numbers.through_square.subdomains, 2);
         assert!(numbers.through_square.sampled_seam);
         assert_eq!(numbers.vertical_feature_samples, 11);
+
         assert!(numbers.stub_square.gate_pass);
         assert_eq!(numbers.stub_square.cracks, 0);
         assert!(numbers.stub_square.boundary_offset < 1.0e-9);
         assert!((numbers.stub_square.slot_width - 1.0).abs() < 1.0e-12);
         assert!((numbers.stub_square.slot_gap - 0.5).abs() < 1.0e-12);
+        assert_eq!(numbers.stub_square.terminating_mode, "slot");
         assert!(numbers.stub_square.quads > 0);
+
+        assert!(numbers.cross_square.gate_pass);
+        assert_eq!(numbers.cross_square.cracks, 0);
+        assert!(numbers.cross_square.boundary_offset < 1.0e-9);
+        assert_eq!(numbers.cross_square.quads, 100);
+        assert_eq!(numbers.cross_square.subdomains, 4);
+        assert_eq!(numbers.cross_square.seam_nodes, 21);
+        assert!(numbers.cross_square.sampled_seam);
+
+        assert!(numbers.t_square.gate_pass);
+        assert_eq!(numbers.t_square.cracks, 0);
+        assert!(numbers.t_square.boundary_offset < 1.0e-9);
+        assert_eq!(numbers.t_square.subdomains, 2);
+        assert_eq!(numbers.t_square.removals, 1);
+        assert_eq!(numbers.t_square.terminating_mode, "slot");
+        assert!(numbers.t_square.sampled_seam);
+
+        assert!(numbers.channel_square.gate_pass);
+        assert_eq!(numbers.channel_square.cracks, 0);
+        assert!(numbers.channel_square.boundary_offset < 1.0e-9);
+        assert_eq!(numbers.channel_square.terminating_mode, "channel");
+        assert!((numbers.channel_square.channel_width - CHANNEL_WIDTH_FACTOR).abs() < 1.0e-12);
+        assert!(numbers.channel_square.channel_quads > 0);
+        assert_eq!(numbers.channel_square.slot_width, 0.0);
+        assert_eq!(numbers.channel_square.removals, 1);
     }
 
     #[test]

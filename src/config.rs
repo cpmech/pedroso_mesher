@@ -162,11 +162,12 @@ pub enum Route {
     Sized,
 
     /// **Features** — the Simons 2024 interior-feature constraints (Chapter 2):
-    /// a through-going polyline splits the domain and both halves are meshed
-    /// with `sized`/fallbacks and welded along one sampled seam; a terminating
-    /// polyline becomes a thin slot (a hole) at the measured size. The feature
-    /// polylines come from [`MeshConfig::features`]; the route needs at least
-    /// one.
+    /// any number of through-going polylines (which may cross) subdivide the
+    /// domain into sub-regions, each meshed with `sized`/fallbacks and welded
+    /// along the sampled seams; a terminating polyline becomes a thin slot (a
+    /// hole) or a carved channel band. The feature polylines come from
+    /// [`MeshConfig::features`], the terminating mode from
+    /// [`MeshConfig::feature_options`]; the route needs at least one feature.
     Features,
 
     /// **Pipeline** — the full Simons 2024 pipeline: the size-aware GODF field
@@ -279,9 +280,18 @@ pub struct MeshConfig {
     pub pipeline: crate::simons_pipeline::Options,
 
     /// Interior feature polylines for [`Route::Features`] (empty otherwise).
-    /// A through-going polyline (both endpoints on the domain boundary) splits
-    /// the region; a terminating one becomes a slot (a thin hole).
+    /// Any number of through-going polylines (both endpoints on the domain
+    /// boundary) split the region into sub-regions, and they may cross each
+    /// other; a terminating one becomes a slot (a thin hole) or a carved
+    /// channel band, as selected by [`MeshConfig::feature_options`].
     pub features: Vec<Vec<[f64; 2]>>,
+
+    /// Options of the `features` route: how a terminating feature is
+    /// represented (a slot by default, or a carved channel band) and the
+    /// channel band width. Additive with a serde default, so older saved
+    /// configurations still load.
+    #[serde(default)]
+    pub feature_options: crate::simons_features::Options,
 }
 
 impl MeshConfig {
@@ -431,7 +441,12 @@ pub fn generate(
             let features = crate::simons_features::Features {
                 polylines: config.features.clone(),
             };
-            crate::simons_features::mesh(domain, &features, sizing)?
+            crate::simons_features::mesh_with_options(
+                domain,
+                &features,
+                sizing,
+                &config.feature_options,
+            )?
         }
     };
     // Step 2: the generator's own row. Measuring before smoothing is what lets
