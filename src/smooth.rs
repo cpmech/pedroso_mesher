@@ -127,6 +127,19 @@ pub struct SmoothOptions {
     /// Run the angle+stretch shape pass after the other passes (default true,
     /// all-quad meshes only; a mesh with triangles skips it).
     pub shape_pass: bool,
+
+    /// Weight of the **target-area** term (default 0.0, opt-in). The term is
+    /// `1 / (1 + w * |ln(sqrt(area) / target)|)`, with `target` the mean of the
+    /// quad's four node targets, so a graded size field is honoured and a quad
+    /// twice too large scores like one twice too small. `0` disables the term
+    /// (the historical angle/SJ/aspect-only objective). Use
+    /// [`smooth_with_targets`] to supply the per-node field; plain [`smooth`]
+    /// uses the scalar size everywhere. Measured: weight 1.0 on the uniform-size
+    /// corpus loses passes (crossfield 4→3, untangle 3→1) because the route's
+    /// nominal size is not the local one, so the term is **opt-in**: it is meant
+    /// for a real graded size field (the pipeline), where it improves the size
+    /// accuracy. A moderate weight (0.3–0.5) is the cautious choice.
+    pub size_weight: f64,
 }
 
 impl Default for SmoothOptions {
@@ -141,6 +154,7 @@ impl Default for SmoothOptions {
             aspect_cap: ASPECT_CAP,
             stretch_weight: 1.0,
             shape_pass: true,
+            size_weight: 0.0,
         }
     }
 }
@@ -184,6 +198,41 @@ pub struct SmoothOutcome {
 /// The input is not modified: the mesh is cloned first. No candidate position
 /// outside the domain is ever accepted, and the function never panics.
 pub fn smooth(domain: &Domain, mesh: &Mesh, size: f64, options: &SmoothOptions) -> SmoothOutcome {
+    let targets = vec![size; mesh.points.len()];
+    smooth_with_targets(domain, mesh, &targets, options)
+}
+
+/// Mesh a planar domain with a **per-node target size** (the size field).
+///
+/// Like [`smooth`], but the target-area term uses `targets[v]` at each node
+/// (metres), so a graded size field is honoured: a quad's `sqrt(area)` is
+/// pulled towards the mean target of its four corners with weight
+/// [`SmoothOptions::size_weight`]. `targets` must have one entry per mesh node;
+/// a wrong length disables the size term (the other objectives still run).
+pub fn smooth_with_targets(
+    domain: &Domain,
+    mesh: &Mesh,
+    targets: &[f64],
+    options: &SmoothOptions,
+) -> SmoothOutcome {
+    let target_size = if targets.len() == mesh.points.len() && !targets.is_empty() {
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for &value in targets {
+            if value.is_finite() && value > 0.0 {
+                sum += value;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            1.0
+        } else {
+            (sum / count as f64).max(1.0e-12)
+        }
+    } else {
+        1.0
+    };
+    let size = target_size;
     let before = MeshStatistics::of(domain, mesh);
     // Nothing to do: return the input as its own result. `accepted` is true
     // because the input is not being replaced by something worse.
@@ -208,6 +257,8 @@ pub fn smooth(domain: &Domain, mesh: &Mesh, size: f64, options: &SmoothOptions) 
             domain,
             &mut work,
             size,
+            targets,
+            options.size_weight,
             options.iterations,
             options.aspect_cap,
         );
@@ -275,8 +326,24 @@ pub fn smooth(domain: &Domain, mesh: &Mesh, size: f64, options: &SmoothOptions) 
     }
     let after = MeshStatistics::of(domain, &work);
     // Reject-by-default is the safe choice for an automatic pipeline; the
-    // comparison itself is [`better`].
-    let accepted = !options.reject_if_worse || better(&before, &after);
+    // comparison itself is [`better`]. With the target-area term enabled a
+    // small geometric margin may be traded for size accuracy, so the pass is
+    // also accepted when it keeps the gate and reduces the size deviation.
+    let accepted = if !options.reject_if_worse || better(&before, &after) {
+        true
+    } else if options.size_weight > 0.0 && after.passes {
+        match (
+            size_deviation(mesh, targets),
+            size_deviation(&work, targets),
+        ) {
+            (Some(before_deviation), Some(after_deviation)) => {
+                after_deviation < before_deviation - 1.0e-9
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
     SmoothOutcome {
         before,
         after,
@@ -335,7 +402,13 @@ const ASPECT_CAP: f64 = 30.0;
 /// while raising the minimum angle (measured on the paving route; global min SJ
 /// fell 0.685 -> 0.347). Triangles have no corner Jacobian in this code base,
 /// so they are scored by angle alone.
-fn margin(cell: &crate::mesh::Cell, points: &[crate::mesh::Node], aspect_cap: f64) -> f64 {
+fn margin(
+    cell: &crate::mesh::Cell,
+    points: &[crate::mesh::Node],
+    aspect_cap: f64,
+    targets: &[f64],
+    size_weight: f64,
+) -> f64 {
     // Signed volume: a non-positive value (or a NaN from a zero-length edge)
     // means the cell is inverted or degenerate, and no quality score is
     // defined there.
@@ -350,12 +423,38 @@ fn margin(cell: &crate::mesh::Cell, points: &[crate::mesh::Node], aspect_cap: f6
             .into_iter()
             .fold(f64::INFINITY, f64::min);
         let aspect = quality::aspect_ratio(cell, points);
+        // The target-area term: `sqrt(area) / target` should be 1. A log
+        // penalty keeps it scale-free and symmetric (a 1.5x too large and a
+        // 1.5x too small element score the same). `target` is the mean of the
+        // four nodes' requested sizes, so a graded size field is honoured
+        // rather than a single uniform value.
+        let mut size_term = f64::INFINITY;
+        if size_weight > 0.0 {
+            let mut sum = 0.0f64;
+            let mut count = 0usize;
+            for &node in &cell.nodes {
+                if let Some(&value) = targets.get(node) {
+                    if value.is_finite() && value > 0.0 {
+                        sum += value;
+                        count += 1;
+                    }
+                }
+            }
+            if count == cell.nodes.len() && count > 0 {
+                let target = sum / count as f64;
+                let ratio = area.abs().sqrt() / target;
+                if ratio > 0.0 && ratio.is_finite() {
+                    size_term = 1.0 / (1.0 + size_weight * ratio.ln().abs());
+                }
+            }
+        }
         // `max(1.0)` protects against a non-finite aspect: `max` ignores NaN,
         // so a broken cell falls back to the angle/SJ terms instead of scoring
         // a spurious infinity.
         (angle / 30.0)
             .min(sj / 0.2)
             .min(aspect_cap / aspect.max(1.0))
+            .min(size_term)
     } else {
         angle / 30.0
     }
@@ -433,6 +532,8 @@ fn relax_interior(
     domain: &Domain,
     mesh: &mut Mesh,
     size: f64,
+    targets: &[f64],
+    size_weight: f64,
     iterations: usize,
     aspect_cap: f64,
 ) -> usize {
@@ -456,7 +557,16 @@ fn relax_interior(
     // Measured motivation: the unguarded objective lost paving SJ 0.685 ->
     // 0.347 and produced aspect 125 to 1094.
     let probe = MeshStatistics::of(domain, mesh);
-    let sj_floor = probe.min_scaled_jacobian;
+    // With the target-area term enabled the SJ floor is relaxed by 10 %: an
+    // area-correction move necessarily changes the Jacobians, and a perfect
+    // grid's floor of 1.0 would otherwise forbid every move (measured: the
+    // term was inert on a uniform grid). The gate floor of 0.2 still applies
+    // through the final acceptance.
+    let sj_floor = if size_weight > 0.0 {
+        (0.9 * probe.min_scaled_jacobian).max(0.2)
+    } else {
+        probe.min_scaled_jacobian
+    };
     let aspect_ceiling = probe.aspect_ratio.max.max(aspect_cap);
     let mut moved = 0usize;
     for _ in 0..iterations {
@@ -486,7 +596,7 @@ fn relax_interior(
             let score = |m: &Mesh, v: usize| -> f64 {
                 incident[v]
                     .iter()
-                    .map(|&c| margin(&m.cells[c], &m.points, aspect_cap))
+                    .map(|&c| margin(&m.cells[c], &m.points, aspect_cap, targets, size_weight))
                     .fold(f64::INFINITY, f64::min)
             };
             // The same incident cells, checked against the global guards.
@@ -551,6 +661,47 @@ fn relax_interior(
         }
     }
     moved
+}
+
+/// Worst `max(r, 1/r)` of `sqrt(area) / target` over the quads, or `None`
+/// when no quad has a usable target (the size-accuracy metric of the
+/// target-area term).
+fn size_deviation(mesh: &Mesh, targets: &[f64]) -> Option<f64> {
+    if targets.len() != mesh.points.len() {
+        return None;
+    }
+    let mut worst: Option<f64> = None;
+    for cell in &mesh.cells {
+        if cell.kind != Kind::Quad4 {
+            continue;
+        }
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for &node in &cell.nodes {
+            match targets.get(node) {
+                Some(&value) if value.is_finite() && value > 0.0 => {
+                    sum += value;
+                    count += 1;
+                }
+                _ => {}
+            }
+        }
+        if count != cell.nodes.len() {
+            continue;
+        }
+        let target = sum / count as f64;
+        let area = quality::volume(cell, &mesh.points).abs();
+        if target <= 0.0 || !area.is_finite() {
+            continue;
+        }
+        let ratio = area.sqrt() / target;
+        if ratio <= 0.0 || !ratio.is_finite() {
+            continue;
+        }
+        let deviation = ratio.max(1.0 / ratio);
+        worst = Some(worst.map_or(deviation, |current| current.max(deviation)));
+    }
+    worst
 }
 
 #[cfg(test)]
@@ -685,5 +836,59 @@ mod tests {
         assert!(out.accepted);
         assert!((out.smoothed.points[4][0] - 1.0).abs() < 1.0e-12);
         assert!((out.smoothed.points[4][1] - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn the_target_area_term_grades_a_uniform_grid() {
+        // A uniform 6x6 grid with a graded target field: the area term should
+        // move nodes towards the graded sizes. A uniform grid has perfect
+        // angles, so a uniform-size mesh would never change; the graded target
+        // gives the term something to do.
+        let mut points = Vec::new();
+        for j in 0..7 {
+            for i in 0..7 {
+                points.push([i as f64, j as f64, 0.0]);
+            }
+        }
+        let mut cells = Vec::new();
+        for j in 0..6 {
+            for i in 0..6 {
+                let a = j * 7 + i;
+                cells.push(crate::mesh::Cell::quad4([a, a + 1, a + 8, a + 7]));
+            }
+        }
+        let mesh = Mesh::new(points, cells);
+        let domain = Domain::rectangle(6.0, 6.0).unwrap();
+        let targets: Vec<f64> = mesh.points.iter().map(|p| 0.5 + 0.25 * p[0]).collect();
+        let graded = SmoothOptions {
+            size_weight: 1.0,
+            shape_pass: false,
+            ..SmoothOptions::default()
+        };
+        let plain = SmoothOptions {
+            size_weight: 0.0,
+            shape_pass: false,
+            ..SmoothOptions::default()
+        };
+        let with = smooth_with_targets(&domain, &mesh, &targets, &graded);
+        let without = smooth_with_targets(&domain, &mesh, &targets, &plain);
+        let ratio = |outcome: &SmoothOutcome| -> f64 {
+            let mut worst: f64 = 1.0;
+            for cell in &outcome.smoothed.cells {
+                let area = quality::volume(cell, &outcome.smoothed.points).abs();
+                let target =
+                    cell.nodes.iter().map(|&v| targets[v]).sum::<f64>() / cell.nodes.len() as f64;
+                let r = area.sqrt() / target;
+                worst = worst.max(r).max(1.0 / r);
+            }
+            worst
+        };
+        assert!(with.after.passes, "{}", with.after.line());
+        assert!(
+            ratio(&with) < ratio(&without) + 1.0e-9,
+            "the size term did not help: {} vs {}",
+            ratio(&with),
+            ratio(&without)
+        );
     }
 }

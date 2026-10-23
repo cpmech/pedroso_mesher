@@ -425,7 +425,7 @@ where
     };
 
     let (mesh, smoothing_error) = if options.smooth {
-        match smooth_mesh(domain, &mesh) {
+        match smooth_mesh(domain, &mesh, sigma) {
             Ok((smoothed, smoothing)) => {
                 trace.smoothing = Some(smoothing);
                 (smoothed, None)
@@ -834,8 +834,12 @@ where
 // Step 5: smoothing
 // ---------------------------------------------------------------------------
 
-/// Smooth with the thesis angle + stretch objective, boundary fixed.
-fn smooth_mesh(domain: &Domain, mesh: &Mesh) -> Result<(Mesh, Smoothing), String> {
+/// Smooth with the thesis angle + stretch objective, boundary fixed, then with
+/// the product smoother's **target-area** term against the size field.
+fn smooth_mesh<F>(domain: &Domain, mesh: &Mesh, sigma: &F) -> Result<(Mesh, Smoothing), String>
+where
+    F: Fn(f64, f64) -> f64,
+{
     let size = mean_quad_size(mesh)?;
     let options = simons_smooth::Options {
         iterations: SMOOTH_ITERATIONS,
@@ -845,11 +849,33 @@ fn smooth_mesh(domain: &Domain, mesh: &Mesh) -> Result<(Mesh, Smoothing), String
     };
     let outcome = simons_smooth::smooth_with_stats(domain, mesh, size, &options)
         .map_err(|error| format!("smoothing: {error}"))?;
+    let mut smoothed = outcome.mesh.clone();
+    // The thesis smoother has no size term; the product smoother does. Pull
+    // `sqrt(area)` towards sigma at each node, keeping the mesh only when the
+    // gate survives (the smoother's own acceptance also checks the size).
+    let targets: Vec<f64> = smoothed
+        .points
+        .iter()
+        .map(|point| sigma(point[0], point[1]))
+        .collect();
+    let product = crate::smooth::smooth_with_targets(
+        domain,
+        &smoothed,
+        &targets,
+        &crate::smooth::SmoothOptions {
+            size_weight: 1.0,
+            ..crate::smooth::SmoothOptions::default()
+        },
+    );
+    if product.accepted && product.after.passes {
+        smoothed = product.smoothed;
+    }
+    let after = crate::simons_smooth::measure(&smoothed).unwrap_or(outcome.after);
     Ok((
-        outcome.mesh,
+        smoothed,
         Smoothing {
             before: outcome.before,
-            after: outcome.after,
+            after,
             sweeps: outcome.sweeps,
             moved_nodes: outcome.moved_nodes,
         },
