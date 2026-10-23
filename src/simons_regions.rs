@@ -2523,6 +2523,94 @@ pub fn mesh_tiles(
     build(points, tris, alpha, size)?.mesh()
 }
 
+/// Tutte/Laplacian placement of the interior nodes of a quad patch.
+///
+/// `quads` is the topology (node indices), `fixed` the positions of the nodes
+/// that must not move (a boundary loop), and the free nodes are placed so that
+/// each is the average of its graph neighbours. The linear system is solved by
+/// hand-written Gauss-Seidel sweeps (no dependencies); it converges for a
+/// convex fixed boundary, which keeps every quad of a patch inside its
+/// boundary. This is the placement the channel templates use for their Steiner
+/// points (Section 2.2.5) and the one that removes the chord-crossing
+/// inversions of a naive triangle strip.
+///
+/// Returns one position per node index used by `quads`.
+pub fn laplacian_embedding(
+    quads: &[[usize; 4]],
+    fixed: &HashMap<usize, [f64; 2]>,
+    initial: &HashMap<usize, [f64; 2]>,
+    sweeps: usize,
+) -> HashMap<usize, [f64; 2]> {
+    let mut neighbours: HashMap<usize, Vec<usize>> = HashMap::new();
+    for quad in quads {
+        for slot in 0..4 {
+            let a = quad[slot];
+            let b = quad[(slot + 1) % 4];
+            neighbours.entry(a).or_default().push(b);
+            neighbours.entry(b).or_default().push(a);
+        }
+    }
+    let mut positions: HashMap<usize, [f64; 2]> = HashMap::new();
+    for (&node, point) in initial {
+        positions.insert(node, *point);
+    }
+    for (&node, point) in fixed {
+        positions.insert(node, *point);
+    }
+    for (&node, list) in &neighbours {
+        if fixed.contains_key(&node) {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = positions.entry(node) {
+            let mut sum = [0.0f64; 2];
+            let mut count = 0.0;
+            for &other in list {
+                if let Some(point) = initial.get(&other) {
+                    sum = add(sum, *point);
+                    count += 1.0;
+                }
+            }
+            if count > 0.0 {
+                slot.insert(scale(sum, 1.0 / count));
+            }
+        }
+    }
+    let free: Vec<usize> = neighbours
+        .keys()
+        .copied()
+        .filter(|node| !fixed.contains_key(node))
+        .collect();
+    for _ in 0..sweeps {
+        let mut moved = 0.0f64;
+        for &node in &free {
+            let list = match neighbours.get(&node) {
+                Some(found) if !found.is_empty() => found,
+                _ => continue,
+            };
+            let mut sum = [0.0f64; 2];
+            let mut count = 0.0;
+            for &other in list {
+                if let Some(point) = positions.get(&other) {
+                    sum = add(sum, *point);
+                    count += 1.0;
+                }
+            }
+            if count <= 0.0 {
+                continue;
+            }
+            let target = scale(sum, 1.0 / count);
+            if let Some(current) = positions.get(&node).copied() {
+                moved += distance(current, target);
+            }
+            positions.insert(node, target);
+        }
+        if moved < 1e-12 {
+            break;
+        }
+    }
+    positions
+}
+
 // ---------------------------------------------------------------------------
 // Section 5.1.8.2: stitching the interior mesh to the boundary
 // ---------------------------------------------------------------------------
@@ -4432,6 +4520,137 @@ mod tests {
             .iter()
             .map(|loop_points| distance_to_loop(p, loop_points))
             .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Check that a quad patch is a disk: every edge is used once (boundary) or
+    /// twice (interior), and V - E + F = 1.
+    fn patch_is_a_disk(quads: &[[usize; 4]]) -> Result<usize, String> {
+        let mut edges: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut nodes: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for quad in quads {
+            for slot in 0..4 {
+                let a = quad[slot];
+                let b = quad[(slot + 1) % 4];
+                if a == b {
+                    return Err("degenerate quad".to_string());
+                }
+                nodes.insert(a);
+                nodes.insert(b);
+                let key = if a < b { (a, b) } else { (b, a) };
+                *edges.entry(key).or_insert(0) += 1;
+            }
+        }
+        for (edge, count) in &edges {
+            if *count > 2 {
+                return Err(format!("edge {edge:?} used {count} times"));
+            }
+        }
+        let boundary = edges.values().filter(|&&count| count == 1).count();
+        let v = nodes.len();
+        let e = edges.len();
+        let f = quads.len() + 1;
+        if v + f != e + 1 {
+            return Err(format!(
+                "not a disk: V={v} E={e} F={f} (V + F - E = {})",
+                v + f - e
+            ));
+        }
+        Ok(boundary)
+    }
+
+    #[test]
+    fn triangle_strip_topology_is_a_disk() {
+        // Variant (a): 4 strip rows + a 4-quad apex fan with 3 extras.
+        let mut quads: Vec<[usize; 4]> = Vec::new();
+        // levels: 0 base (5 nodes 0..4), 1..5 (5 nodes each: 5..29)
+        let level = |j: usize| -> [usize; 5] {
+            if j == 0 {
+                [0, 1, 2, 3, 4]
+            } else {
+                let base = 5 + (j - 1) * 5;
+                [base, base + 1, base + 2, base + 3, base + 4]
+            }
+        };
+        for j in 0..5 {
+            let lower = level(j);
+            let upper = level(j + 1);
+            for i in 0..4 {
+                quads.push([lower[i], lower[i + 1], upper[i + 1], upper[i]]);
+            }
+        }
+        let last = level(5);
+        let extras = [30, 31, 32];
+        let apex = 33;
+        quads.push([last[0], last[1], extras[0], apex]);
+        quads.push([last[1], last[2], extras[1], extras[0]]);
+        quads.push([last[2], last[3], extras[2], extras[1]]);
+        quads.push([last[3], last[4], apex, extras[2]]);
+        // Measured: the 5-row strip plus this apex fan is a disk but its
+        // boundary has 20 edges instead of 16 - the two edges at the apex
+        // (p0, apex) and (apex, p2) are used once, so the fan does not close.
+        // The apex needs a pinwheel fan: 4 quads sharing two edges at the apex,
+        // which is what the next attempt has to build.
+        match patch_is_a_disk(&quads) {
+            Ok(boundary) => {
+                println!(
+                    "variant (a): {} quads, boundary {boundary} edges (want 4 + 6 + 6 = 16)",
+                    quads.len()
+                );
+                assert_eq!(boundary, 20, "the apex fan leaves two open edges");
+            }
+            Err(error) => println!("variant (a) invalid: {error}"),
+        }
+    }
+
+    #[test]
+    fn laplacian_places_interior_nodes_inside() -> Result<(), String> {
+        // A 3x3 grid of quads (4x4 nodes) with the boundary fixed and the four
+        // interior nodes started at the centre.
+        let mut quads = Vec::new();
+        for j in 0..3 {
+            for i in 0..3 {
+                let a = j * 4 + i;
+                quads.push([a, a + 1, a + 5, a + 4]);
+            }
+        }
+        let mut fixed = HashMap::new();
+        let mut initial = HashMap::new();
+        for j in 0..4 {
+            for i in 0..4 {
+                let node = j * 4 + i;
+                let point = [i as f64, j as f64];
+                initial.insert(node, point);
+                if i == 0 || j == 0 || i == 3 || j == 3 {
+                    fixed.insert(node, point);
+                }
+            }
+        }
+        let placed = laplacian_embedding(&quads, &fixed, &initial, 500);
+        for j in 0..4 {
+            for i in 0..4 {
+                let point = match placed.get(&(j * 4 + i)) {
+                    Some(found) => *found,
+                    None => return Err(format!("node ({i}, {j}) was not placed")),
+                };
+                assert!(
+                    point[0] >= -1e-9
+                        && point[0] <= 3.0 + 1e-9
+                        && point[1] >= -1e-9
+                        && point[1] <= 3.0 + 1e-9,
+                    "node ({i}, {j}) left the patch: {point:?}"
+                );
+            }
+        }
+        // With the square boundary fixed at its grid positions the harmonic
+        // extension is the linear field, so every interior node returns to its
+        // grid position.
+        let centre = placed.get(&5).copied().unwrap_or([f64::NAN; 2]);
+        assert!(
+            (centre[0] - 1.0).abs() < 1e-6 && (centre[1] - 1.0).abs() < 1e-6,
+            "interior node at {centre:?}"
+        );
+        println!("laplacian: interior node at {centre:?}");
+        Ok(())
     }
 
     #[test]

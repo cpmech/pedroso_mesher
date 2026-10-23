@@ -75,13 +75,13 @@
 //! * **Corpus stepped section** (60×40 with a notch, size 1): 2300 quads
 //!   (2084 interior + 216 channel), same δ = 1.0h path, min SJ 1.0000,
 //!   angles 90°–90°, aspect 1.00, cracks 0, offset 0, Acceptable.
-//! * **Perf plate** (100×60, 64-gon hole r = 10, size 0.6): 15,520 quads in
-//!   ~0.35 s; the channel closes at δ = 1.4h through a **projection row strip**
-//!   between the staircase grid hole loop and the 64-gon domain hole. Raw
-//!   min SJ 0.0874, angles 5.01°–174.71°, verdict BelowTarget (not Refused):
-//!   the worst quad is a sliver where a radial staircase step is almost
-//!   parallel to its cross edge. The mesh is all-quad and conforming; a split
-//!   or cap at those steps is the remaining quality improvement.
+//! * **Perf plate** (100×60, 64-gon hole r = 10, size 0.6): 15,526 quads in
+//!   ~0.4 s; the channel closes at δ = 1.4h through a **projection row strip**
+//!   between the staircase grid hole loop and the 64-gon domain hole, at the
+//!   half-cell grid offset `(0, 0.5)` chosen by the guarded offset retry
+//!   described below. Raw min SJ 0.2344, angles 13.55°–165.71°; after the
+//!   shared smoother and shape pass SJ 0.391 / 30.9°, which is the integrated
+//!   7/7 result. The default `(0,0)` placement is still 0.0874 / 5.01°.
 //! * **Corpus ring section** (quarter annulus, R20/R10, size 1): 48 quads,
 //!   min SJ 0.9979, angles 87.50°–93.75°, aspect 7.66, cracks 0, boundary
 //!   offset 4.4e-16, verdict Acceptable (PASS), produced by the **two-chain
@@ -115,8 +115,34 @@
 //!   single boundary cross edge is merged with each neighbour and kept as a
 //!   megapatch if the union is 4–8-sided and meshalable. It is used when the
 //!   greedy cover leaves faces uncovered; the resulting cover is kept only if
-//!   it covers more area. The widest-path cycle cover (§2.2.8) is not
-//!   implemented; greedy remains the selection rule.
+//!   it covers more area.
+//! * **§2.2.8 widest-path cycle cover** is implemented (`widest_path_cycle`).
+//!   Patches are classified by their boundary cross-edge count into **caps**
+//!   (one, a dead end), **beads** (two, a chain link) and **junctions** (three
+//!   or more); a patch whose boundary contains a contiguous run of a channel
+//!   loop's edges covers exactly that run, so an exact cover of the loop is a
+//!   partition of its edge cycle into patch runs. Fixing the patch that covers
+//!   the loop's first edge turns the cycle into a line and the bottleneck DP
+//!   `width[t + len(p)] = max(width[t + len(p)], min(width[t], rank(p)))`
+//!   (the widest-path search of the thesis, specialised to a loop) finds the
+//!   cover that maximises the minimum rank. The selection is validated (patch
+//!   faces pairwise disjoint) and its covered area measured. Greedy + cap
+//!   megapatches remain the fallback; the cycle cover is kept only when it
+//!   covers **at least as much area** with a **strictly better** minimum rank.
+//!   Measured on the two channels where the patch stage runs (δ = 1.0h):
+//!   l-bracket 828 patches (546 usable) → greedy 69 patches / 100 % / rank
+//!   1.0000, cycle 69 patches / 99.26 % / rank 1.0000 (rejected: less area);
+//!   stepped 1311 patches (866 usable) → greedy 109 / 100 % / 1.0000, cycle
+//!   108 / 99.07 % / 1.0000 (rejected). The rectilinear corpus channels are
+//!   perfectly griddable, so greedy already attains the optimum and the cycle
+//!   cover never replaces it; a synthetic ring channel with varying patch ranks
+//!   is used in the unit tests to prove that the DP does beat greedy
+//!   (0.9 against 0.5 minimum rank at equal coverage).
+//!
+//!   The plates cannot use either cover: their two channel components (outer
+//!   band and hole band) are not connected by the 4h cross-edge search, so
+//!   `build_faces` returns "the cross-edge search did not connect the channel
+//!   loops" at every tried width and the ribbon path handles them.
 //! * **Template set**: six-gons use the 0/1/2-Steiner templates (the convex
 //!   3-Steiner configuration is necessarily a doublet or a central triangular
 //!   hole, so it is not generated). Eight-gons use the recursive cuts from
@@ -125,25 +151,43 @@
 //!
 //! # Known quality limit: the 0.6 mm perf plate
 //!
-//! A cap-aware projection strip was implemented and measured for the staircase
-//! hole band: a cap consumes two grid edges and one inner vertex where a grid
-//! edge is nearly radial (the 5° sliver). Its best minimum rank was 0.14
-//! (≈12°), and the node mapping could make the cap strip overlap neighbouring
-//! bands; it cannot reach the 30° target, so it is **not enabled**.
-//!
 //! The 5° angle is a **boundary-vertex angle**: at the offending grid vertex
 //! the two boundary edges are a fixed grid edge and the cross edge to the
-//! projected inner node. Interior topology (a fan) can only split that angle
-//! into smaller pieces, and a windowed slide of the inner projection along the
-//! domain hole was measured with no change. Raising it to 30° therefore needs
-//! changing the grid-edge / inner-boundary correspondence itself (splitting the
-//! grid edge together with its adjacent grid quad and remapping the staircase),
-//! not just an interior fan. The raw perf mesh stays at min SJ 0.0874 / 5.01°
-//! (BelowTarget); the shared smoother and shape pass take it to SJ 0.513 /
-//! 36.4°, which is the integrated 7/7 result.
+//! projected inner node, and both are nearly radial where the circular hole is
+//! tangent to a grid direction. Measured on the worst quad of the δ = 1.4h
+//! channel (grid vertex `(51.0, 18.6)`, grid edge `(0, 0.6)`, cross edge
+//! `(-0.042, 0.481)`): **4.99°**. Two remedies were measured:
 //!
-//! * **Covering (§2.2.7–2.2.9)**: the full megapatch/widest-path search is not
-//!   implemented. Patches are scored and selected by a greedy cover: repeatedly
+//! * **Grid-edge + adjacent-grid-quad 2-refinement** (split the offending grid
+//!   edge and remap the projection row). Splitting the edge inserts a midpoint
+//!   `m = (51.0, 18.9)` and its radial projection `(50.897, 20.040)`; the two
+//!   sub-quads have corner angles **4.99°** and **5.15°** — the offending angle
+//!   is unchanged, because both its edges are radial and the split subdivides
+//!   the same direction. Moving the angle requires pairing the boundary vertex
+//!   with an inner node far along the hole; measured: pairing 10° of arc away
+//!   gives 52.5° at that corner, but the quad then spans a 1.7 mm chord over a
+//!   0.6 mm outer edge and the neighbouring column folds unless a fan absorbs
+//!   the skipped inner nodes, which drops the rank below the target. The
+//!   refinement is therefore **reverted**, not enabled.
+//! * **Grid offset** (thesis §2.2.2/§2.3: the grid is placed with a
+//!   user-defined offset, and failed cases often succeed under another).
+//!   `build_ribbon_with_delta` re-places the grid at the half-cell offsets
+//!   `[[0,0], [0.5,0], [0,0.5], [0.5,0.5]]` **only when the default placement
+//!   succeeds with raw min SJ < 0.2**, and keeps the best. Measured offsets on
+//!   the 0.6 mm perf plate (raw min SJ / min angle): `(0,0)` 0.0874 / 5.01°,
+//!   `(0.5,0)` 0.0960 / 5.51°, `(0,0.5)` **0.2344 / 13.55°**, `(0.5,0.5)`
+//!   0.1827 / 10.53°; quarter-cell offsets were swept and none did better. The
+//!   plate is now built at `(0, 0.5)` with **15 526 quads**, raw min SJ
+//!   **0.2344** (target ≥ 0.2 met) and min angle **13.55°** (target ≥ 30° not
+//!   met — a residual tangency at the right of the hole, where a radial grid
+//!   step and the radial cross edge are still nearly parallel). After the
+//!   shared smoother and shape pass: SJ **0.391**, angles **30.9°–165.6°**,
+//!   Sized 7/7 PASS. Every other corpus part keeps its default placement bit
+//!   for bit.
+//!
+//! * **Covering (§2.2.7–2.2.9)**: the greedy cover is the fallback (the
+//!   widest-path cycle cover above is tried first). Patches are scored and
+//!   selected by a greedy cover: repeatedly
 //!   take the patch that adds the largest uncovered channel area, breaking ties
 //!   by the better rank. Overlaps are impossible by construction because a
 //!   patch is a union of whole channel faces; a patch is only taken when all of
@@ -156,15 +200,14 @@
 //!   patches (5 and 7 sides) are kept as candidates but not quadrangulated:
 //!   splitting a shared cross edge would require every neighbouring patch to
 //!   agree on the split. Their area goes to the fallback.
-//! * **Megapatches and the widest-path cover (§2.2.7–2.2.8) are not
-//!   implemented.** The widest-path machinery exists only as the A/B/C ribbon
-//!   dynamic program (`dp_ribbon`): strip quads plus caps that absorb a
-//!   loop-count mismatch. Its caps are degenerate when three consecutive
-//!   boundary vertices are collinear, which is exactly the common case on a
-//!   straight run, so it does not close the wide-leg corpus channels. What
-//!   unlocked the corpus L and stepped sections instead was the adaptive
-//!   channel width above, which keeps the regular grid close enough to the
-//!   boundary that the ordinary template cover closes the remaining thin band.
+//! * **Ribbon dynamic program** (`dp_ribbon`, the A/B/C widest-path ribbon):
+//!   strip quads plus caps that absorb a loop-count mismatch. Its caps are
+//!   degenerate when three consecutive boundary vertices are collinear, which
+//!   is exactly the common case on a straight run, so it does not close the
+//!   wide-leg corpus channels. What unlocked the corpus L and stepped sections
+//!   instead was the adaptive channel width above, which keeps the regular grid
+//!   close enough to the boundary that the ordinary template cover closes the
+//!   remaining thin band.
 //! * **Adaptive channel width**: `build` tries δ = 1.4h, then 1.0h, then 0.7h,
 //!   returning the first valid all-quad mesh. This deviates from the thesis'
 //!   fixed δ = 1.4h, but it is what lets the corpus L and stepped sections
@@ -290,11 +333,13 @@ pub struct ChannelLoop {
 /// Numbers collected while building one channel mesh.
 #[derive(Clone, Debug, Default)]
 pub struct ChannelStats {
-    /// Which construction produced the mesh: "boundary-ribbon" or
-    /// "templates+greedy".
+    /// Which construction produced the mesh: "boundary-ribbon",
+    /// "templates+greedy" or "templates+widest-path".
     pub method: &'static str,
     /// Channel-width factor used (1.4 is the thesis default).
     pub delta_factor: f64,
+    /// Grid offset used, in cell units (the thesis' grid placement knob).
+    pub grid_shift: [f64; 2],
     /// Grid vertices that survived the cull.
     pub grid_vertices: usize,
     /// Quads promoted from the regular grid.
@@ -311,10 +356,27 @@ pub struct ChannelStats {
     pub patches: usize,
     /// Candidate patches for which a template produced a valid quadrangulation.
     pub usable_patches: usize,
-    /// Patches picked by the greedy cover.
+    /// Patches picked by the cover.
     pub selected_patches: usize,
     /// Channel area fraction filled before the fallback (ribbon path: 1.0).
     pub greedy_covered_fraction: f64,
+    /// Minimum rank of the selected patches (ribbon path: its worst quad).
+    pub selected_min_rank: f64,
+    /// Candidate patches with exactly one cross edge (dead ends, §2.2.7).
+    pub caps: usize,
+    /// Candidate patches with exactly two cross edges (chain links, §2.2.7).
+    pub beads: usize,
+    /// Candidate patches with three or more cross edges (branches, §2.2.7).
+    pub junctions: usize,
+    /// Patches selected by the widest-path cycle cover (§2.2.8); 0 when the
+    /// cover was not attempted.
+    pub cycle_selected_patches: usize,
+    /// Area fraction covered by the widest-path cycle cover.
+    pub cycle_covered_fraction: f64,
+    /// Minimum patch rank of the widest-path cycle cover.
+    pub cycle_min_rank: f64,
+    /// Whether the returned cover is the widest-path cycle cover.
+    pub cycle_used: bool,
     /// Leftover regions closed by the fallback.
     pub fallback_regions: usize,
     /// Quads produced by the fallback.
@@ -372,6 +434,35 @@ pub struct DemoNumbers {
     pub square_with_hole: Option<CaseNumbers>,
     /// Why the square-with-a-hole case failed, when it did.
     pub square_with_hole_error: Option<String>,
+}
+
+/// Cover numbers of one channel (§2.2.7–§2.2.8): the greedy cover, the
+/// widest-path cycle cover, and the patch classification.
+#[derive(Clone, Debug, Default)]
+pub struct CoverCase {
+    pub name: &'static str,
+    pub delta_factor: f64,
+    pub loops: usize,
+    pub faces: usize,
+    pub patches: usize,
+    pub usable_patches: usize,
+    pub caps: usize,
+    pub beads: usize,
+    pub junctions: usize,
+    /// Patches and area fraction of the plain greedy cover.
+    pub greedy_selected: usize,
+    pub greedy_fraction: f64,
+    pub greedy_min_rank: f64,
+    /// Patches, area fraction and minimum rank of the widest-path cycle cover
+    /// (zeros when no cycle cover was found).
+    pub cycle_selected: usize,
+    pub cycle_fraction: f64,
+    pub cycle_min_rank: f64,
+    /// Cover finally kept by [`select_cover`].
+    pub cover_selected: usize,
+    pub cover_fraction: f64,
+    pub cover_min_rank: f64,
+    pub used_cycle: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1089,113 @@ pub fn demo() -> Result<DemoNumbers, String> {
     })
 }
 
+/// Measure the two covers on the channels of the corpus (§2.2.7–§2.2.8).
+///
+/// Runs the patch construction at every adaptive channel width on the 0.6 mm
+/// perf plate (the widest channel of the corpus) and at the chosen width on the
+/// other corpus parts. Each row reports the coverage fraction, the number of
+/// selected patches, the minimum rank and the cap/bead/junction split for both
+/// the greedy cover and the widest-path cycle cover.
+pub fn cover_demo() -> Result<Vec<CoverCase>, String> {
+    let cases: Vec<(&'static str, Domain, f64)> = vec![
+        (
+            "perf-0.6mm",
+            Domain::plate_with_hole(100.0, 60.0, 10.0, 64).map_err(|e| e.to_string())?,
+            0.6,
+        ),
+        (
+            "plate-2mm",
+            Domain::plate_with_hole(100.0, 60.0, 10.0, 24).map_err(|e| e.to_string())?,
+            2.0,
+        ),
+        (
+            "l-bracket",
+            Domain::new(
+                vec![
+                    [0.0, 0.0],
+                    [80.0, 0.0],
+                    [80.0, 20.0],
+                    [20.0, 20.0],
+                    [20.0, 60.0],
+                    [0.0, 60.0],
+                ],
+                vec![],
+            )
+            .map_err(|e| e.to_string())?,
+            2.0,
+        ),
+        (
+            "stepped",
+            Domain::new(
+                vec![
+                    [0.0, 0.0],
+                    [60.0, 0.0],
+                    [60.0, 40.0],
+                    [30.0, 40.0],
+                    [30.0, 30.0],
+                    [20.0, 30.0],
+                    [20.0, 40.0],
+                    [0.0, 40.0],
+                ],
+                vec![],
+            )
+            .map_err(|e| e.to_string())?,
+            1.0,
+        ),
+    ];
+    let mut out = Vec::new();
+    for (name, domain, size) in cases {
+        let trial_deltas: &[f64] = if name == "perf-0.6mm" {
+            &ADAPTIVE_DELTAS
+        } else {
+            &ADAPTIVE_DELTAS[1..2]
+        };
+        for &delta in trial_deltas {
+            if let Some(case) = cover_case(name, &domain, size, delta) {
+                out.push(case);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn cover_case(name: &'static str, domain: &Domain, size: f64, delta: f64) -> Option<CoverCase> {
+    let prepared = prepare(domain, size, delta).ok()?;
+    let cross_edges = build_cross_edges(&prepared, domain).ok()?;
+    let faces = build_faces(&prepared, &cross_edges, domain).ok()?;
+    let mut patches = build_patches(&faces, &cross_edges);
+    let mut pos = prepared.pos.clone();
+    finalize_patches(&mut patches, &pos, None);
+    let cross: HashSet<(usize, usize)> = cross_edges.iter().map(|&(a, b)| edge_key(a, b)).collect();
+    let (greedy_selected, greedy_fraction) = greedy_cover(&faces, &patches);
+    let selection = select_cover(&prepared, &faces, &patches, &cross, &pos);
+    let _ = &mut pos;
+    Some(CoverCase {
+        name,
+        delta_factor: delta,
+        loops: prepared.loops.len(),
+        faces: faces.len(),
+        patches: patches.len(),
+        usable_patches: patches
+            .iter()
+            .filter(|patch| patch.decomposition.is_some())
+            .count(),
+        caps: selection.caps,
+        beads: selection.beads,
+        junctions: selection.junctions,
+        greedy_selected: greedy_selected.len(),
+        greedy_fraction,
+        greedy_min_rank: selection_rank(&patches, &greedy_selected),
+        cycle_selected: selection.cycle_selected,
+        cycle_fraction: selection.cycle_fraction,
+        cycle_min_rank: selection.cycle_min_rank,
+        cover_selected: selection.selected.len(),
+        cover_fraction: selection.fraction,
+        cover_min_rank: selection.min_rank,
+        used_cycle: selection.used_cycle,
+    })
+}
+
 fn case_numbers(domain: &Domain, size: f64) -> Result<CaseNumbers, String> {
     let (_, stats) = mesh_with_stats(domain, size)?;
     Ok(CaseNumbers {
@@ -1071,14 +1269,29 @@ impl Prepared {
 }
 
 fn prepare(domain: &Domain, size: f64, delta: f64) -> Result<Prepared, String> {
+    prepare_shifted(domain, size, delta, 0.0, 0.0)
+}
+
+/// Grid offsets tried, in half-cell units, when the default alignment leaves a
+/// poor ribbon (thesis §2.2.2/§2.3: the grid is placed with a user-defined
+/// orientation and offset; failed cases often succeed under another offset).
+pub const GRID_SHIFTS: [[f64; 2]; 4] = [[0.0, 0.0], [0.5, 0.0], [0.0, 0.5], [0.5, 0.5]];
+
+fn prepare_shifted(
+    domain: &Domain,
+    size: f64,
+    delta: f64,
+    shift_x: f64,
+    shift_y: f64,
+) -> Result<Prepared, String> {
     let h = check_request(domain, size)?;
     let mut pos: Vec<[f64; 2]> = Vec::new();
     let (boundary_loops, domain_edges) = discretize_boundary(domain, h, &mut pos)?;
 
     // A regular grid, aligned to the lower-left lattice line.
     let (min_x, min_y, max_x, max_y) = domain_bounds(domain);
-    let ox = (min_x / h).floor() * h;
-    let oy = (min_y / h).floor() * h;
+    let ox = (min_x / h).floor() * h + shift_x * h;
+    let oy = (min_y / h).floor() * h + shift_y * h;
     let nx = ((max_x - ox) / h).ceil() as i64 + 2;
     let ny = ((max_y - oy) / h).ceil() as i64 + 2;
 
@@ -2462,6 +2675,394 @@ fn add_megapatches(
     extras
 }
 
+// ---------------------------------------------------------------------------
+// Widest-path cycle cover (§2.2.7–§2.2.8)
+//
+// Each candidate patch is classified by the number of cross edges on its
+// boundary: a *cap* has one (a dead end of the channel), a *bead* has two (a
+// link of a chain) and a *junction* has three or more (a branch). A covering
+// of a channel loop is a cyclic sequence of patches in which consecutive
+// patches share a cross edge, exactly as §2.2.8 describes.
+//
+// The thesis solves that sequence with a widest-path (bottleneck) Dijkstra
+// variant: the width of a path is the minimum rank of its patches and the
+// cover maximises the width. Here the patches are ordered by their footprints
+// on one channel boundary loop: a patch whose boundary contains a contiguous
+// run of that loop's edges can only cover those edges, so an exact cover of
+// the loop is a partition of its edge cycle into patch runs, and the widest
+// path is a dynamic program over the cycle (fix the patch that covers the
+// first edge, then run the bottleneck DP and close the cycle). This is the
+// same search the thesis performs, specialised to the case where the patches
+// can be ordered along one loop.
+// ---------------------------------------------------------------------------
+
+/// Classification of a patch by its number of boundary cross edges (§2.2.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PatchClass {
+    /// Zero or one cross edge: a dead end, merged away by §2.2.7.
+    Cap,
+    /// Exactly two cross edges: a link of a chain.
+    Bead,
+    /// Three or more cross edges: a branch.
+    Junction,
+}
+
+/// Count the cross edges on a patch boundary and classify the patch.
+fn patch_class(patch: &CandidatePatch, cross: &HashSet<(usize, usize)>) -> PatchClass {
+    let n = patch.boundary.len();
+    let mut count = 0usize;
+    for i in 0..n {
+        if cross.contains(&edge_key(patch.boundary[i], patch.boundary[(i + 1) % n])) {
+            count += 1;
+        }
+    }
+    match count {
+        0 | 1 => PatchClass::Cap,
+        2 => PatchClass::Bead,
+        _ => PatchClass::Junction,
+    }
+}
+
+/// One widest-path cycle-cover candidate.
+#[derive(Clone, Debug, Default)]
+struct CycleCover {
+    selected: Vec<usize>,
+    fraction: f64,
+    min_rank: f64,
+}
+
+/// Area covered by a selection of patches, as a fraction of the channel area.
+/// The faces of the selection must be pairwise disjoint for the fraction to be
+/// meaningful; the caller checks that.
+fn covered_fraction(patches: &[CandidatePatch], selected: &[usize], faces: &[Face]) -> f64 {
+    let total: f64 = faces.iter().map(|face| face.area).sum();
+    if total <= EPS {
+        return 0.0;
+    }
+    let mut covered = vec![false; faces.len()];
+    for &index in selected {
+        if let Some(patch) = patches.get(index) {
+            for &face in &patch.faces {
+                if let Some(slot) = covered.get_mut(face) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    let area: f64 = covered
+        .iter()
+        .enumerate()
+        .filter(|(_, &is_covered)| is_covered)
+        .map(|(face, _)| faces[face].area)
+        .sum();
+    (area / total).clamp(0.0, 1.0)
+}
+
+/// Maximum number of starting patches tried per loop, so that the cycle DP
+/// stays bounded on a very fine channel.
+const MAX_CYCLE_STARTS: usize = 128;
+
+/// Widest-path cycle cover over the channel loops (§2.2.8).
+///
+/// For every channel loop, every usable patch whose boundary contains a
+/// contiguous run of the loop's edges becomes an arc of the loop; an exact
+/// cover of the loop is a partition of its edge cycle into such arcs. Fixing
+/// the patch that covers the first edge turns the cycle into a line, and the
+/// bottleneck DP
+///
+/// ```text
+/// width[t + len(p)] = max(width[t + len(p)], min(width[t], rank(p)))
+/// ```
+///
+/// over the positions of the loop finds the cover with the best minimum rank.
+/// The selection is validated (its patch faces must be pairwise disjoint) and
+/// its covered area is measured; the caller only keeps it when it covers at
+/// least as much area as the greedy cover with a better minimum rank.
+fn widest_path_cycle(
+    prepared: &Prepared,
+    patches: &[CandidatePatch],
+    faces: &[Face],
+) -> Option<CycleCover> {
+    let usable: Vec<usize> = (0..patches.len())
+        .filter(|&index| {
+            patches
+                .get(index)
+                .is_some_and(|patch| patch.decomposition.is_some())
+        })
+        .collect();
+    if usable.is_empty() {
+        return None;
+    }
+    let mut best: Option<CycleCover> = None;
+    for raw in &prepared.loops {
+        let m = raw.points.len();
+        if m < 4 {
+            continue;
+        }
+        // Loop edge -> position along the loop.
+        let mut edge_index: HashMap<(usize, usize), usize> = HashMap::with_capacity(m);
+        for (i, &point) in raw.points.iter().enumerate() {
+            let next = raw.points[(i + 1) % m];
+            edge_index.insert(edge_key(point, next), i);
+        }
+        // Contiguous run of loop edges on each patch boundary, if any.
+        let mut runs: Vec<Option<(usize, usize)>> = vec![None; patches.len()];
+        for &index in &usable {
+            let patch = &patches[index];
+            let n = patch.boundary.len();
+            let mut positions: Vec<usize> = Vec::new();
+            for i in 0..n {
+                let key = edge_key(patch.boundary[i], patch.boundary[(i + 1) % n]);
+                if let Some(&position) = edge_index.get(&key) {
+                    positions.push(position);
+                }
+            }
+            if positions.is_empty() {
+                continue;
+            }
+            positions.sort_unstable();
+            positions.dedup();
+            let count = positions.len();
+            let mut gap: Option<usize> = None;
+            let mut split = false;
+            for k in 0..count {
+                let a = positions[k];
+                let b = positions[(k + 1) % count];
+                if (b + m - a) % m != 1 {
+                    if gap.is_some() {
+                        split = true;
+                        break;
+                    }
+                    gap = Some((k + 1) % count);
+                }
+            }
+            if split {
+                continue;
+            }
+            let start = match gap {
+                Some(k) => positions[k],
+                None => positions[0],
+            };
+            runs[index] = Some((start, count));
+        }
+        // Patches that can cover the loop's first edge.
+        let mut starts: Vec<usize> = Vec::new();
+        for &index in &usable {
+            if let Some((start, len)) = runs[index] {
+                if len >= m || (m - start) % m < len {
+                    starts.push(index);
+                }
+            }
+        }
+        if starts.len() > MAX_CYCLE_STARTS {
+            starts.truncate(MAX_CYCLE_STARTS);
+        }
+        for &start_patch in &starts {
+            let Some((start0, len0)) = runs[start_patch] else {
+                continue;
+            };
+            // Rebase the loop so that the fixed patch starts at position 0.
+            let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); m];
+            for &index in &usable {
+                if index == start_patch {
+                    continue;
+                }
+                if let Some((start, len)) = runs[index] {
+                    let rebased = (start + m - start0) % m;
+                    if rebased + len <= m {
+                        buckets[rebased].push(index);
+                    }
+                }
+            }
+            let mut width = vec![f64::NEG_INFINITY; m + 1];
+            let mut previous = vec![usize::MAX; m + 1];
+            let mut chosen = vec![usize::MAX; m + 1];
+            if len0 > m {
+                continue;
+            }
+            width[len0] = patches[start_patch].rank;
+            previous[len0] = 0;
+            chosen[len0] = start_patch;
+            for position in 0..=m {
+                let current = width[position];
+                if current == f64::NEG_INFINITY {
+                    continue;
+                }
+                let Some(candidates) = buckets.get(position) else {
+                    continue;
+                };
+                for &index in candidates {
+                    let Some((_, len)) = runs[index] else {
+                        continue;
+                    };
+                    let next = position + len;
+                    if next > m {
+                        continue;
+                    }
+                    let candidate = current.min(patches[index].rank);
+                    if candidate > width[next] + 1.0e-12 {
+                        width[next] = candidate;
+                        previous[next] = position;
+                        chosen[next] = index;
+                    }
+                }
+            }
+            if width[m] == f64::NEG_INFINITY {
+                continue;
+            }
+            // Backtrack the chain.
+            let mut selected: Vec<usize> = Vec::new();
+            let mut position = m;
+            let mut guard = 0usize;
+            while position > 0 {
+                let index = chosen[position];
+                if index == usize::MAX {
+                    selected.clear();
+                    break;
+                }
+                selected.push(index);
+                let next = previous[position];
+                if next == usize::MAX || next >= position {
+                    selected.clear();
+                    break;
+                }
+                position = next;
+                guard += 1;
+                if guard > m + 1 {
+                    selected.clear();
+                    break;
+                }
+            }
+            if selected.is_empty() {
+                continue;
+            }
+            selected.reverse();
+            // The selected patches must not share a face.
+            let mut covered = vec![false; faces.len()];
+            let mut overlap = false;
+            for &index in &selected {
+                for &face in &patches[index].faces {
+                    match covered.get_mut(face) {
+                        Some(slot) if !*slot => *slot = true,
+                        Some(_) => overlap = true,
+                        None => overlap = true,
+                    }
+                }
+            }
+            if overlap {
+                continue;
+            }
+            let fraction = covered_fraction(patches, &selected, faces);
+            let min_rank = selected
+                .iter()
+                .filter_map(|&index| patches.get(index).map(|patch| patch.rank))
+                .fold(f64::INFINITY, f64::min);
+            let better = match &best {
+                None => true,
+                Some(current) => {
+                    min_rank > current.min_rank + 1.0e-12
+                        || ((min_rank - current.min_rank).abs() <= 1.0e-12
+                            && fraction > current.fraction + 1.0e-12)
+                }
+            };
+            if better {
+                best = Some(CycleCover {
+                    selected,
+                    fraction,
+                    min_rank,
+                });
+            }
+        }
+    }
+    best
+}
+
+/// The cover returned for one channel: the candidate set actually used (which
+/// may include megapatches) and the selection.
+struct CoverSelection {
+    patches: Vec<CandidatePatch>,
+    selected: Vec<usize>,
+    fraction: f64,
+    min_rank: f64,
+    caps: usize,
+    beads: usize,
+    junctions: usize,
+    cycle_selected: usize,
+    cycle_fraction: f64,
+    cycle_min_rank: f64,
+    used_cycle: bool,
+}
+
+/// Select the channel cover: greedy over the patch set (extended by the §2.2.7
+/// cap megapatches when it leaves area uncovered), then the §2.2.8 widest-path
+/// cycle cover. The cycle cover replaces the greedy one only when it covers at
+/// least as much area **and** has a strictly better minimum rank, which keeps
+/// the validated greedy result as a fallback.
+fn select_cover(
+    prepared: &Prepared,
+    faces: &[Face],
+    patches: &[CandidatePatch],
+    cross: &HashSet<(usize, usize)>,
+    pos: &[[f64; 2]],
+) -> CoverSelection {
+    let mut used = patches.to_vec();
+    let (mut selected, mut fraction) = greedy_cover(faces, &used);
+    if fraction < 0.999 {
+        let extras = add_megapatches(&used, cross, faces, pos);
+        if !extras.is_empty() {
+            let mut all = used.clone();
+            all.extend(extras);
+            let (candidate, candidate_fraction) = greedy_cover(faces, &all);
+            if candidate_fraction > fraction + 1.0e-9 {
+                selected = candidate;
+                fraction = candidate_fraction;
+                used = all;
+            }
+        }
+    }
+    let greedy_rank = selection_rank(&used, &selected);
+
+    let cycle = widest_path_cycle(prepared, &used, faces);
+    let mut cycle_selected = 0usize;
+    let mut cycle_fraction = 0.0f64;
+    let mut cycle_min_rank = 0.0f64;
+    let mut used_cycle = false;
+    if let Some(cycle) = &cycle {
+        cycle_selected = cycle.selected.len();
+        cycle_fraction = cycle.fraction;
+        cycle_min_rank = cycle.min_rank;
+        if cycle.fraction >= fraction - 1.0e-9 && cycle.min_rank > greedy_rank + 1.0e-9 {
+            selected = cycle.selected.clone();
+            fraction = cycle.fraction;
+            used_cycle = true;
+        }
+    }
+    let mut caps = 0usize;
+    let mut beads = 0usize;
+    let mut junctions = 0usize;
+    for patch in &used {
+        match patch_class(patch, cross) {
+            PatchClass::Cap => caps += 1,
+            PatchClass::Bead => beads += 1,
+            PatchClass::Junction => junctions += 1,
+        }
+    }
+    let min_rank = selection_rank(&used, &selected);
+    CoverSelection {
+        patches: used,
+        selected,
+        fraction,
+        min_rank,
+        caps,
+        beads,
+        junctions,
+        cycle_selected,
+        cycle_fraction,
+        cycle_min_rank,
+        used_cycle,
+    }
+}
+
 fn greedy_cover(faces: &[Face], patches: &[CandidatePatch]) -> (Vec<usize>, f64) {
     let mut covered = vec![false; faces.len()];
     let mut selected: Vec<usize> = Vec::new();
@@ -3173,8 +3774,41 @@ struct GridLoop {
     area: f64,
 }
 
+/// Try the grid offsets of [`GRID_SHIFTS`] only when the default alignment
+/// produces a poor ribbon (raw min SJ below 0.2). Every corpus part except the
+/// 0.6 mm perf plate passes on the first offset, so the extra placements are
+/// not paid for there; the perf plate's tangent-point sliver is a grid-phase
+/// artefact and a half-cell shift removes the worst of it.
 fn build_ribbon_with_delta(domain: &Domain, size: f64, delta: f64) -> Result<BuildOutput, String> {
-    let prepared = prepare(domain, size, delta)?;
+    // The default alignment is kept exactly as it was whenever it succeeds with
+    // an acceptable rank, so every corpus part but the perf plate is unchanged
+    // bit for bit. A failed default alignment is *not* rescued by an offset
+    // either: the template path is a far better fallback there (the rectilinear
+    // sections close with a perfect grid at 1.0h). Only a ribbon that succeeds
+    // but is poor (the 0.6 mm perf plate's tangent-point sliver) is re-placed.
+    let first = build_ribbon_at_offset(domain, size, delta, 0.0, 0.0)?;
+    if first.stats.min_scaled_jacobian >= 0.2 {
+        return Ok(first);
+    }
+    let mut best = first;
+    for [shift_x, shift_y] in GRID_SHIFTS.iter().copied().skip(1) {
+        if let Ok(output) = build_ribbon_at_offset(domain, size, delta, shift_x, shift_y) {
+            if output.stats.min_scaled_jacobian > best.stats.min_scaled_jacobian + 1.0e-9 {
+                best = output;
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn build_ribbon_at_offset(
+    domain: &Domain,
+    size: f64,
+    delta: f64,
+    shift_x: f64,
+    shift_y: f64,
+) -> Result<BuildOutput, String> {
+    let prepared = prepare_shifted(domain, size, delta, shift_x, shift_y)?;
     let mut boundary: Vec<LoopData> = Vec::new();
     let mut grid: Vec<GridLoop> = Vec::new();
     for raw in &prepared.loops {
@@ -3346,6 +3980,7 @@ fn build_ribbon_with_delta(domain: &Domain, size: f64, delta: f64) -> Result<Bui
     let mut stats = ChannelStats {
         method: "boundary-ribbon",
         delta_factor: delta,
+        grid_shift: [shift_x, shift_y],
         grid_vertices: prepared.grid_vertex_count,
         interior_quads: prepared.quads.len(),
         channel_loops: prepared.loops.len(),
@@ -3356,6 +3991,7 @@ fn build_ribbon_with_delta(domain: &Domain, size: f64, delta: f64) -> Result<Bui
         usable_patches: 0,
         selected_patches: 0,
         greedy_covered_fraction: 1.0,
+        selected_min_rank: worst_rank,
         fallback_regions: 0,
         fallback_quads: 0,
         channel_quads: channel_quads.len(),
@@ -4494,20 +5130,11 @@ fn build_templates_with_delta(
     finalize_patches(&mut patches, &pos, None);
     let cross: HashSet<(usize, usize)> = cross_edges.iter().map(|&(a, b)| edge_key(a, b)).collect();
 
-    let (mut selected, mut greedy_fraction) = greedy_cover(&faces, &patches);
-    if greedy_fraction < 0.999 {
-        let extras = add_megapatches(&patches, &cross, &faces, &pos);
-        if !extras.is_empty() {
-            let mut all = patches.clone();
-            all.extend(extras);
-            let (candidate_selected, candidate_fraction) = greedy_cover(&faces, &all);
-            if candidate_fraction > greedy_fraction + 1.0e-9 {
-                selected = candidate_selected;
-                greedy_fraction = candidate_fraction;
-                patches = all;
-            }
-        }
-    }
+    let selection = select_cover(&prepared, &faces, &patches, &cross, &pos);
+    patches = selection.patches;
+    let mut selected = selection.selected;
+    let mut greedy_fraction = selection.fraction;
+    let used_cycle = selection.used_cycle;
 
     // §2.2.5 split pass: collect the split edges requested by the odd-sided
     // patch variants, extend every patch boundary whose edges are in the global
@@ -4732,8 +5359,13 @@ fn build_templates_with_delta(
     let boundary_offset = max_boundary_offset(&mesh, domain)?;
 
     let stats = ChannelStats {
-        method: "templates+greedy",
+        method: if used_cycle {
+            "templates+widest-path"
+        } else {
+            "templates+greedy"
+        },
         delta_factor: delta,
+        grid_shift: [0.0, 0.0],
         grid_vertices: prepared.grid_vertex_count,
         interior_quads: prepared.quads.len(),
         channel_loops: prepared.loops.len(),
@@ -4744,6 +5376,14 @@ fn build_templates_with_delta(
         usable_patches: usable,
         selected_patches: selected.len(),
         greedy_covered_fraction: greedy_fraction,
+        selected_min_rank: selection.min_rank,
+        caps: selection.caps,
+        beads: selection.beads,
+        junctions: selection.junctions,
+        cycle_selected_patches: selection.cycle_selected,
+        cycle_covered_fraction: selection.cycle_fraction,
+        cycle_min_rank: selection.cycle_min_rank,
+        cycle_used: used_cycle,
         fallback_regions,
         fallback_quads: fallback_quads.len(),
         channel_quads: channel_quads.len(),
@@ -5905,6 +6545,23 @@ mod tests {
                     stats.delta_factor,
                     report.verdict
                 );
+                println!(
+                    "  grid shift {:?}, raw min angle {:.2}",
+                    stats.grid_shift, stats.min_angle_deg
+                );
+                // The guarded offset retry picks the half-cell y shift; it is
+                // what takes the raw min SJ from 0.0874 to 0.2344.
+                assert_eq!(stats.grid_shift, [0.0, 0.5], "perf plate grid shift");
+                assert!(
+                    stats.min_scaled_jacobian >= 0.2,
+                    "perf plate raw min SJ {:.4}",
+                    stats.min_scaled_jacobian
+                );
+                assert!(
+                    stats.min_angle_deg >= 13.0,
+                    "perf plate raw min angle {:.2}",
+                    stats.min_angle_deg
+                );
                 assert_eq!(stats.cracks, 0, "perf plate cracks");
                 assert!(
                     stats.boundary_offset < 1.0e-7,
@@ -6132,6 +6789,186 @@ mod tests {
             assert_eq!(hole.cracks, 0);
         } else if let Some(error) = &numbers.square_with_hole_error {
             println!("hole case error: {error}");
+        }
+    }
+    /// A synthetic ring channel: a square loop with a centre vertex, four
+    /// triangular faces, two big low-rank patches and four small high-rank
+    /// patches. The greedy cover (largest area first) takes the two low-rank
+    /// patches; the widest-path cycle cover takes the four high-rank ones.
+    fn ring_cover_fixture() -> (
+        Prepared,
+        Vec<Face>,
+        Vec<CandidatePatch>,
+        HashSet<(usize, usize)>,
+    ) {
+        let pos: Vec<[f64; 2]> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.5]];
+        let prepared = Prepared {
+            pos: pos.clone(),
+            h: 1.0,
+            ox: 0.0,
+            oy: 0.0,
+            quads: Vec::new(),
+            quad_cells: HashMap::new(),
+            loops: vec![RawLoop {
+                points: vec![0, 1, 2, 3],
+                source: LoopSource::Boundary,
+            }],
+            domain_edges: HashSet::new(),
+            grid_vertex_count: 4,
+        };
+        let mut faces = Vec::new();
+        for i in 0..4 {
+            faces.push(Face {
+                vertices: vec![i, (i + 1) % 4, 4],
+                area: 0.25,
+            });
+        }
+        let patch = |boundary: Vec<usize>, face_ids: Vec<usize>, rank: f64| CandidatePatch {
+            faces: face_ids,
+            boundary,
+            extended: None,
+            decomposition: Some(Decomp {
+                quads: vec![[0, 1, 2, 3]],
+                steiner: Vec::new(),
+                rank,
+            }),
+            area: 0.25 * 2.0f64.powi(0),
+            rank,
+        };
+        let patches = vec![
+            patch(vec![0, 1, 2, 4], vec![0, 1], 0.5),
+            patch(vec![2, 3, 0, 4], vec![2, 3], 0.5),
+            patch(vec![0, 1, 4], vec![0], 0.9),
+            patch(vec![1, 2, 4], vec![1], 0.9),
+            patch(vec![2, 3, 4], vec![2], 0.9),
+            patch(vec![3, 0, 4], vec![3], 0.9),
+        ];
+        // The two big patches cover two faces each; fix their area.
+        let mut patches = patches;
+        patches[0].area = 0.5;
+        patches[1].area = 0.5;
+        (prepared, faces, patches, HashSet::new())
+    }
+
+    #[test]
+    fn the_widest_path_cycle_beats_the_greedy_cover() {
+        let (prepared, faces, patches, cross) = ring_cover_fixture();
+        let (greedy, greedy_fraction) = greedy_cover(&faces, &patches);
+        assert!((greedy_fraction - 1.0).abs() < 1.0e-12);
+        assert_eq!(greedy.len(), 2, "greedy takes the two big patches");
+        assert!((selection_rank(&patches, &greedy) - 0.5).abs() < 1.0e-12);
+
+        let cycle = match widest_path_cycle(&prepared, &patches, &faces) {
+            Some(cycle) => cycle,
+            None => {
+                assert!(false, "the fixture must admit a cycle cover");
+                return;
+            }
+        };
+        assert_eq!(cycle.selected.len(), 4, "four small patches cover the ring");
+        assert!((cycle.fraction - 1.0).abs() < 1.0e-12);
+        assert!((cycle.min_rank - 0.9).abs() < 1.0e-12);
+
+        let selection = select_cover(&prepared, &faces, &patches, &cross, &prepared.pos);
+        assert!(selection.used_cycle, "the better minimum rank must be kept");
+        assert_eq!(selection.selected.len(), 4);
+        assert!((selection.fraction - 1.0).abs() < 1.0e-12);
+        assert!((selection.min_rank - 0.9).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn an_overlapping_cycle_is_rejected() {
+        // Keep only the first loop edge covered by two overlapping patches:
+        // any cycle that mixes the big patch with a small patch covering the
+        // same face must be rejected, leaving the greedy fallback.
+        let (prepared, faces, mut patches, cross) = ring_cover_fixture();
+        patches.truncate(3); // two big patches + the small patch on face 0
+        let selection = select_cover(&prepared, &faces, &patches, &cross, &prepared.pos);
+        assert!(!selection.selected.is_empty());
+        assert!(selection.fraction <= 1.0 + 1.0e-12);
+        for &index in &selection.selected {
+            let patch = &patches[index];
+            for &other in &selection.selected {
+                if other != index {
+                    assert!(
+                        patch
+                            .faces
+                            .iter()
+                            .all(|f| !patches[other].faces.contains(f)),
+                        "an overlapping selection must never be returned"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn patch_classes_follow_the_cross_edge_count() {
+        let patch = |boundary: Vec<usize>| CandidatePatch {
+            faces: vec![0],
+            boundary,
+            extended: None,
+            decomposition: None,
+            area: 1.0,
+            rank: 1.0,
+        };
+        let mut cross = HashSet::new();
+        cross.insert(edge_key(0, 1));
+        cross.insert(edge_key(2, 3));
+        cross.insert(edge_key(4, 5));
+        // One cross edge -> cap, two -> bead, three -> junction.
+        assert_eq!(
+            patch_class(&patch(vec![0, 1, 9, 8]), &cross),
+            PatchClass::Cap
+        );
+        assert_eq!(
+            patch_class(&patch(vec![0, 1, 9, 2, 3]), &cross),
+            PatchClass::Bead
+        );
+        assert_eq!(
+            patch_class(&patch(vec![0, 1, 9, 2, 3, 8, 4, 5]), &cross),
+            PatchClass::Junction
+        );
+    }
+
+    #[test]
+    fn cover_demo_measures_both_covers() {
+        let cases = match cover_demo() {
+            Ok(cases) => cases,
+            Err(error) => {
+                assert!(false, "cover_demo failed: {error}");
+                return;
+            }
+        };
+        assert!(!cases.is_empty(), "cover_demo must report the corpus");
+        for case in &cases {
+            println!(
+                "{} d={:.1}: faces={} patches={} caps={} beads={} junctions={} \
+                 greedy={}/{} @{:.4} cycle={}/{} @{:.4} kept={} @{:.4} used={}",
+                case.name,
+                case.delta_factor,
+                case.faces,
+                case.patches,
+                case.caps,
+                case.beads,
+                case.junctions,
+                case.greedy_selected,
+                case.greedy_fraction,
+                case.greedy_min_rank,
+                case.cycle_selected,
+                case.cycle_fraction,
+                case.cycle_min_rank,
+                case.cover_selected,
+                case.cover_min_rank,
+                case.used_cycle
+            );
+            assert!(case.greedy_fraction <= 1.0 + 1.0e-12);
+            assert!(case.cycle_fraction <= 1.0 + 1.0e-12);
+            assert!(case.cover_fraction <= 1.0 + 1.0e-12);
+            if case.used_cycle {
+                assert!(case.cover_fraction >= case.greedy_fraction - 1.0e-9);
+                assert!(case.cover_min_rank > case.greedy_min_rank + 1.0e-9);
+            }
         }
     }
 }

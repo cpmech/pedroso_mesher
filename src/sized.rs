@@ -15,8 +15,9 @@
 //! integration step, documented in the vault.
 //!
 //! Supported: **all seven corpus parts** — rectangle-like domains with holes
-//! (plate-hole 4/2/1/0.6 mm: 262/1240/5324/15520 quads, SJ 0.608/0.564/0.481/
-//! 0.513 after the shared smoother + shape pass), the rectilinear non-convex
+//! (plate-hole 4/2/1/0.6 mm: 262/1240/5324/15526 quads, SJ 0.608/0.564/0.481/
+//! 0.391 after the shared smoother + shape pass; the perf raw mesh is
+//! 0.234 / 13.6 deg after the half-cell grid-offset retry), the rectilinear non-convex
 //! parts (l-bracket, stepped: 600/2300 quads as perfect grids) and the quarter
 //! annulus (ring: 48 quads, SJ 0.998, 87.5°, through the two-chain strip
 //! fallback)
