@@ -101,11 +101,16 @@
 //!   splits) and a 4-gon as 6 (two splits), ranking each against the plain
 //!   template. The collinear midpoint is allowed; rotations that would put both
 //!   half-edges in one quad are rejected by the convexity check. The variants
-//!   are **not wired into the cover** yet: a split edge is shared with the
-//!   neighbouring patch, and making every neighbour agree (and stay even-sided)
-//!   needs a global split set; the cover therefore still uses the plain
-//!   templates. Measured: regular 5-gon split → 6-sided, 2 quads, rank 0.60;
-//!   regular 7-gon split → 8-sided, 4 quads, rank 0.5714.
+//!   are wired into the cover through a **global split set**:
+//!   `requested_splits` collects the cross edges chosen by odd-sided patch
+//!   variants, `make_split_points` creates one shared midpoint per edge,
+//!   `finalize_patches` extends every patch boundary whose edges are in the
+//!   set (so both sides agree), and the split-aware greedy cover is used only
+//!   when it covers more area (or the same area with a better minimum rank)
+//!   than the plain cover; the fallback receives the same split map. Measured:
+//!   regular 5-gon split → 6-sided, 2 quads, rank 0.60; 7-gon split →
+//!   8-sided, 4 quads, rank 0.5714. On the current corpus the plain cover still
+//!   wins, so the measured seven meshes are unchanged.
 //! * **§2.2.7 cap merging** is implemented (`add_megapatches`): a patch with a
 //!   single boundary cross edge is merged with each neighbour and kept as a
 //!   megapatch if the union is 4–8-sided and meshalable. It is used when the
@@ -2216,6 +2221,9 @@ fn decompose(boundary: &[[f64; 2]]) -> Option<Decomp> {
 struct CandidatePatch {
     faces: Vec<usize>,
     boundary: Vec<usize>,
+    /// Boundary ids extended with the midpoints of the global split edges.
+    /// `None` means the plain boundary is used.
+    extended: Option<Vec<usize>>,
     decomposition: Option<Decomp>,
     area: f64,
     rank: f64,
@@ -2252,6 +2260,7 @@ fn build_patches(faces: &[Face], cross_edges: &[(usize, usize)]) -> Vec<Candidat
             patches.push(CandidatePatch {
                 faces: ids.clone(),
                 boundary,
+                extended: None,
                 decomposition: None,
                 area,
                 rank: f64::NEG_INFINITY,
@@ -2284,14 +2293,94 @@ fn build_patches(faces: &[Face], cross_edges: &[(usize, usize)]) -> Vec<Candidat
 }
 
 /// Decompose and rank every candidate patch, once its positions are known.
-fn finalize_patches(patches: &mut [CandidatePatch], pos: &[[f64; 2]]) {
+/// With `split_points`, every boundary edge in the map is extended by its
+/// midpoint before the template is chosen.
+fn finalize_patches(
+    patches: &mut [CandidatePatch],
+    pos: &[[f64; 2]],
+    split_points: Option<&HashMap<(usize, usize), usize>>,
+) {
     for patch in patches.iter_mut() {
-        let polygon: Vec<[f64; 2]> = patch.boundary.iter().map(|&id| pos[id]).collect();
+        let mut extended: Vec<usize> = Vec::with_capacity(patch.boundary.len());
+        let n = patch.boundary.len();
+        for i in 0..n {
+            extended.push(patch.boundary[i]);
+            if let Some(points) = split_points {
+                if let Some(&mid) =
+                    points.get(&edge_key(patch.boundary[i], patch.boundary[(i + 1) % n]))
+                {
+                    extended.push(mid);
+                }
+            }
+        }
+        let polygon: Vec<[f64; 2]> = extended.iter().map(|&id| pos[id]).collect();
+        patch.extended = if split_points.is_some() {
+            Some(extended.clone())
+        } else {
+            None
+        };
+        patch.decomposition = None;
+        patch.rank = f64::NEG_INFINITY;
         if let Some(decomposition) = decompose(&polygon) {
             patch.rank = decomposition.rank;
             patch.decomposition = Some(decomposition);
         }
     }
+}
+
+/// Create the midpoint nodes of a global split set and return edge -> node id.
+fn make_split_points(
+    split_set: &HashSet<(usize, usize)>,
+    pos: &mut Vec<[f64; 2]>,
+) -> HashMap<(usize, usize), usize> {
+    let mut ordered: Vec<(usize, usize)> = split_set.iter().copied().collect();
+    ordered.sort_unstable();
+    let mut points: HashMap<(usize, usize), usize> = HashMap::new();
+    for (a, b) in ordered {
+        let (Some(&pa), Some(&pb)) = (pos.get(a), pos.get(b)) else {
+            continue;
+        };
+        let id = pos.len();
+        pos.push([0.5 * (pa[0] + pb[0]), 0.5 * (pa[1] + pb[1])]);
+        points.insert(edge_key(a, b), id);
+    }
+    points
+}
+
+/// Collect the split edges requested by the ranked split variants of odd-sided
+/// candidate patches. Only cross edges are considered; a split edge is shared,
+/// so the global set applies to every patch whose boundary contains it.
+fn requested_splits(
+    patches: &[CandidatePatch],
+    pos: &[[f64; 2]],
+    cross: &HashSet<(usize, usize)>,
+) -> HashSet<(usize, usize)> {
+    let mut split_set: HashSet<(usize, usize)> = HashSet::new();
+    for patch in patches {
+        let n = patch.boundary.len();
+        if n.is_multiple_of(2) {
+            continue;
+        }
+        let polygon: Vec<[f64; 2]> = patch.boundary.iter().map(|&id| pos[id]).collect();
+        let Some((_, splits)) = best_split_variant(&polygon) else {
+            continue;
+        };
+        for &edge in &splits {
+            let key = edge_key(patch.boundary[edge], patch.boundary[(edge + 1) % n]);
+            if cross.contains(&key) {
+                split_set.insert(key);
+            }
+        }
+    }
+    split_set
+}
+
+/// Min rank of a greedy selection.
+fn selection_rank(patches: &[CandidatePatch], selected: &[usize]) -> f64 {
+    selected
+        .iter()
+        .filter_map(|&index| patches.get(index).map(|patch| patch.rank))
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// Cap merging (§2.2.7): a patch with exactly one cross edge on its boundary
@@ -2355,6 +2444,7 @@ fn add_megapatches(
             extras.push(CandidatePatch {
                 faces: union,
                 boundary,
+                extended: None,
                 decomposition: Some(decomposition),
                 area,
                 rank,
@@ -4392,18 +4482,13 @@ fn build_templates_with_delta(
     }
 
     let mut patches = build_patches(&faces, &cross_edges);
-    let pos_snapshot = prepared.pos.clone();
-    finalize_patches(&mut patches, &pos_snapshot);
-    let usable: usize = patches
-        .iter()
-        .filter(|patch| patch.decomposition.is_some())
-        .count();
+    let mut pos = prepared.pos.clone();
+    finalize_patches(&mut patches, &pos, None);
+    let cross: HashSet<(usize, usize)> = cross_edges.iter().map(|&(a, b)| edge_key(a, b)).collect();
 
     let (mut selected, mut greedy_fraction) = greedy_cover(&faces, &patches);
     if greedy_fraction < 0.999 {
-        let cross: HashSet<(usize, usize)> =
-            cross_edges.iter().map(|&(a, b)| edge_key(a, b)).collect();
-        let extras = add_megapatches(&patches, &cross, &faces, &pos_snapshot);
+        let extras = add_megapatches(&patches, &cross, &faces, &pos);
         if !extras.is_empty() {
             let mut all = patches.clone();
             all.extend(extras);
@@ -4416,9 +4501,36 @@ fn build_templates_with_delta(
         }
     }
 
+    // §2.2.5 split pass: collect the split edges requested by the odd-sided
+    // patch variants, extend every patch boundary whose edges are in the global
+    // set (so both sides of a split agree), and keep the split cover only when
+    // it covers more area (or the same area with a better minimum rank).
+    let mut active_splits: Option<HashMap<(usize, usize), usize>> = None;
+    let requested = requested_splits(&patches, &pos, &cross);
+    if !requested.is_empty() {
+        let split_points = make_split_points(&requested, &mut pos);
+        let mut split_patches = patches.clone();
+        finalize_patches(&mut split_patches, &pos, Some(&split_points));
+        let (split_selected, split_fraction) = greedy_cover(&faces, &split_patches);
+        let plain_rank = selection_rank(&patches, &selected);
+        let split_rank = selection_rank(&split_patches, &split_selected);
+        let better = split_fraction > greedy_fraction + 1.0e-9
+            || ((split_fraction - greedy_fraction).abs() <= 1.0e-9
+                && split_rank > plain_rank + 1.0e-9);
+        if better {
+            patches = split_patches;
+            selected = split_selected;
+            greedy_fraction = split_fraction;
+            active_splits = Some(split_points);
+        }
+    }
+    let usable: usize = patches
+        .iter()
+        .filter(|patch| patch.decomposition.is_some())
+        .count();
+
     // ---- fallback: close whatever the greedy cover left -------------------
-    let mut pos = prepared.pos.clone();
-    let mut splits: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut splits: HashMap<(usize, usize), usize> = active_splits.clone().unwrap_or_default();
     let mut fallback_quads: Vec<[usize; 4]> = Vec::new();
     let mut fallback_regions = 0usize;
     let mut attempts = 0usize;
@@ -4506,7 +4618,8 @@ fn build_templates_with_delta(
         let Some(decomposition) = &patch.decomposition else {
             continue;
         };
-        let n = patch.boundary.len();
+        let boundary = patch.extended.as_deref().unwrap_or(&patch.boundary);
+        let n = boundary.len();
         let mut steiner_ids: Vec<usize> = Vec::with_capacity(decomposition.steiner.len());
         for &point in &decomposition.steiner {
             steiner_ids.push(pos.len());
@@ -4517,7 +4630,7 @@ fn build_templates_with_delta(
             for c in 0..4 {
                 let index = quad[c];
                 global[c] = if index < n {
-                    match patch.boundary.get(index) {
+                    match boundary.get(index) {
                         Some(&id) => id,
                         None => return Err("internal error: patch boundary index".into()),
                     }
@@ -5540,6 +5653,65 @@ mod tests {
             println!(
                 "split template {n}-gon: {} splits {splits:?}, {} quads, rank {:.4}",
                 splits.len(),
+                decomposition.quads.len(),
+                decomposition.rank
+            );
+        }
+    }
+
+    #[test]
+    fn split_aware_patch_finalization() {
+        let regular = |n: usize| -> Vec<[f64; 2]> {
+            (0..n)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * i as f64 / n as f64;
+                    [a.cos(), a.sin()]
+                })
+                .collect()
+        };
+        for n in [5usize, 7] {
+            let polygon = regular(n);
+            let ids: Vec<usize> = (0..n).collect();
+            let mut pos = polygon.clone();
+            let mut split_set: HashSet<(usize, usize)> = HashSet::new();
+            split_set.insert(edge_key(ids[0], ids[1]));
+            let points = make_split_points(&split_set, &mut pos);
+            assert_eq!(points.len(), 1);
+            let mut patches = vec![CandidatePatch {
+                faces: vec![0],
+                boundary: ids.clone(),
+                extended: None,
+                decomposition: None,
+                area: 1.0,
+                rank: f64::NEG_INFINITY,
+            }];
+            finalize_patches(&mut patches, &pos, Some(&points));
+            let patch = &patches[0];
+            let Some(extended) = &patch.extended else {
+                assert!(false, "{n}-gon: no extended boundary");
+                return;
+            };
+            assert_eq!(extended.len(), n + 1);
+            assert!(
+                patch.decomposition.is_some(),
+                "{n}-gon: split decomposition"
+            );
+            let decomposition = match &patch.decomposition {
+                Some(decomposition) => decomposition,
+                None => return,
+            };
+            let total = extended.len() + decomposition.steiner.len();
+            for quad in &decomposition.quads {
+                assert!(quad.iter().all(|&index| index < total));
+            }
+            // The midpoint is shared and on the split edge.
+            let midpoint = extended[1];
+            assert_eq!(midpoint, points[&edge_key(ids[0], ids[1])]);
+            let mid = pos[midpoint];
+            assert!((mid[0] - 0.5 * (polygon[0][0] + polygon[1][0])).abs() < 1.0e-12);
+            println!(
+                "split-aware patch {n}-gon: {} extended sides, {} quads, rank {:.4}",
+                extended.len(),
                 decomposition.quads.len(),
                 decomposition.rank
             );
