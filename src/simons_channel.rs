@@ -129,10 +129,18 @@
 //! hole band: a cap consumes two grid edges and one inner vertex where a grid
 //! edge is nearly radial (the 5° sliver). Its best minimum rank was 0.14
 //! (≈12°), and the node mapping could make the cap strip overlap neighbouring
-//! bands; it cannot reach the 30° target, so it is **not enabled**. The §2.2.5
-//! cross-edge midpoint splits were not completed. The raw perf mesh therefore
-//! stays at min SJ 0.0874 / 5.01° (BelowTarget); the shared smoother and shape
-//! pass take it to SJ 0.513 / 36.4°, which is the integrated 7/7 result.
+//! bands; it cannot reach the 30° target, so it is **not enabled**.
+//!
+//! The 5° angle is a **boundary-vertex angle**: at the offending grid vertex
+//! the two boundary edges are a fixed grid edge and the cross edge to the
+//! projected inner node. Interior topology (a fan) can only split that angle
+//! into smaller pieces, and a windowed slide of the inner projection along the
+//! domain hole was measured with no change. Raising it to 30° therefore needs
+//! changing the grid-edge / inner-boundary correspondence itself (splitting the
+//! grid edge together with its adjacent grid quad and remapping the staircase),
+//! not just an interior fan. The raw perf mesh stays at min SJ 0.0874 / 5.01°
+//! (BelowTarget); the shared smoother and shape pass take it to SJ 0.513 /
+//! 36.4°, which is the integrated 7/7 result.
 //!
 //! * **Covering (§2.2.7–2.2.9)**: the full megapatch/widest-path search is not
 //!   implemented. Patches are scored and selected by a greedy cover: repeatedly
