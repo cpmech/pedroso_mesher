@@ -175,6 +175,14 @@
 //!   coverage 1.000, min SJ 0.729, angles 46.8-129.6 degrees, boundary offset
 //!   2e-16.** This is a fallback, not the thesis stitch.
 //!
+//! Section 5.1.5.2 merging is the last route, and its scale is measured
+//! (`annulus_singularity_neighbourhoods`): the four singularities carry 3, 5, 3
+//! and 3 incident tiles with total areas 2.075, 5.794, 2.061 and 1.816. A
+//! merged region is therefore a non-convex 6-to-10-corner polygon spanning up
+//! to most of the annulus, which the four-side convex Coons machinery cannot
+//! mesh; it needs a multi-block or non-convex block decomposition, and that is
+//! what still separates this module from a QGP ring on the annulus.
+//!
 //! Measured attempts at the ring, all rejected: coarser annulus meshes (40x4,
 //! 60x6) keep the same rejected faces; the bent-horseshoe Coons patch folds
 //! when its long sides are sampled by arc length (fixed here by the angular
@@ -5173,6 +5181,348 @@ mod tests {
             "interior node at {centre:?}"
         );
         println!("laplacian: interior node at {centre:?}");
+        Ok(())
+    }
+
+    /// Census of the tiles around each singularity: Section 5.1.5.2 merging
+    /// would join these, so their sizes and areas are what a merged region
+    /// would have to mesh.
+    /// Annulus fixture with explicit resolution, phase and size law, for the
+    /// QGP parameter sweep.
+    fn annulus_variant(
+        n_theta: usize,
+        n_radial: usize,
+        phase: f64,
+        size_law: &dyn Fn(f64) -> f64,
+    ) -> Result<(Vec<[f64; 3]>, Vec<[usize; 3]>, Vec<f64>, Vec<f64>), String> {
+        const INNER: f64 = 0.4;
+        const HALF: f64 = 1.5;
+        let mut points: Vec<[f64; 3]> = Vec::with_capacity((n_radial + 1) * n_theta);
+        for layer in 0..=n_radial {
+            let t = layer as f64 / n_radial as f64;
+            for segment in 0..n_theta {
+                let theta = std::f64::consts::TAU * segment as f64 / n_theta as f64;
+                let (sin, cos) = theta.sin_cos();
+                // Square annulus: the radius is clamped to the square boundary.
+                let radius = INNER + t * (HALF - INNER);
+                points.push([radius * cos, radius * sin, 0.0]);
+            }
+        }
+        let index = |layer: usize, segment: usize| layer * n_theta + segment % n_theta;
+        let mut tris: Vec<[usize; 3]> = Vec::with_capacity(2 * n_radial * n_theta);
+        for layer in 0..n_radial {
+            for segment in 0..n_theta {
+                let a = index(layer, segment);
+                let b = index(layer, segment + 1);
+                let c = index(layer + 1, segment + 1);
+                let d = index(layer + 1, segment);
+                tris.push([a, c, b]);
+                tris.push([a, d, c]);
+            }
+        }
+        let alpha: Vec<f64> = points
+            .iter()
+            .map(|point| {
+                let z = [point[0], point[1]];
+                let radius2 = z[0] * z[0] + z[1] * z[1];
+                let z2 = [z[0] * z[0] - z[1] * z[1], 2.0 * z[0] * z[1]];
+                let z4 = [z2[0] * z2[0] - z2[1] * z2[1], 2.0 * z2[0] * z2[1]];
+                let (spiral_sin, spiral_cos) = (4.0 * phase).sin_cos();
+                let base = [z4[0] / (radius2 * radius2), z4[1] / (radius2 * radius2)];
+                let prefactor = [
+                    base[0] * spiral_cos - base[1] * spiral_sin,
+                    base[0] * spiral_sin + base[1] * spiral_cos,
+                ];
+                let diagonal = std::f64::consts::FRAC_1_SQRT_2;
+                let zeros = complex_mul(
+                    [z[0] - diagonal, z[1] - diagonal],
+                    [z[0] + diagonal, z[1] + diagonal],
+                );
+                let poles = complex_mul(
+                    [z[0] + diagonal, z[1] - diagonal],
+                    [z[0] - diagonal, z[1] + diagonal],
+                );
+                let ratio = complex_div(zeros, poles).unwrap_or([1.0, 0.0]);
+                let value = complex_mul(prefactor, ratio);
+                wrap_cross(0.25 * value[1].atan2(value[0]))
+            })
+            .collect();
+        let size: Vec<f64> = points
+            .iter()
+            .map(|point| size_law((point[0] * point[0] + point[1] * point[1]).sqrt()))
+            .collect();
+        Ok((points, tris, alpha, size))
+    }
+
+    #[test]
+    fn annulus_qgp_parameter_sweep() {
+        let mut rows: Vec<String> = Vec::new();
+        let mut hits = 0usize;
+        for &(n_theta, n_radial) in &[(60usize, 6usize), (80, 8), (100, 10), (120, 12)] {
+            for &phase_deg in &[0.0f64, 10.0, 20.0, 30.0] {
+                for &scale in &[0.15f64, 0.22, 0.3, 0.4] {
+                    let phase = phase_deg.to_radians();
+                    let law = move |_r: f64| scale;
+                    let fixture = match annulus_variant(n_theta, n_radial, phase, &law) {
+                        Ok(found) => found,
+                        Err(error) => {
+                            rows.push(format!("{n_theta}x{n_radial} {phase_deg:2.0}deg {scale:.2}: fixture {error}"));
+                            continue;
+                        }
+                    };
+                    let (points, tris, alpha, size) = fixture;
+                    let regions = match build(&points, &tris, &alpha, &size) {
+                        Ok(found) => found,
+                        Err(error) => {
+                            rows.push(format!(
+                                "{n_theta}x{n_radial} {phase_deg:2.0}deg {scale:.2}: {error}"
+                            ));
+                            continue;
+                        }
+                    };
+                    let interior = match regions.mesh() {
+                        Ok(found) => found,
+                        Err(error) => {
+                            rows.push(format!(
+                                "{n_theta}x{n_radial} {phase_deg:2.0}deg {scale:.2}: {error}"
+                            ));
+                            continue;
+                        }
+                    };
+                    let field = match Field::new(&points, &tris, &alpha, &size) {
+                        Ok(found) => found,
+                        Err(error) => {
+                            rows.push(format!(
+                                "{n_theta}x{n_radial} {phase_deg:2.0}deg {scale:.2}: {error}"
+                            ));
+                            continue;
+                        }
+                    };
+                    let outer = field.boundary_points.clone();
+                    let hole = field.boundary_points.get(1).cloned().unwrap_or_default();
+                    let mut centre = [0.0f64; 2];
+                    for point in &hole {
+                        centre[0] += point[0] / hole.len().max(1) as f64;
+                        centre[1] += point[1] / hole.len().max(1) as f64;
+                    }
+                    let (carved, carved_quads) =
+                        carve_rings(&interior, &field, &[outer[0].clone()], 1.4);
+                    let loops = mesh_boundary_loops(&carved).unwrap_or_default();
+                    let mut contains = 0usize;
+                    let mut areas: Vec<f64> = Vec::new();
+                    for ids in &loops {
+                        let line = loop_points(&carved, ids);
+                        areas.push(loop_area(&line));
+                        if loop_contains(&line, centre) {
+                            contains += 1;
+                        }
+                    }
+                    if contains > 0 {
+                        hits += 1;
+                    }
+                    rows.push(format!(
+                        "{n_theta}x{n_radial} {phase_deg:2.0}deg {scale:.2}: tiles {} interior {carved_quads} carved, {} loops, contains {contains}, areas {:?}",
+                        regions.tiles.len(),
+                        loops.len(),
+                        areas.iter().map(|a| (a * 100.0).round() / 100.0).collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+        for row in &rows {
+            println!("sweep: {row}");
+        }
+        println!(
+            "sweep: {hits} configurations contain the hole of {}",
+            rows.len()
+        );
+    }
+
+    /// Sweep of the Chapter 3 boundary-constrained field on the annulus: does
+    /// a Tangent / Weak(1e4) / anisotropic field produce a QGP interior that
+    /// encircles the hole?
+    #[test]
+    fn annulus_boundary_field_sweep() {
+        use crate::simons_godf::{BoundaryMode, Options};
+        let mut rows: Vec<String> = Vec::new();
+        let mut hits = 0usize;
+        let scales: [(&str, f64); 2] = [("0.15", 0.15), ("0.22", 0.22)];
+        let variants: [(&str, Options); 5] = [
+            (
+                "tangent+accurate",
+                Options {
+                    boundary: BoundaryMode::Tangent,
+                    accurate: true,
+                    ..Options::default()
+                },
+            ),
+            (
+                "weak1e4",
+                Options {
+                    boundary: BoundaryMode::Weak(1.0e4),
+                    accurate: true,
+                    ..Options::default()
+                },
+            ),
+            (
+                "tangent+aniso2",
+                Options {
+                    boundary: BoundaryMode::Tangent,
+                    accurate: true,
+                    anisotropy: 2.0,
+                    ..Options::default()
+                },
+            ),
+            (
+                "tangent+aniso3",
+                Options {
+                    boundary: BoundaryMode::Tangent,
+                    accurate: true,
+                    anisotropy: 3.0,
+                    ..Options::default()
+                },
+            ),
+            (
+                "tangent+aniso4",
+                Options {
+                    boundary: BoundaryMode::Tangent,
+                    accurate: true,
+                    anisotropy: 4.0,
+                    ..Options::default()
+                },
+            ),
+        ];
+        for &(label, options) in &variants {
+            for &(scale_label, scale) in &scales {
+                for &(n_theta, n_radial) in &[(100usize, 10usize), (48, 4)] {
+                    let law = move |_r: f64| scale;
+                    let fixture = match annulus_variant(n_theta, n_radial, 0.0, &law) {
+                        Ok(found) => found,
+                        Err(error) => {
+                            rows.push(format!(
+                                "{label} {scale_label} {n_theta}x{n_radial}: fixture {error}"
+                            ));
+                            continue;
+                        }
+                    };
+                    let (points, tris, _alpha, size) = fixture;
+                    let alpha = match crate::simons_godf::solve_with_options(
+                        &points, &tris, &size, &options, 100,
+                    ) {
+                        Ok(found) => found,
+                        Err(error) => {
+                            rows.push(format!(
+                                "{label} {scale_label} {n_theta}x{n_radial}: solve {error}"
+                            ));
+                            continue;
+                        }
+                    };
+                    let regions = match build(&points, &tris, &alpha, &size) {
+                        Ok(found) => found,
+                        Err(error) => {
+                            rows.push(format!(
+                                "{label} {scale_label} {n_theta}x{n_radial}: {error}"
+                            ));
+                            continue;
+                        }
+                    };
+                    let interior = match regions.mesh() {
+                        Ok(found) => found,
+                        Err(error) => {
+                            rows.push(format!(
+                                "{label} {scale_label} {n_theta}x{n_radial}: {error}"
+                            ));
+                            continue;
+                        }
+                    };
+                    let field = match Field::new(&points, &tris, &alpha, &size) {
+                        Ok(found) => found,
+                        Err(error) => {
+                            rows.push(format!(
+                                "{label} {scale_label} {n_theta}x{n_radial}: {error}"
+                            ));
+                            continue;
+                        }
+                    };
+                    let outer = field.boundary_points.clone();
+                    let hole = field.boundary_points.get(1).cloned().unwrap_or_default();
+                    let mut centre = [0.0f64; 2];
+                    for point in &hole {
+                        centre[0] += point[0] / hole.len().max(1) as f64;
+                        centre[1] += point[1] / hole.len().max(1) as f64;
+                    }
+                    let (carved, carved_quads) =
+                        carve_rings(&interior, &field, &[outer[0].clone()], 1.4);
+                    let loops = mesh_boundary_loops(&carved).unwrap_or_default();
+                    let mut contains = 0usize;
+                    let mut areas: Vec<f64> = Vec::new();
+                    for ids in &loops {
+                        let line = loop_points(&carved, ids);
+                        areas.push(loop_area(&line));
+                        if loop_contains(&line, centre) {
+                            contains += 1;
+                        }
+                    }
+                    if contains > 0 {
+                        hits += 1;
+                    }
+                    rows.push(format!(
+                        "{label:18} {scale_label} {n_theta}x{n_radial}: sing {} tiles {} interior {carved_quads} carved, {} loops, contains {contains}, areas {:?}",
+                        regions.singularities.len(),
+                        regions.tiles.len(),
+                        loops.len(),
+                        areas.iter().map(|a| (a * 100.0).round() / 100.0).collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+        for row in &rows {
+            println!("field sweep: {row}");
+        }
+        println!(
+            "field sweep: {hits} configurations contain the hole of {}",
+            rows.len()
+        );
+    }
+
+    #[test]
+    fn annulus_singularity_neighbourhoods() -> Result<(), String> {
+        let (points, tris, alpha, size) = annulus_fixture()?;
+        let regions = build(&points, &tris, &alpha, &size)?;
+        println!(
+            "merge: {} singularities, {} tiles, {} degenerate, {} collapsed",
+            regions.singularities.len(),
+            regions.tiles.len(),
+            regions.degenerate_tiles,
+            regions.collapsed_tiles
+        );
+        for (index, point) in regions.singularities.iter().enumerate() {
+            let mut incident: Vec<(usize, f64, [usize; 4])> = Vec::new();
+            for (tile_index, tile) in regions.tiles.iter().enumerate() {
+                if tile
+                    .corners
+                    .iter()
+                    .any(|corner| distance(*corner, *point) <= 1e-9)
+                {
+                    incident.push((tile_index, tile.area, tile.corner_nodes));
+                }
+            }
+            let mut total = 0.0;
+            for (_, area, _) in &incident {
+                total += area;
+            }
+            println!(
+                "merge: singularity {index} at ({:.3}, {:.3}): {} incident tiles, areas {:?}, total {:.3}",
+                point[0],
+                point[1],
+                incident.len(),
+                incident
+                    .iter()
+                    .map(|(_, area, _)| (*area * 1000.0).round() / 1000.0)
+                    .collect::<Vec<_>>(),
+                total
+            );
+        }
         Ok(())
     }
 
