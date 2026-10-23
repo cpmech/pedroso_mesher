@@ -77,6 +77,15 @@
 //!    region whose blocks would invert is not merged; its tiles fall back to
 //!    the per-tile meshes, so a failed merge never removes quads.
 //!
+//! 8. **The nautilus tile (Section 5.1.4).** On a singularity-free field over a
+//!    domain with a hole, the motorcycle graph leaves one annular region rather
+//!    than four-side tiles. [`build_nautilus`] keeps it as the thesis's
+//!    self-referential ring tile and meshes it by angular correspondence about
+//!    the hole centre: every ray meets both star-shaped loops exactly once, so
+//!    the rows close around the hole with positive quads by construction. The
+//!    stitched circular annulus is measured in [`stitch_demo`] (192 kept
+//!    interior quads, coverage 1.000, min SJ > 0.9, min angle > 80 degrees).
+//!
 //! # Faithful
 //!
 //! Per-triangle holonomy and one singularity per triangle, the exact zero
