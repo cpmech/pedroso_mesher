@@ -146,41 +146,33 @@
 //!   44-node interior loop (area 1.400) and a 44-quad equal-count projection
 //!   band: **156 quads, cracks 0, coverage 1.000, min SJ 0.625, angles
 //!   38.7-141.3 degrees, boundary offset 7e-18**.
-//! * **Annulus: gate PASS via the collar fallback.** The QGP interior has no
-//!   ring component (the five rejected faces cut it into a hole-side loop with
-//!   6 nodes on the hole plus islands of 0.7145, 0.6863 and 0.1907), so no
-//!   interior loop encloses the hole and neither band can attach to the QGP
-//!   mesh. Three attempts at a ring were measured and rejected:
-//!   (a) coarser annulus meshes (40x4 and 60x6) still have the same rejected
-//!   faces and still fall back to the collar; (b) keeping the 2.93-area
-//!   horseshoe as a *bent* tile (four field-line sides, clockwise corner
-//!   polygon) and meshing it with a bilinear Coons patch that ignores the
-//!   corner winding grows the QGP interior from 49 to 54 quads, but the patch
-//!   folds ("bent coons: a quad is inverted"): a 180-degree bent strip is not
-//!   transfinite-meshable, and the thesis handles exactly this case with the
-//!   singularity pairs and chord redirection of Section 5.1.4, not a Coons
-//!   patch; (c) after carving both rings no edge-connected component has a
-//!   hole loop that encloses the hole, so the two-band `ring_bands` path has
-//!   nothing to attach to. A phase sweep (`annulus_ring_phase_sweep`, 0-35
-//!   degrees, outer carve 1.4 sigma and hole side only 0.3 sigma so the ring
-//!   can stay connected) confirms it: **no phase gives a ring**, and at phase 0
-//!   the carved interior is three blobs of 11, 10 and 4 quads, each with a
-//!   single boundary loop and no hole loop. The ring has to come from the
-//!   2.93-area horseshoe itself, which is an *annular* tile: meshing it needs
-//!   its two long sides (8.767 and 6.067) re-parametrized by a common angular
-//!   coordinate about the hole and the ring cut by the valence-3/5 pair at the
-//!   seam, because an arc-length Coons patch twists (the arcs differ in length
-//!   and have no point correspondence). `kept_interior` therefore stays 0 for the annulus
-//!   and the collar fallback remains the only gate-passing construction. Two channel bands are therefore built on a **collar loop offset from
-//!   the hole polygon** by `1.4 sigma` (100 nodes): the outer band (100 quads)
-//!   between the domain boundary and the collar, and the hole band (100 quads)
-//!   between the hole polygon and the same collar. They share the collar ids,
-//!   so the result is conforming: **200 quads, 0 QGP interior quads, cracks 0,
+//! * **Annulus: gate PASS via the collar fallback, with the QGP interior now
+//!   including the horseshoe.** The 2.93-area horseshoe (four field lines, a
+//!   clockwise corner polygon) is kept as a *bent* tile and meshed by a Coons
+//!   patch whose two long sides (8.767 and 6.067) are re-parametrized by their
+//!   **angle about the tile centroid** instead of arc length
+//!   ([`resample_angular`] + [`bent_coons_quads`]); the QGP interior grows from
+//!   49 to **79 quads** with every quad positive. The interior is still not a
+//!   ring, though: the horseshoe is an *open* C-strip (its two ends are the
+//!   radial seps, so its boundary is one loop with no hole), and the hole is
+//!   surrounded by the three 3/5-corner faces, which are still rejected. A
+//!   quad mesh of a triangle with two even sep sides and a free arc exists
+//!   (all-quad triangulations need interior valence-3/5 pairs and the
+//!   even-boundary rule), but that construction is not implemented, so
+//!   `ring_bands` reports "no hole loop around the hole" and the collar
+//!   fallback runs: a collar loop offset `1.4 sigma` from the hole polygon
+//!   (100 nodes) carries the outer band (100 quads) and the hole band (100
+//!   quads), which share its ids. **200 quads, 0 QGP interior quads, cracks 0,
 //!   coverage 1.000, min SJ 0.729, angles 46.8-129.6 degrees, boundary offset
-//!   2e-16**. This is a fallback, not the thesis stitch: the interior QGP
-//!   quads are dropped. A true QGP interior for the annulus needs the five
-//!   rejected faces meshed (the §5.1.6 completion, which produced inverted
-//!   quads when tried) or the Chapter 2 carve.
+//!   2e-16.** This is a fallback, not the thesis stitch.
+//!
+//! Measured attempts at the ring, all rejected: coarser annulus meshes (40x4,
+//! 60x6) keep the same rejected faces; the bent-horseshoe Coons patch folds
+//! when its long sides are sampled by arc length (fixed here by the angular
+//! sampling); a phase sweep over 0-35 degrees of the cross field never leaves a
+//! ring component (at phase 0 the carved interior is blobs of 11, 10 and 4
+//! quads, each with a single loop); and a two-band path on a
+//! hole-enclosing loop finds no such loop.
 //!
 //! # Not implemented
 //!
@@ -3235,6 +3227,20 @@ fn ring_bands(
         } else if area.abs() > hole_area && loop_contains(&points, centre) && inner_loop.is_none() {
             inner_loop = Some((ids, area));
         }
+    }
+    for component_loop in mesh_boundary_loops(component).unwrap_or_default() {
+        let points = loop_points(component, &component_loop);
+        let area = loop_area(&points);
+        let off = points
+            .iter()
+            .filter(|&&p| domain.distance_to_boundary(p) > 1.0e-9)
+            .count();
+        eprintln!(
+            "DEBUG ring loop: {} nodes area {area:.4} off-boundary {off}/{} contains {}",
+            component_loop.len(),
+            points.len(),
+            loop_contains(&points, centre)
+        );
     }
     let (outer_ids, outer_area) =
         outer_loop.ok_or_else(|| "ring bands: no outer loop".to_string())?;
