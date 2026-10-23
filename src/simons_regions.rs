@@ -139,27 +139,27 @@
 //! node are re-indexed to the copy of the wedge that contains their centroid),
 //! so the boundary edge set becomes a set of disjoint cycles.
 //!
-//! * Rectangle (channel from T4 with corner-aware matching): the carve leaves
-//!   one loop of 44 nodes (area 1.400), and the band is built on the loop's
-//!   four corners, so **116 quads, coverage 1.000, min SJ 0.625, angles
-//!   38.7-141.3 degrees, boundary offset 0.125 (the ring width), 48 cracks**:
-//!   the 40 collinear inner nodes are not used by the band, which leaves a
-//!   T-junction crack along each side. T4's projection-based candidate (all
-//!   inner ids) is what removes those 48 cracks.
-//! * Annulus: the carve is now applied to the outer boundary and the hole, the
-//!   pinches are split and the largest edge-connected component is kept, but
-//!   the interior **has no ring component at all**: the largest component is a
-//!   blob of 10 quads whose outer loop `channel_between` rejects ("neither the
-//!   width-path DP nor the resampled strip nor the row strip produced a valid
-//!   ribbon"), and there is no negative-area loop for
-//!   [`crate::simons_channel::channel_between_hole`] to fill. The cause is the
-//!   five rejected faces (the 3/5-corner boundary tiles and the 2.93-area
-//!   horseshoe), which cut the annulus interior into islands: the earlier
-//!   single-carve loop census was a 20-node hole-side loop (area 1.778, 6
-//!   nodes on the hole boundary) plus islands of 0.7145, 0.6863 and 0.1907.
-//!   Stitching the annulus therefore needs the rejected faces meshed (the
-//!   tile completion that produced inverted quads, or the Chapter 2 carving),
-//!   not a better band.
+//! Measured with T4's channel HEAD (`channel_between_dense`,
+//! `channel_between_hole`):
+//!
+//! * **Rectangle: gate PASS.** 160 interior quads, 48 carved, 112 kept, a
+//!   44-node interior loop (area 1.400) and a 44-quad equal-count projection
+//!   band: **156 quads, cracks 0, coverage 1.000, min SJ 0.625, angles
+//!   38.7-141.3 degrees, boundary offset 7e-18**.
+//! * **Annulus: gate PASS via the collar fallback.** The QGP interior has no
+//!   ring component (the five rejected faces cut it into a hole-side loop with
+//!   6 nodes on the hole plus islands of 0.7145, 0.6863 and 0.1907), so no
+//!   interior loop encloses the hole and neither band can attach to the QGP
+//!   mesh. Two channel bands are therefore built on a **collar loop offset from
+//!   the hole polygon** by `1.4 sigma` (100 nodes): the outer band (100 quads)
+//!   between the domain boundary and the collar, and the hole band (100 quads)
+//!   between the hole polygon and the same collar. They share the collar ids,
+//!   so the result is conforming: **200 quads, 0 QGP interior quads, cracks 0,
+//!   coverage 1.000, min SJ 0.729, angles 46.8-129.6 degrees, boundary offset
+//!   2e-16**. This is a fallback, not the thesis stitch: the interior QGP
+//!   quads are dropped. A true QGP interior for the annulus needs the five
+//!   rejected faces meshed (the §5.1.6 completion, which produced inverted
+//!   quads when tried) or the Chapter 2 carve.
 //!
 //! # Not implemented
 //!
@@ -2290,6 +2290,9 @@ pub struct StitchCase {
     pub carved_quads: usize,
     /// Quads added by the channel.
     pub channel_quads: usize,
+    /// Interior QGP quads kept after the carve (0 when the whole domain is
+    /// filled by channel bands).
+    pub kept_interior: usize,
     /// Number of `simons_channel::channel_between` calls that succeeded.
     pub bands: usize,
     /// Total quads of the stitched mesh.
@@ -2756,6 +2759,72 @@ fn largest_component(mesh: &Mesh) -> (Mesh, usize) {
     (Mesh::new(points, cells), dropped)
 }
 
+/// Ray-casting point-in-polygon test for a closed loop.
+fn loop_contains(loop_points: &[[f64; 2]], p: [f64; 2]) -> bool {
+    let mut inside = false;
+    let count = loop_points.len();
+    if count < 3 {
+        return false;
+    }
+    let mut j = count - 1;
+    for i in 0..count {
+        let a = loop_points[i];
+        let b = loop_points[j];
+        if (a[1] > p[1]) != (b[1] > p[1]) {
+            let denominator = b[1] - a[1];
+            if denominator != 0.0 {
+                let x = a[0] + (p[1] - a[1]) * (b[0] - a[0]) / denominator;
+                if p[0] < x {
+                    inside = !inside;
+                }
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
+/// The interior loop that encloses the domain hole and lies strictly outside
+/// it: the largest negative-area boundary loop whose interior contains the
+/// hole's centroid and whose absolute area is larger than the hole's.
+fn hole_enclosing_loop(
+    mesh: &Mesh,
+    domain: &Domain,
+    hole_points: &[Vec<[f64; 2]>],
+) -> Option<(Vec<usize>, Vec<[f64; 2]>, f64)> {
+    let hole = hole_points.first()?;
+    let hole_area = loop_area(hole).abs();
+    let count = hole.len().max(1);
+    let mut centre = [0.0f64; 2];
+    for point in hole {
+        centre[0] += point[0] / count as f64;
+        centre[1] += point[1] / count as f64;
+    }
+    let loops = mesh_boundary_loops(mesh).ok()?;
+    let mut best: Option<(Vec<usize>, Vec<[f64; 2]>, f64)> = None;
+    for ids in loops {
+        let points = loop_points(mesh, &ids);
+        let area = loop_area(&points);
+        if area >= 0.0 || area.abs() <= hole_area {
+            continue;
+        }
+        let outside = points
+            .iter()
+            .all(|&p| domain.distance_to_boundary(p) > 1.0e-9);
+        if !outside || !loop_contains(&points, centre) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .map(|(_, _, found)| area.abs() > *found)
+            .unwrap_or(true)
+        {
+            best = Some((ids, points, area));
+        }
+    }
+    best
+}
+
 /// Points of a boundary loop of a mesh.
 fn loop_points(mesh: &Mesh, ids: &[usize]) -> Vec<[f64; 2]> {
     let mut points = Vec::with_capacity(ids.len());
@@ -2838,7 +2907,15 @@ fn stitch_case(
     let all_loops: Vec<Vec<[f64; 2]>> = std::iter::once(outer_points.clone())
         .chain(hole_points.iter().cloned())
         .collect();
-    let mut attempt: Option<(Mesh, usize, Vec<[usize; 4]>, Vec<[f64; 3]>, usize, f64)> = None;
+    let mut attempt: Option<(
+        Mesh,
+        usize,
+        Vec<[usize; 4]>,
+        Vec<[f64; 3]>,
+        usize,
+        f64,
+        bool,
+    )> = None;
     let mut fallback: Option<(Mesh, usize)> = None;
     for &radius in &[1.4f64, 1.6, 1.8, 2.0, 2.4, 3.0, 3.6] {
         let (carved, carved_quads) = carve_rings(&interior, &field, &all_loops, radius);
@@ -2857,6 +2934,71 @@ fn stitch_case(
             notes.push(format!(
                 "carve {radius:.1}: split {split_nodes} pinched boundary node(s)"
             ));
+        }
+        // A domain with a hole can be filled by two bands that meet on a single
+        // loop around the hole: the outer band between the domain boundary and
+        // that loop, and the hole band between the hole polygon and the same
+        // loop. This is the annulus path; it needs no interior ring at all.
+        if !hole_points.is_empty() {
+            if let Some((ids, points2d, area)) = hole_enclosing_loop(&carved, &domain, &hole_points)
+            {
+                let mean_size = mean_sigma(&field, &points2d);
+                let mut pool: Vec<[f64; 3]> = carved.points.clone();
+                let outer_band = simons_channel::channel_between_dense(
+                    &domain,
+                    &outer_points,
+                    &points2d,
+                    &ids,
+                    &mut pool,
+                    mean_size,
+                )
+                .or_else(|_| {
+                    simons_channel::channel_between(
+                        &domain,
+                        &outer_points,
+                        &points2d,
+                        &ids,
+                        &mut pool,
+                        mean_size,
+                    )
+                });
+                let hole_band = simons_channel::channel_between_hole(
+                    &domain,
+                    &hole_points[0],
+                    &points2d,
+                    &ids,
+                    &mut pool,
+                    mean_size,
+                );
+                match (outer_band, hole_band) {
+                    (Ok(outer_quads), Ok(hole_quads)) => {
+                        notes.push(format!(
+                            "carve {radius:.1}: two-band fill on {} nodes (loop area {area:.4}): \
+                             outer {} quads, hole {} quads",
+                            ids.len(),
+                            outer_quads.len(),
+                            hole_quads.len()
+                        ));
+                        let mut quads = outer_quads;
+                        quads.extend(hole_quads);
+                        let bands = 2usize;
+                        attempt = Some((carved, carved_quads, quads, pool, bands, radius, false));
+                        break;
+                    }
+                    (outer, hole) => {
+                        if let Err(error) = outer {
+                            notes.push(format!("carve {radius:.1}: two-band outer: {error}"));
+                        }
+                        if let Err(error) = hole {
+                            notes.push(format!("carve {radius:.1}: two-band hole: {error}"));
+                        }
+                    }
+                }
+            } else {
+                notes.push(format!(
+                    "carve {radius:.1}: no interior loop encloses the hole"
+                ));
+            }
         }
         let (carved, dropped) = largest_component(&carved);
         if carved.cells.is_empty() {
@@ -2917,14 +3059,25 @@ fn stitch_case(
             if ids.len().is_multiple_of(2) {
                 let points2d = loop_points(&carved, &ids);
                 let mean_size = mean_sigma(&field, &points2d);
-                match simons_channel::channel_between_dense(
+                let band = simons_channel::channel_between_dense(
                     &domain,
                     &outer_points,
                     &points2d,
                     &ids,
                     &mut pool,
                     mean_size,
-                ) {
+                )
+                .or_else(|_| {
+                    simons_channel::channel_between(
+                        &domain,
+                        &outer_points,
+                        &points2d,
+                        &ids,
+                        &mut pool,
+                        mean_size,
+                    )
+                });
+                match band {
                     Ok(found) => {
                         notes.push(format!(
                             "carve {radius:.1}: outer band on {} nodes (area {area:.4}), \
@@ -2974,34 +3127,118 @@ fn stitch_case(
             }
         }
         if bands > 0 {
-            attempt = Some((carved, carved_quads, quads, pool, bands, radius));
+            attempt = Some((carved, carved_quads, quads, pool, bands, radius, true));
             break;
         }
         if fallback.is_none() {
             fallback = Some((carved, carved_quads));
         }
     }
-    let (mut carved_mesh, carved_quads, channel_quads, pool, bands, _radius) = match attempt {
-        Some(found) => found,
-        None => {
-            let (carved, carved_quads) = match fallback {
-                Some(found) => found,
-                None => {
-                    return Err(format!(
-                        "regions: no carve radius left a stitchable interior loop ({notes:?})"
-                    ))
-                }
-            };
-            (carved, carved_quads, Vec::new(), Vec::new(), 0usize, 0.0)
-        }
-    };
+    let (mut carved_mesh, carved_quads, mut channel_quads, pool, bands, _radius, keep_interior) =
+        match attempt {
+            Some(found) => found,
+            None => {
+                let (carved, carved_quads) = match fallback {
+                    Some(found) => found,
+                    None => {
+                        return Err(format!(
+                            "regions: no carve radius left a stitchable interior loop ({notes:?})"
+                        ))
+                    }
+                };
+                (
+                    carved,
+                    carved_quads,
+                    Vec::new(),
+                    Vec::new(),
+                    0usize,
+                    0.0,
+                    true,
+                )
+            }
+        };
     if !pool.is_empty() {
         carved_mesh.points = pool;
     }
-    let mut cells = carved_mesh.cells.clone();
+    let mut keep_interior = keep_interior;
+    let mut bands = bands;
+    // Last resort for a domain with a hole and no ring-shaped interior: two
+    // bands that meet on a collar loop offset from the hole polygon. The QGP
+    // interior contributes no quad; the bands share the collar ids, so the
+    // result is still conforming.
+    if bands < 2 && !hole_points.is_empty() {
+        let hole = hole_points[0].clone();
+        let count = hole.len();
+        let mean = mean_sigma(&field, &hole);
+        let gap = 1.4 * mean;
+        let mut centre = [0.0f64; 2];
+        for point in &hole {
+            centre[0] += point[0] / count as f64;
+            centre[1] += point[1] / count as f64;
+        }
+        let collar: Vec<[f64; 2]> = hole
+            .iter()
+            .map(|point| {
+                let offset = sub(*point, centre);
+                match unit(offset) {
+                    Some(direction) => add(*point, scale(direction, gap)),
+                    None => *point,
+                }
+            })
+            .collect();
+        let mut pool = carved_mesh.points.clone();
+        let mut ids: Vec<usize> = Vec::with_capacity(count);
+        for point in &collar {
+            ids.push(pool.len());
+            pool.push([point[0], point[1], 0.0]);
+        }
+        let outer_band = simons_channel::channel_between_dense(
+            &domain,
+            &outer_points,
+            &collar,
+            &ids,
+            &mut pool,
+            mean,
+        )
+        .or_else(|_| {
+            simons_channel::channel_between(&domain, &outer_points, &collar, &ids, &mut pool, mean)
+        });
+        let hole_band =
+            simons_channel::channel_between_hole(&domain, &hole, &collar, &ids, &mut pool, mean);
+        match (outer_band, hole_band) {
+            (Ok(outer_quads), Ok(hole_quads)) => {
+                notes.push(format!(
+                    "collar fallback: {} nodes at {gap:.3} from the hole, outer {} quads, \
+                     hole {} quads, no QGP interior",
+                    ids.len(),
+                    outer_quads.len(),
+                    hole_quads.len()
+                ));
+                carved_mesh.points = pool;
+                channel_quads = outer_quads;
+                channel_quads.extend(hole_quads);
+                bands = 2;
+                keep_interior = false;
+            }
+            (outer, hole_band) => {
+                if let Err(error) = outer {
+                    notes.push(format!("collar outer band: {error}"));
+                }
+                if let Err(error) = hole_band {
+                    notes.push(format!("collar hole band: {error}"));
+                }
+            }
+        }
+    }
+    let mut cells: Vec<Cell> = if keep_interior {
+        carved_mesh.cells.clone()
+    } else {
+        Vec::new()
+    };
     for quad in &channel_quads {
         cells.push(Cell::quad4(*quad));
     }
+    let kept_interior = cells.len().saturating_sub(channel_quads.len());
     let mesh = Mesh::new(carved_mesh.points.clone(), cells);
     mesh.validate()
         .map_err(|error| format!("regions: the stitched mesh is invalid: {error}"))?;
@@ -3010,6 +3247,7 @@ fn stitch_case(
         interior_quads: interior.cells.len(),
         carved_quads,
         channel_quads: channel_quads.len(),
+        kept_interior,
         bands,
         quads: mesh.cells.len(),
         notes,
@@ -3349,7 +3587,6 @@ pub fn demo() -> Result<DemoNumbers, String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -3568,15 +3805,37 @@ mod tests {
                 case.notes
             );
         }
-        // The carve always leaves a quad mesh with a boundary loop; the
-        // channel depends on `channel_between`, which currently rejects a
-        // dense (staircase) inner loop, so that failure is asserted as a note
-        // rather than hidden.
-        assert!(numbers.rectangle.carved_quads > 0);
-        assert!(numbers.rectangle.quads > 0);
-        assert!(!numbers.rectangle.mesh.cells.is_empty());
-        assert!(!numbers.annulus.mesh.cells.is_empty());
-        assert!(numbers.annulus.quads > 0);
+        // Both cases must come out all-quad, crack-free and covering the
+        // domain; the annulus is filled by two channel bands because its QGP
+        // interior has no ring component.
+        for case in [&numbers.rectangle, &numbers.annulus] {
+            assert_eq!(case.cracks, 0, "{}: cracks {}", case.name, case.cracks);
+            assert!(
+                case.coverage > 0.999,
+                "{}: coverage {}",
+                case.name,
+                case.coverage
+            );
+            assert!(
+                case.min_scaled_jacobian > 0.2,
+                "{}: min SJ {}",
+                case.name,
+                case.min_scaled_jacobian
+            );
+            assert!(
+                case.min_corner_angle_deg >= 30.0 && case.max_corner_angle_deg <= 150.0,
+                "{}: angles [{}, {}]",
+                case.name,
+                case.min_corner_angle_deg,
+                case.max_corner_angle_deg
+            );
+            assert!(!case.mesh.cells.is_empty());
+        }
+        assert_eq!(numbers.rectangle.channel_quads, 44);
+        assert_eq!(numbers.rectangle.kept_interior, 112);
+        assert_eq!(numbers.annulus.bands, 2);
+        assert_eq!(numbers.annulus.kept_interior, 0);
+        assert_eq!(numbers.annulus.channel_quads, 200);
         Ok(())
     }
 
@@ -3659,16 +3918,6 @@ mod tests {
         let mesh = regions.mesh()?;
         assert!(!mesh.cells.is_empty());
         Ok(())
-    }
-
-    #[test]
-    fn stitched_rectangle_is_crack_free() {
-        let numbers = stitch_demo().unwrap();
-        let c = &numbers.rectangle;
-        assert_eq!(c.cracks, 0, "{}", c.notes.join("; "));
-        assert!(c.coverage > 0.999, "coverage {}", c.coverage);
-        assert!(c.min_scaled_jacobian > 0.2);
-        assert!(c.channel_quads > 0);
     }
 
     #[test]

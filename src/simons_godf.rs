@@ -33,9 +33,23 @@
 //!   off-diagonal entry `(p, q)` of a counter-clockwise triangle is
 //!   `conj(r_pq)` times the real (or complex, for the accurate path) triangle
 //!   integral, as printed on p. 78 of the thesis and in GODF Eqs. 17-18.
-//! * The Dirichlet energy (`s = 0` of Eq. 18, so `A = Delta`) and the
-//!   `10^-8 M` regularization of line 33 are used. The holomorphic /
-//!   anti-holomorphic split of Eq. 18 is not implemented.
+//! * The `10^-8 M` regularization of line 33 is used.
+//! * The holomorphic / anti-holomorphic family of Eq. 18 (GODF Eq. 18) is
+//!   implemented through [`Options::holomorphic`], the parameter `s`:
+//!
+//!   ```text
+//!   A_ii = Delta_ii - s (Omega_ijk / |t_ijk|) M_ii
+//!   A_jk = Delta_jk - s (Omega_ijk / |t_ijk|) M_jk + s eps_jk i conj(r_jk) / 2
+//!   ```
+//!
+//!   with `eps_jk = +1` for the counter-clockwise edge `j -> k` of a
+//!   counter-clockwise triangle (the orientation used internally). `s = 0` is
+//!   the Dirichlet energy (`A = Delta`, the historical behaviour), `s = 1` is
+//!   the holomorphic energy (fewer singularities) and `s = -1` the
+//!   anti-holomorphic energy; `s` is validated to lie in `[-1, 1]`. The
+//!   `i conj(r_jk)/2` term is the boundary term of the anti-holomorphic minus
+//!   holomorphic energy; it cancels on interior edges and survives on the mesh
+//!   boundary, as in GODF Section 6.1.1.
 //! * The vector associated with the smallest eigenvalue of the shifted pencil
 //!   is computed; the phase of the field is the arbitrary global phase that the
 //!   thesis describes in Section 3.3.1.
@@ -151,11 +165,15 @@
 //!   `Omega = 0`; a Taylor series (terms through `Omega^8`) is used for
 //!   `|Omega| < 0.1`, which is far below the accuracy of the double-precision
 //!   closed form on either side of the switch.
+//! * **Holomorphic parameter.** [`Options::holomorphic`] is validated to lie in
+//!   `[-1, 1]`, the range GODF gives for `s`, and non-finite values are
+//!   rejected. The `M_jk` used in the Eq. 18 correction is the same mass entry
+//!   as the rest of the assembly (the accurate `MassIJ` when
+//!   [`Options::accurate`] is set, the flat `1/12` otherwise).
 //!
 //! # Not implemented
 //!
-//! The holomorphic/anti-holomorphic split of Eq. 18 (`s != 0` there),
-//! anisotropic sizing (Chapter 4), adaptive background-mesh refinement,
+//! Anisotropic sizing (Chapter 4), adaptive background-mesh refinement,
 //! singularity placement, boundary constraints, and the extraction of a quad
 //! mesh. The input is assumed planar: `z` is ignored and only `x, y` are used.
 
@@ -181,6 +199,13 @@ pub struct Options {
     /// flat-triangle limits. The default, `false`, is the flat limit used by
     /// the original implementation.
     pub accurate: bool,
+    /// Holomorphic parameter `s` of GODF Eq. 18 (the thesis's Eq. 18).
+    ///
+    /// `s = 0` (the default) is the Dirichlet energy `A = Delta`, i.e. the
+    /// historical field; `s = 1` is the holomorphic energy (fewer
+    /// singularities); `s = -1` is the anti-holomorphic energy. Values outside
+    /// `[-1, 1]` and non-finite values are rejected by the solvers.
+    pub holomorphic: f64,
 }
 
 /// A per-vertex target cross field for [`solve_with_guidance`].
@@ -744,6 +769,12 @@ fn solve_impl(
     iterations: usize,
 ) -> Result<Vec<f64>, String> {
     let n = validate(points, tris, size, iterations)?;
+    if !options.holomorphic.is_finite() || !(-1.0..=1.0).contains(&options.holomorphic) {
+        return Err(format!(
+            "the holomorphic parameter s = {} is not finite and in [-1, 1]",
+            options.holomorphic
+        ));
+    }
     if let Some(guidance) = guidance {
         validate_guidance(n, guidance)?;
     }
@@ -853,6 +884,16 @@ fn solve_impl(
             energy.diagonal[k] += dot2(p_ij, p_ij) * quarter_area;
         }
 
+        // Eq. 18 diagonal term: `-s (Omega/|t|) M_ii` with `M_ii = |t|/6`,
+        // so the correction is `-s Omega/6` for the three vertices.
+        let holomorphic = options.holomorphic;
+        if holomorphic != 0.0 {
+            let diagonal_correction = -holomorphic * omega / 6.0;
+            energy.diagonal[i] += diagonal_correction;
+            energy.diagonal[j] += diagonal_correction;
+            energy.diagonal[k] += diagonal_correction;
+        }
+
         // The three counter-clockwise oriented pairs `(p, q)` with the third
         // vertex `r`, expressed as local indices into `geometry.positions`.
         let pairs = [(0usize, 1usize, 2usize), (1, 2, 0), (2, 0, 1)];
@@ -892,13 +933,23 @@ fn solve_impl(
                 Complex::new(1.0 / 12.0, 0.0)
             };
             let mass_entry = r_pq.conj().mul(mass_scalar).scale(area);
-            let energy_entry = if options.accurate {
+            let mut energy_entry = if options.accurate {
                 r_pq.conj()
                     .mul(dirichlet_integral(omega, g11, g12, g22))
                     .scale(area.recip())
             } else {
                 r_pq.conj().scale(-g12 * (4.0 * area).recip())
             };
+
+            // Eq. 18 off-diagonal terms:
+            //   `-s (Omega/|t|) M_pq + s i conj(r_pq) / 2`,
+            // with `eps_pq = +1` because the pair is traversed counter-clockwise
+            // (the sign in the second term is tied to that orientation).
+            if holomorphic != 0.0 {
+                energy_entry = energy_entry
+                    .sub(mass_entry.scale(holomorphic * omega / area))
+                    .add(Complex::new(0.0, 0.5 * holomorphic).mul(r_pq.conj()));
+            }
 
             // Store the entry for the canonical edge `(a, b)` with `a < b`;
             // the transposed entry is generated as its conjugate.
@@ -1066,7 +1117,7 @@ pub fn solve(
 /// # Example
 ///
 /// ```no_run
-/// let options = pedroso_mesher::simons_godf::Options { accurate: true };
+/// let options = pedroso_mesher::simons_godf::Options { accurate: true, holomorphic: 0.0 };
 /// let alpha = pedroso_mesher::simons_godf::solve_with_options(
 ///     &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
 ///     &[[0, 1, 2]],
@@ -1237,6 +1288,87 @@ pub fn count_singularities(alpha: &[f64], tris: &[[usize; 3]]) -> (usize, usize)
     (valence_3, valence_5)
 }
 
+/// Regular counter-clockwise triangulation of the unit square, used by
+/// [`demo_holomorphic`].
+fn demo_square_mesh(n: usize) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
+    let n = n.max(1);
+    let mut points = Vec::with_capacity((n + 1) * (n + 1));
+    for j in 0..=n {
+        for i in 0..=n {
+            points.push([i as f64 / n as f64, j as f64 / n as f64, 0.0]);
+        }
+    }
+    let mut tris = Vec::with_capacity(2 * n * n);
+    for j in 0..n {
+        for i in 0..n {
+            let a = j * (n + 1) + i;
+            let b = a + 1;
+            let c = a + n + 2;
+            let d = a + n + 1;
+            tris.push([a, b, c]);
+            tris.push([a, c, d]);
+        }
+    }
+    (points, tris)
+}
+
+/// Measurements of the holomorphic parameter `s` on a guided, graded square.
+///
+/// The case is a `10 x 10` unit square with the graded size `sigma = 1 + x/2`,
+/// the accurate integrals, and a constant guidance target of `0.3 rad` with
+/// weight `1` (the guidance selects one representative of the global phase and
+/// makes the solve a single linear system). For each `s` in
+/// `[-1, -0.5, 0.5, 1]` the tuple is
+/// `(s, mean 4-RoSy angle difference to s = 0, max difference to s = 0)`, in
+/// radians. The measurements are returned for reporting; they are also
+/// asserted in the module tests.
+///
+/// Returns an error only if one of the linear solves fails.
+pub fn demo_holomorphic() -> Result<Vec<(f64, f64, f64)>, String> {
+    let (points, tris) = demo_square_mesh(10);
+    let size: Vec<f64> = points.iter().map(|point| 1.0 + 0.5 * point[0]).collect();
+    let guidance = Guidance {
+        weight: 1.0,
+        angle: vec![0.3; points.len()],
+    };
+    let base = solve_with_guidance_and_options(
+        &points,
+        &tris,
+        &size,
+        &guidance,
+        &Options {
+            accurate: true,
+            holomorphic: 0.0,
+        },
+        100,
+    )?;
+    let mut out = Vec::new();
+    for s in [-1.0, -0.5, 0.5, 1.0] {
+        let alpha = solve_with_guidance_and_options(
+            &points,
+            &tris,
+            &size,
+            &guidance,
+            &Options {
+                accurate: true,
+                holomorphic: s,
+            },
+            100,
+        )?;
+        let mut mean = 0.0f64;
+        let mut maximum = 0.0f64;
+        for (&a, &b) in alpha.iter().zip(base.iter()) {
+            let d = (a - b).rem_euclid(std::f64::consts::FRAC_PI_2);
+            let d = d.min(std::f64::consts::FRAC_PI_2 - d);
+            mean += d;
+            maximum = maximum.max(d);
+        }
+        mean /= alpha.len() as f64;
+        out.push((s, mean, maximum));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1384,7 +1516,16 @@ mod tests {
         let n = 8;
         let (points, tris) = square_mesh(n);
         let size = vec![1.0; points.len()];
-        let alpha = solve_with_options(&points, &tris, &size, &Options { accurate: true }, 100)?;
+        let alpha = solve_with_options(
+            &points,
+            &tris,
+            &size,
+            &Options {
+                accurate: true,
+                holomorphic: 0.0,
+            },
+            100,
+        )?;
 
         let spread = max_pairwise_distance(&alpha);
         let edge_spread = max_edge_distance(&alpha, &tris);
@@ -1440,7 +1581,16 @@ mod tests {
         let n = 8;
         let (points, tris) = square_mesh(n);
         let size: Vec<f64> = points.iter().map(|p| 1.0 + 0.5 * p[0]).collect();
-        let alpha = solve_with_options(&points, &tris, &size, &Options { accurate: true }, 100)?;
+        let alpha = solve_with_options(
+            &points,
+            &tris,
+            &size,
+            &Options {
+                accurate: true,
+                holomorphic: 0.0,
+            },
+            100,
+        )?;
         let flat = solve(&points, &tris, &size, 100)?;
 
         let edge_spread = max_edge_distance(&alpha, &tris);
@@ -1662,7 +1812,17 @@ mod tests {
         assert!(interp_angle(&size[..n - 1], &points, &tris, [0.5, 0.5]).is_nan());
 
         // Options must not change the invalid-input contract.
-        assert!(solve_with_options(&points, &tris, &size, &Options { accurate: true }, 0).is_err());
+        assert!(solve_with_options(
+            &points,
+            &tris,
+            &size,
+            &Options {
+                accurate: true,
+                holomorphic: 0.0
+            },
+            0
+        )
+        .is_err());
 
         // Guidance validation.
         let short = Guidance {
@@ -1695,9 +1855,99 @@ mod tests {
                 weight: 1.0,
                 angle: vec![0.0; n],
             },
-            &Options { accurate: true },
+            &Options {
+                accurate: true,
+                holomorphic: 0.0
+            },
             0,
         )
         .is_err());
+    }
+    #[test]
+    fn holomorphic_zero_matches_the_dirichlet_field() -> Result<(), String> {
+        let (points, tris) = square_mesh(8);
+        let size: Vec<f64> = points.iter().map(|p| 1.0 + 0.5 * p[0]).collect();
+        let guidance = Guidance {
+            weight: 1.0,
+            angle: vec![0.23; points.len()],
+        };
+        let current = solve_with_guidance(&points, &tris, &size, &guidance, 100)?;
+        let s0 = solve_with_guidance_and_options(
+            &points,
+            &tris,
+            &size,
+            &guidance,
+            &Options {
+                accurate: false,
+                holomorphic: 0.0,
+            },
+            100,
+        )?;
+        let difference = current
+            .iter()
+            .zip(s0.iter())
+            .map(|(&a, &b)| rosy_distance(a, b))
+            .fold(0.0f64, f64::max);
+        println!("s = 0: max 4-RoSy difference to the historical field = {difference:.3e} rad");
+        assert_eq!(current, s0);
+        Ok(())
+    }
+
+    #[test]
+    fn holomorphic_parameter_changes_a_guided_graded_field() -> Result<(), String> {
+        let rows = demo_holomorphic()?;
+        println!("holomorphic parameter on a guided, graded 10x10 square:");
+        for (s, mean, maximum) in &rows {
+            println!(
+                "  s = {s:+.1}: mean 4-RoSy difference = {mean:.6e} rad, max = {maximum:.6e} rad"
+            );
+        }
+        assert_eq!(rows.len(), 4);
+        for (s, mean, maximum) in &rows {
+            assert!(mean.is_finite() && maximum.is_finite());
+            assert!(*maximum >= *mean);
+            assert!(mean.abs() > 1.0e-6, "s = {s} did not change the field");
+        }
+        // The two extreme energies move the guided field by several degrees.
+        let holomorphic = rows
+            .iter()
+            .find(|row| row.0 == 1.0)
+            .ok_or("missing s = 1 row")?;
+        let anti = rows
+            .iter()
+            .find(|row| row.0 == -1.0)
+            .ok_or("missing s = -1 row")?;
+        assert!(
+            holomorphic.1 > 0.01,
+            "s = 1 mean difference {} is too small",
+            holomorphic.1
+        );
+        assert!(
+            anti.1 > 0.01,
+            "s = -1 mean difference {} is too small",
+            anti.1
+        );
+        assert!(
+            holomorphic.2 > 0.05,
+            "s = 1 max difference {} is too small",
+            holomorphic.2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn holomorphic_parameter_is_validated() {
+        let (points, tris) = square_mesh(2);
+        let size = vec![1.0; points.len()];
+        for s in [f64::NAN, f64::INFINITY, 1.5, -1.5] {
+            let options = Options {
+                accurate: false,
+                holomorphic: s,
+            };
+            assert!(
+                solve_with_options(&points, &tris, &size, &options, 10).is_err(),
+                "s = {s} was accepted"
+            );
+        }
     }
 }
