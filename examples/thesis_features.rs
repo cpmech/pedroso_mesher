@@ -9,7 +9,13 @@ use pedroso_mesher::simons_features;
 
 fn main() {
     let numbers = simons_features::demo().unwrap();
-    for case in [&numbers.through_square, &numbers.stub_square] {
+    for case in [
+        &numbers.through_square,
+        &numbers.stub_square,
+        &numbers.cross_square,
+        &numbers.t_square,
+        &numbers.channel_square,
+    ] {
         println!(
             "{}: {} quads, SJ {:.4}, angles {:.1}/{:.1}, cracks {}, offset {:.2e}, gate {}",
             case.name,
