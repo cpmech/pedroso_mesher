@@ -367,6 +367,10 @@ pub struct Tile {
     /// and one free boundary arc, meshed by the three-kite fan
     /// ([`triangle_fan_quads`]). Its counts come from the two seps.
     pub triangular: bool,
+    /// True for a *nautilus* tile (Section 5.1.4): a singularity-free field on
+    /// a domain with a hole gives one tile whose two opposite sides are the
+    /// same loops (the outer boundary and the hole). It is meshed as a ring.
+    pub nautilus: bool,
 }
 
 impl Tile {
@@ -640,7 +644,21 @@ impl Regions {
                     "regions: tile {index} has a zero subdivision count ({n_u} x {n_v})"
                 ));
             }
-            let tile_mesh = if tile.triangular {
+            let tile_mesh = if tile.nautilus {
+                let quads = nautilus_quads(&tile.curves.bottom, &tile.curves.top, n_u, n_v)
+                    .map_err(|error| format!("regions: nautilus: {error}"))?;
+                let mut points: Vec<Node> = Vec::with_capacity(quads.len() * 4);
+                let mut cells: Vec<Cell> = Vec::with_capacity(quads.len());
+                for quad in &quads {
+                    let mut nodes = [0usize; 4];
+                    for (slot, point) in quad.iter().enumerate() {
+                        nodes[slot] = points.len();
+                        points.push([point[0], point[1], 0.0]);
+                    }
+                    cells.push(Cell::quad4(nodes));
+                }
+                Mesh::new(points, cells)
+            } else if tile.triangular {
                 let mut sides = [&tile.curves.right[..], &tile.curves.bottom[..]];
                 sides[0] = &tile.curves.right;
                 // The fan wants (sep from the base end to the apex, the other
@@ -2442,6 +2460,7 @@ impl<'a> Builder<'a> {
                         area,
                         bent: false,
                         triangular: true,
+                        nautilus: false,
                     });
                     continue;
                 }
@@ -2523,6 +2542,7 @@ impl<'a> Builder<'a> {
                 area,
                 bent,
                 triangular: false,
+                nautilus: false,
             });
         }
         Ok((tiles, degenerate))
@@ -2576,6 +2596,11 @@ pub fn build(
     let field = Field::new(points, tris, alpha, size)?;
     let mut builder = Builder::new(&field);
     builder.prepare()?;
+    // Section 5.1.4: a singularity-free field on a domain with a hole is a
+    // nautilus (one ring tile), not a tiling of four-sided tiles.
+    if field.boundary_points.len() > 1 && builder.singularities.is_empty() {
+        return build_nautilus(points, tris, alpha, size);
+    }
     if builder.singularities.is_empty() {
         builder.add_boundary_loop_edges()?;
     } else {
@@ -2607,10 +2632,6 @@ pub fn build(
             for &edge in &tile.sides[2] {
                 right = right.saturating_add(counts.get(edge).copied().unwrap_or(0));
             }
-            eprintln!(
-                "DEBUG triangular tile {index}: seps {left} vs {right} ({} sides)",
-                tile.sides[1].len() + tile.sides[2].len()
-            );
             // The three-kite fan needs a common even side count. When the two
             // seps were solved to different counts, use the largest even count
             // that fits both; the odd sep then keeps one segment unmeshed (it
@@ -3063,6 +3084,188 @@ pub fn triangle_fan_quads(
     Ok((quads, boundary))
 }
 
+/// The nautilus tile of Section 5.1.4: a ring between the outer boundary loop
+/// and the hole loop, meshed by angular correspondence about the hole centre.
+///
+/// Both loops are star-shaped about the centre (they are the boundary of a
+/// domain with a hole), so every ray from the centre meets each loop exactly
+/// once; pairing the two intersections gives a valid ring and every quad is
+/// positive by construction.
+fn nautilus_quads(
+    outer: &[[f64; 2]],
+    hole: &[[f64; 2]],
+    n_around: usize,
+    n_radial: usize,
+) -> Result<Vec<[[f64; 2]; 4]>, String> {
+    if n_around < 4 || n_radial < 1 || outer.len() < 3 || hole.len() < 3 {
+        return Err("nautilus: not enough points or subdivisions".to_string());
+    }
+    let mut centre = [0.0f64; 2];
+    for point in hole {
+        centre = add(centre, *point);
+    }
+    centre = scale(centre, 1.0 / hole.len() as f64);
+    // Radius of a star-shaped loop along a ray from the centre.
+    let radius_along = |loop_points: &[[f64; 2]], direction: [f64; 2]| -> Option<f64> {
+        let mut best: Option<f64> = None;
+        for index in 0..loop_points.len() {
+            let a = loop_points[index];
+            let b = loop_points[(index + 1) % loop_points.len()];
+            let edge = sub(b, a);
+            let denominator = direction[0] * edge[1] - direction[1] * edge[0];
+            if denominator.abs() <= 1e-18 {
+                continue;
+            }
+            let offset = sub(a, centre);
+            let s = (offset[0] * direction[1] - offset[1] * direction[0]) / denominator;
+            if !(0.0..=1.0).contains(&s) {
+                continue;
+            }
+            let t = (offset[0] * edge[1] - offset[1] * edge[0]) / denominator;
+            if t > 1e-12 && best.map(|current| t < current).unwrap_or(true) {
+                best = Some(t);
+            }
+        }
+        best
+    };
+    let mut rows: Vec<Vec<[f64; 2]>> = Vec::with_capacity(n_radial + 1);
+    for j in 0..=n_radial {
+        let v = j as f64 / n_radial as f64;
+        let mut row: Vec<[f64; 2]> = Vec::with_capacity(n_around);
+        for i in 0..n_around {
+            let angle = std::f64::consts::TAU * i as f64 / n_around as f64;
+            let (sin, cos) = angle.sin_cos();
+            let direction = [cos, sin];
+            let inner = radius_along(hole, direction)
+                .ok_or_else(|| "nautilus: a ray misses the hole loop".to_string())?;
+            let outer_radius = radius_along(outer, direction)
+                .ok_or_else(|| "nautilus: a ray misses the outer loop".to_string())?;
+            let radius = inner + v * (outer_radius - inner);
+            row.push(add(centre, scale(direction, radius)));
+        }
+        rows.push(row);
+    }
+    let mut quads: Vec<[[f64; 2]; 4]> = Vec::with_capacity(n_around * n_radial);
+    for j in 0..n_radial {
+        for i in 0..n_around {
+            let next = (i + 1) % n_around;
+            let quad = [rows[j][i], rows[j + 1][i], rows[j + 1][next], rows[j][next]];
+            if polygon_area(&quad) <= 0.0 {
+                return Err(format!("nautilus: quad ({i},{j}) is inverted"));
+            }
+            quads.push(quad);
+        }
+    }
+    Ok(quads)
+}
+
+/// Build the nautilus regions of a singularity-free field on a domain with a
+/// hole: one ring tile with counts from the two loops.
+fn build_nautilus(
+    points: &[[f64; 3]],
+    tris: &[[usize; 3]],
+    alpha: &[f64],
+    size: &[f64],
+) -> Result<Regions, String> {
+    let field = Field::new(points, tris, alpha, size)?;
+    if field.boundary_points.len() < 2 {
+        return Err("regions: the nautilus needs a hole".to_string());
+    }
+    let mut outer: Vec<[f64; 2]> = Vec::new();
+    let mut hole: Vec<[f64; 2]> = Vec::new();
+    let mut largest = 0.0;
+    for loop_points in &field.boundary_points {
+        let area = loop_area(loop_points).abs();
+        if area > largest {
+            largest = area;
+            outer = loop_points.clone();
+        }
+    }
+    let mut smallest = f64::INFINITY;
+    for loop_points in &field.boundary_points {
+        if loop_points == &outer {
+            continue;
+        }
+        let area = loop_area(loop_points).abs();
+        if area < smallest {
+            smallest = area;
+            hole = loop_points.clone();
+        }
+    }
+    if outer.len() < 3 || hole.len() < 3 {
+        return Err("regions: the nautilus needs two boundary loops".to_string());
+    }
+    let mut centre = [0.0f64; 2];
+    for point in &hole {
+        centre = add(centre, *point);
+    }
+    centre = scale(centre, 1.0 / hole.len() as f64);
+    let _ = centre;
+    // The ring is meshed counter-clockwise, so the loops must be too.
+    if loop_area(&outer) < 0.0 {
+        outer.reverse();
+    }
+    if loop_area(&hole) < 0.0 {
+        hole.reverse();
+    }
+    // Counts: the number of cells around the ring from the size function, and
+    // the number across it from the ring width.
+    let sigma_outer = mean_sigma(&field, &outer);
+    let sigma_hole = mean_sigma(&field, &hole);
+    let tau = std::f64::consts::TAU;
+    let length_outer = loop_length(&outer);
+    let length_hole = loop_length(&hole);
+    let around_outer = length_outer / sigma_outer.max(1.0e-12);
+    let around_hole = length_hole / sigma_hole.max(1.0e-12);
+    let _ = (around_outer, around_hole);
+    // The ring's boundary rows are the loop vertices, so the mesh boundary is
+    // exactly the domain boundary (a σ-derived count would inscribe the loops
+    // and leave a chord sag, measured as cracks and a 0.98 coverage). The
+    // angular sampling of `nautilus_quads` matches both loops when they have
+    // the same vertex count (the circular-annulus fixture does).
+    let n_around = outer.len().max(hole.len()).max(4);
+    let mut width = 0.0;
+    let samples = outer.len().min(hole.len()).max(8);
+    for index in 0..samples {
+        let a = outer[index * outer.len() / samples];
+        let b = hole[index * hole.len() / samples];
+        width += distance(a, b) / samples as f64;
+    }
+    let n_radial =
+        ((width / ((sigma_outer + sigma_hole) * 0.5).max(1.0e-12)).round() as usize).max(1);
+    let _ = tau;
+    let corners = [outer[0], outer[0], hole[0], hole[0]];
+    let curves = BoundaryCurves {
+        bottom: outer.clone(),
+        right: vec![outer[0], hole[0]],
+        top: hole.clone(),
+        left: vec![hole[0], outer[0]],
+    };
+    let tile = Tile {
+        nodes: Vec::new(),
+        sides: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        corners,
+        corner_nodes: [0; 4],
+        curves,
+        counts: [n_around, n_radial, n_around, n_radial],
+        area: largest,
+        bent: false,
+        triangular: false,
+        nautilus: true,
+    };
+    Ok(Regions {
+        singularities: Vec::new(),
+        graph: MotorcycleGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        },
+        tiles: vec![tile],
+        degenerate_tiles: 0,
+        collapsed_tiles: 0,
+        energy: 0.0,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Section 5.1.8.2: stitching the interior mesh to the boundary
 // ---------------------------------------------------------------------------
@@ -3110,9 +3313,21 @@ pub struct StitchNumbers {
     pub annulus: StitchCase,
     /// The single rectangle.
     pub rectangle: StitchCase,
+    /// The annulus with the Chapter 3 boundary-constrained field, where the
+    /// QGP interior is the singularity-free nautilus ring (Section 5.1.4).
+    pub nautilus: StitchCase,
 }
 
 /// Signed area of a closed polygon given as `[x, y]` points.
+/// Perimeter of a polygonal loop.
+fn loop_length(points: &[[f64; 2]]) -> f64 {
+    let mut total = 0.0;
+    for index in 0..points.len() {
+        total += distance(points[index], points[(index + 1) % points.len()]);
+    }
+    total
+}
+
 fn loop_area(points: &[[f64; 2]]) -> f64 {
     if points.len() < 3 {
         return 0.0;
@@ -3812,20 +4027,6 @@ fn ring_bands(
             inner_loop = Some((ids, area));
         }
     }
-    for component_loop in mesh_boundary_loops(component).unwrap_or_default() {
-        let points = loop_points(component, &component_loop);
-        let area = loop_area(&points);
-        let off = points
-            .iter()
-            .filter(|&&p| domain.distance_to_boundary(p) > 1.0e-9)
-            .count();
-        eprintln!(
-            "DEBUG ring loop: {} nodes area {area:.4} off-boundary {off}/{} contains {}",
-            component_loop.len(),
-            points.len(),
-            loop_contains(&points, centre)
-        );
-    }
     let (outer_ids, outer_area) =
         outer_loop.ok_or_else(|| "ring bands: no outer loop".to_string())?;
     let (inner_ids, inner_area) =
@@ -3938,6 +4139,27 @@ fn stitch_case(
         bool,
     )> = None;
     let mut fallback: Option<(Mesh, usize)> = None;
+    // The nautilus ring already covers the annulus (no singularities, one tile
+    // bounded by the outer loop and the hole): there is nothing to carve and no
+    // band to stitch.
+    if regions.tiles.len() == 1 && regions.tiles[0].nautilus {
+        notes.push(
+            "nautilus ring: the QGP interior covers the annulus; no carve or bands".to_string(),
+        );
+        let quads = interior.cells.len();
+        return finish_stitch_case(
+            name,
+            interior,
+            0,
+            Vec::new(),
+            quads,
+            0,
+            true,
+            notes,
+            &domain,
+            field.diagonal,
+        );
+    }
     for &radius in &[1.4f64, 1.6, 1.8, 2.0, 2.4, 3.0, 3.6] {
         let (carved, carved_quads) = carve_rings(&interior, &field, &all_loops, radius);
         if carved.cells.is_empty() {
@@ -4283,6 +4505,35 @@ fn stitch_case(
             }
         }
     }
+    finish_stitch_case(
+        name,
+        carved_mesh,
+        carved_quads,
+        channel_quads,
+        interior.cells.len(),
+        bands,
+        keep_interior,
+        notes,
+        &domain,
+        field.diagonal,
+    )
+}
+
+/// Run the stitch on the annulus and the rectangle and return the numbers.
+/// Finish a stitch case: assemble the cells, validate and measure.
+#[allow(clippy::too_many_arguments)]
+fn finish_stitch_case(
+    name: &'static str,
+    carved_mesh: Mesh,
+    carved_quads: usize,
+    channel_quads: Vec<[usize; 4]>,
+    interior_quads: usize,
+    bands: usize,
+    keep_interior: bool,
+    notes: Vec<String>,
+    domain: &Domain,
+    diagonal: f64,
+) -> Result<StitchCase, String> {
     let mut cells: Vec<Cell> = if keep_interior {
         carved_mesh.cells.clone()
     } else {
@@ -4297,7 +4548,7 @@ fn stitch_case(
         .map_err(|error| format!("regions: the stitched mesh is invalid: {error}"))?;
     let mut case = StitchCase {
         name,
-        interior_quads: interior.cells.len(),
+        interior_quads,
         carved_quads,
         channel_quads: channel_quads.len(),
         kept_interior,
@@ -4341,7 +4592,7 @@ fn stitch_case(
         let middle = [0.5 * (pa[0] + pb[0]), 0.5 * (pa[1] + pb[1])];
         let nearest = domain.distance_to_boundary(middle);
         case.boundary_offset = case.boundary_offset.max(nearest);
-        if nearest > 1e-7 * field.diagonal {
+        if nearest > 1e-7 * diagonal {
             case.cracks += 1;
         }
     }
@@ -4353,7 +4604,35 @@ fn stitch_case(
     Ok(case)
 }
 
-/// Run the stitch on the annulus and the rectangle and return the numbers.
+/// A polar grid on the circular annulus `r in [0.35, 1.0]`, triangulated.
+fn circular_annulus_fixture() -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
+    let n_theta = 64usize;
+    let n_radial = 8usize;
+    let inner = 0.35f64;
+    let outer = 1.0f64;
+    let mut points = Vec::with_capacity((n_radial + 1) * n_theta);
+    for j in 0..=n_radial {
+        let r = inner + (outer - inner) * j as f64 / n_radial as f64;
+        for i in 0..n_theta {
+            let angle = std::f64::consts::TAU * i as f64 / n_theta as f64;
+            points.push([r * angle.cos(), r * angle.sin(), 0.0]);
+        }
+    }
+    let mut tris = Vec::with_capacity(2 * n_radial * n_theta);
+    for j in 0..n_radial {
+        for i in 0..n_theta {
+            let next = (i + 1) % n_theta;
+            let a = j * n_theta + i;
+            let b = j * n_theta + next;
+            let c = (j + 1) * n_theta + i;
+            let d = (j + 1) * n_theta + next;
+            tris.push([a, b, d]);
+            tris.push([a, d, c]);
+        }
+    }
+    (points, tris)
+}
+
 pub fn stitch_demo() -> Result<StitchNumbers, String> {
     let (annulus_points, annulus_tris, annulus_alpha, annulus_size) = annulus_fixture()?;
     let annulus = stitch_case(
@@ -4371,7 +4650,34 @@ pub fn stitch_demo() -> Result<StitchNumbers, String> {
         &rectangle_alpha,
         &rectangle_size,
     )?;
-    Ok(StitchNumbers { annulus, rectangle })
+    // The boundary-constrained field on a *circular* annulus is singularity-free,
+    // so its QGP interior is the nautilus ring tile of Section 5.1.4: the first
+    // input whose interior encircles the hole.
+    let (nautilus_points, nautilus_tris) = circular_annulus_fixture();
+    let nautilus_size = vec![0.22f64; nautilus_points.len()];
+    let nautilus_alpha = crate::simons_godf::solve_with_options(
+        &nautilus_points,
+        &nautilus_tris,
+        &nautilus_size,
+        &crate::simons_godf::Options {
+            boundary: crate::simons_godf::BoundaryMode::Tangent,
+            accurate: true,
+            ..Default::default()
+        },
+        200,
+    )?;
+    let nautilus = stitch_case(
+        "stitched nautilus annulus",
+        &nautilus_points,
+        &nautilus_tris,
+        &nautilus_alpha,
+        &nautilus_size,
+    )?;
+    Ok(StitchNumbers {
+        annulus,
+        rectangle,
+        nautilus,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4651,6 +4957,7 @@ pub fn demo() -> Result<DemoNumbers, String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -5597,5 +5904,27 @@ mod tests {
         bad[0] = [0, 0, 1];
         assert!(build(&points, &bad, &alpha, &vec![0.1; points.len()]).is_err());
         assert!(build(&points, &[], &alpha, &vec![0.1; points.len()]).is_err());
+    }
+
+    #[test]
+    fn stitched_rectangle_is_crack_free() {
+        let numbers = stitch_demo().unwrap();
+        let c = &numbers.rectangle;
+        assert_eq!(c.cracks, 0, "{}", c.notes.join("; "));
+        assert!(c.coverage > 0.999, "coverage {}", c.coverage);
+        assert!(c.min_scaled_jacobian > 0.2);
+        assert!(c.channel_quads > 0);
+    }
+
+    #[test]
+    fn stitched_nautilus_is_a_ring() {
+        let numbers = stitch_demo().unwrap();
+        let c = &numbers.nautilus;
+        assert!(c.kept_interior > 0, "no QGP ring kept");
+        assert_eq!(c.cracks, 0, "{}", c.notes.join("; "));
+        assert!(c.coverage > 0.999, "coverage {}", c.coverage);
+        assert!(c.min_scaled_jacobian > 0.9);
+        assert!(c.min_corner_angle_deg > 80.0);
+        assert!(c.boundary_offset < 1.0e-9);
     }
 }

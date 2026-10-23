@@ -7,7 +7,7 @@ use pedroso_mesher::simons_regions;
 fn main() {
     match simons_regions::stitch_demo() {
         Ok(n) => {
-            for c in [&n.rectangle, &n.annulus] {
+            for c in [&n.rectangle, &n.annulus, &n.nautilus] {
                 println!(
                     "{}: interior {} carved {} channel {} bands {} -> {} quads, cracks {}, SJ {:.4}, angles {:.1}/{:.1}, coverage {:.3}, offset {:.2e}",
                     c.name, c.interior_quads, c.carved_quads, c.channel_quads, c.bands,
