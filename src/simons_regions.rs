@@ -2611,6 +2611,140 @@ pub fn laplacian_embedding(
     positions
 }
 
+/// Quadrangulate a triangle with `leg_segments` subdivisions on each shared sep
+/// and `base_segments` on the free base: 24 quads for (6, 4), arranged as five
+/// quad rows plus a four-quad pinwheel at the apex with two extra interior
+/// nodes. The interior nodes are placed by [`laplacian_embedding`] with the
+/// base, the two seps and the apex fixed, so the embedding stays inside the
+/// triangle; every quad is then checked to be counter-clockwise.
+///
+/// Returns the quads and their boundary edge count (which must be
+/// `base_segments + 2 * leg_segments`).
+#[allow(dead_code)]
+fn triangle_patch_quads(
+    sep_left: &[[f64; 2]],
+    sep_right: &[[f64; 2]],
+    base: &[[f64; 2]],
+    base_segments: usize,
+    leg_segments: usize,
+) -> Result<(Vec<[[f64; 2]; 4]>, usize), String> {
+    if base_segments < 2 || leg_segments < 2 {
+        return Err("triangle patch: at least two segments per side".to_string());
+    }
+    let left = resample_open(sep_left, leg_segments);
+    let right = resample_open(sep_right, leg_segments);
+    let bottom = resample_open(base, base_segments);
+    if left.len() != leg_segments + 1
+        || right.len() != leg_segments + 1
+        || bottom.len() != base_segments + 1
+    {
+        return Err("triangle patch: a side has zero length".to_string());
+    }
+    let apex = match (left.last(), right.last()) {
+        (Some(a), Some(b)) => add(scale(*a, 0.5), scale(*b, 0.5)),
+        _ => return Err("triangle patch: no apex".to_string()),
+    };
+    // Node ids: base 0..base_segments; level j (1..leg_segments) has the left
+    // sep node, the interior nodes and the right sep node.
+    let width = base_segments + 1;
+    let mut positions: HashMap<usize, [f64; 2]> = HashMap::new();
+    let mut fixed: HashMap<usize, [f64; 2]> = HashMap::new();
+    for (i, point) in bottom.iter().enumerate() {
+        positions.insert(i, *point);
+        fixed.insert(i, *point);
+    }
+    let level_start = |j: usize| -> usize { width + (j - 1) * width };
+    for j in 1..=leg_segments {
+        let start = level_start(j);
+        let left_point = *left.get(j).unwrap_or(&apex);
+        let right_point = *right.get(j).unwrap_or(&apex);
+        for i in 0..width {
+            let s = i as f64 / base_segments as f64;
+            let point = add(scale(left_point, 1.0 - s), scale(right_point, s));
+            positions.insert(start + i, point);
+            if i == 0 {
+                fixed.insert(start, left_point);
+            } else if i + 1 == width {
+                fixed.insert(start + i, right_point);
+            }
+        }
+    }
+    let apex_id = level_start(leg_segments) + width;
+    positions.insert(apex_id, apex);
+    fixed.insert(apex_id, apex);
+    let extra0 = apex_id + 1;
+    let extra1 = apex_id + 2;
+    // The two fan extras sit on the apex bisector, at a third of the apex
+    // height and a quarter of the chord half-width to either side. They are
+    // fixed, not solved: for a thin triangle the harmonic solve puts them on
+    // the level chord, which folds the two middle fan quads.
+    let last_start = level_start(leg_segments) - width;
+    let chord_start = positions.get(&last_start).copied().unwrap_or(apex);
+    let chord_end = positions
+        .get(&(last_start + base_segments))
+        .copied()
+        .unwrap_or(apex);
+    let chord = sub(chord_end, chord_start);
+    let chord_length = norm(chord);
+    let middle = scale(add(chord_start, chord_end), 0.5);
+    // `up` points from the apex towards the chord midpoint, so that
+    // `apex + up * h/3` is inside the triangle.
+    let up = unit(sub(middle, apex)).unwrap_or([0.0, -1.0]);
+    let tangent = unit(chord).unwrap_or([1.0, 0.0]);
+    let height = distance(apex, middle);
+    let along = add(scale(up, height / 3.0), apex);
+    let side = 0.25 * 0.5 * chord_length;
+    let extra0_point = add(along, scale(tangent, side));
+    let extra1_point = add(along, scale(tangent, -side));
+    positions.insert(extra0, extra0_point);
+    positions.insert(extra1, extra1_point);
+    fixed.insert(extra0, extra0_point);
+    fixed.insert(extra1, extra1_point);
+    // Topology: strip rows then the pinwheel.
+    let mut quads: Vec<[usize; 4]> = Vec::new();
+    for j in 0..leg_segments - 1 {
+        let lower = level_start(j.max(1));
+        let lower = if j == 0 { 0 } else { lower };
+        let upper = level_start(j + 1);
+        for i in 0..base_segments {
+            quads.push([lower + i, lower + i + 1, upper + i + 1, upper + i]);
+        }
+    }
+    let last = level_start(leg_segments);
+    // Pinwheel: q1 and q4 share (apex, p0); q2 and q3 share (p0, p1).
+    quads.push([last, last + 1, extra0, apex_id]);
+    quads.push([last + 1, last + 2, extra0, extra1]);
+    quads.push([last + 2, last + 3, extra1, extra0]);
+    quads.push([last + 3, last + 4, apex_id, extra0]);
+    let placed = laplacian_embedding(&quads, &fixed, &positions, 400);
+    let mut out: Vec<[[f64; 2]; 4]> = Vec::with_capacity(quads.len());
+    for (index, quad) in quads.iter().enumerate() {
+        let mut corners = [[0.0f64; 2]; 4];
+        for (slot, &node) in quad.iter().enumerate() {
+            corners[slot] = match placed.get(&node) {
+                Some(found) => *found,
+                None => return Err(format!("triangle patch: node {node} unplaced")),
+            };
+        }
+        if polygon_area(&corners) <= 0.0 {
+            return Err(format!("triangle patch: quad {index} is inverted"));
+        }
+        out.push(corners);
+    }
+    // Boundary edge count of the topology.
+    let mut edges: HashMap<(usize, usize), usize> = HashMap::new();
+    for quad in &quads {
+        for slot in 0..4 {
+            let a = quad[slot];
+            let b = quad[(slot + 1) % 4];
+            let key = if a < b { (a, b) } else { (b, a) };
+            *edges.entry(key).or_insert(0) += 1;
+        }
+    }
+    let boundary = edges.values().filter(|&&count| count == 1).count();
+    Ok((out, boundary))
+}
+
 // ---------------------------------------------------------------------------
 // Section 5.1.8.2: stitching the interior mesh to the boundary
 // ---------------------------------------------------------------------------
@@ -4548,10 +4682,12 @@ mod tests {
         let boundary = edges.values().filter(|&&count| count == 1).count();
         let v = nodes.len();
         let e = edges.len();
+        // Euler for a connected planar graph: V - E + F = 2 with F including
+        // the outer face; a quad patch is a disk when V - E + (quads + 1) = 2.
         let f = quads.len() + 1;
-        if v + f != e + 1 {
+        if v + f != e + 2 {
             return Err(format!(
-                "not a disk: V={v} E={e} F={f} (V + F - E = {})",
+                "not a disk: V={v} E={e} F={f} (V + F - E = {} != 2)",
                 v + f - e
             ));
         }
@@ -4581,22 +4717,22 @@ mod tests {
         let last = level(5);
         let extras = [30, 31, 32];
         let apex = 33;
+        // Pinwheel: q1 and q4 share the apex edge (A, p0); q2 and q3 share
+        // (p0, p1) and (p1, L2); every apex edge is used twice.
         quads.push([last[0], last[1], extras[0], apex]);
         quads.push([last[1], last[2], extras[1], extras[0]]);
-        quads.push([last[2], last[3], extras[2], extras[1]]);
-        quads.push([last[3], last[4], apex, extras[2]]);
-        // Measured: the 5-row strip plus this apex fan is a disk but its
-        // boundary has 20 edges instead of 16 - the two edges at the apex
-        // (p0, apex) and (apex, p2) are used once, so the fan does not close.
-        // The apex needs a pinwheel fan: 4 quads sharing two edges at the apex,
-        // which is what the next attempt has to build.
+        quads.push([last[2], last[3], extras[0], extras[1]]);
+        quads.push([last[3], last[4], apex, extras[0]]);
+        // The 5-row strip plus the pinwheel fan (q1 and q4 sharing (apex, p0),
+        // q2 and q3 sharing (p0, p1)) is a disk whose boundary is exactly
+        // 4 + 6 + 6 = 16 edges: 24 quads, 2 extra interior nodes.
         match patch_is_a_disk(&quads) {
             Ok(boundary) => {
                 println!(
                     "variant (a): {} quads, boundary {boundary} edges (want 4 + 6 + 6 = 16)",
                     quads.len()
                 );
-                assert_eq!(boundary, 20, "the apex fan leaves two open edges");
+                assert_eq!(boundary, 16, "pinwheel boundary");
             }
             Err(error) => println!("variant (a) invalid: {error}"),
         }
