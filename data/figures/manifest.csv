@@ -165,3 +165,11 @@ features,features,stub-channel,raw,ok,90,0,0.6226,38.51,PASS,data/figures/featur
 features,features,stub-channel,smooth,ok,90,0,0.5950,42.36,PASS,data/figures/features/stub-channel-smooth.png
 pipeline,pipeline,graded-10x10,raw,ok,16,0,1.0000,90.00,PASS,data/figures/pipeline/graded-10x10-raw.png
 pipeline,pipeline,graded-10x10,smooth,ok,16,0,1.0000,90.00,PASS,data/figures/pipeline/graded-10x10-smooth.png
+thesis,stitch,stitched-rectangle,as-built,ok,156,0,0.6247,38.66,PASS,data/figures/thesis/stitched-rectangle.png
+thesis,stitch,stitched-annulus,as-built,ok,500,0,0.7290,46.80,PASS,data/figures/thesis/stitched-annulus.png
+thesis,stitch,stitched-nautilus-annulus,as-built,ok,192,0,0.9988,87.19,PASS,data/figures/thesis/stitched-nautilus-annulus.png
+thesis,qgp,qgp-2x2,as-built,ok,8,0,1.0000,90.00,PASS,data/figures/thesis/qgp-2x2.png
+thesis,graded,graded-linear,as-built,ok,16,0,1.0000,90.00,PASS,data/figures/thesis/graded-linear.png
+thesis,graded,graded-2d,as-built,ok,9,0,1.0000,90.00,PASS,data/figures/thesis/graded-2d.png
+thesis,graded,graded-2d-8x8,as-built,ok,9,0,1.0000,90.00,PASS,data/figures/thesis/graded-2d-8x8.png
+thesis,graded,graded-hole,as-built,ok,15,0,1.0000,90.00,PASS,data/figures/thesis/graded-hole.png
