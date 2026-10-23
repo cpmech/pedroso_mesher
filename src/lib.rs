@@ -91,3 +91,5 @@ pub mod sized;
 pub mod simons_smooth;
 
 pub mod simons_regions;
+
+pub mod simons_features;

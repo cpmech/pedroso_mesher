@@ -30,11 +30,12 @@
 //!   `theta = atan2(dVy, 1 + dVx)`, `rho = -n theta` with `n = 4`, and
 //!   `r = cos(rho) + i sin(rho)` (eqs. 3.4 and 3.5).
 //! * `M` and `A` are Hermitian and are accumulated triangle by triangle; the
-//!   off-diagonal entries are `r_pq` times the real triangle integral, and the
-//!   complex conjugate is used for the transposed entry (Algorithm 1, lines
-//!   15-32).
-//! * The Dirichlet energy (`s = 0`, so `A` is `Delta`) and the `10^-8 M`
-//!   regularization of line 33 are used.
+//!   off-diagonal entry `(p, q)` of a counter-clockwise triangle is
+//!   `conj(r_pq)` times the real (or complex, for the accurate path) triangle
+//!   integral, as printed on p. 78 of the thesis and in GODF Eqs. 17-18.
+//! * The Dirichlet energy (`s = 0` of Eq. 18, so `A = Delta`) and the
+//!   `10^-8 M` regularization of line 33 are used. The holomorphic /
+//!   anti-holomorphic split of Eq. 18 is not implemented.
 //! * The vector associated with the smallest eigenvalue of the shifted pencil
 //!   is computed; the phase of the field is the arbitrary global phase that the
 //!   thesis describes in Section 3.3.1.
@@ -45,29 +46,94 @@
 //!   the winding of `exp(i 4 theta)` around each triangle is `0` or `+/-1`,
 //!   giving valences 4, 3 or 5.
 //!
+//! # Guidance / alignment (Section 3.3)
+//!
+//! [`solve_with_guidance`] biases the field toward a per-vertex target. The
+//! target angles `g_i` use the same representation as the returned field (the
+//! cross-field angle `theta`, whose fourth power is the complex value), so the
+//! complex target is `G_i = exp(4 i g_i)`. With weight `s >= 0` the guided
+//! field solves the normal equations
+//!
+//! ```text
+//! (A + s M) u = s M G.
+//! ```
+//!
+//! Equivalently, `s M` is added to the energy matrix and the right-hand side
+//! of the generalized problem is `s b` with `b = M G`. These are the normal
+//! equations of the soft alignment energy
+//!
+//! ```text
+//! E(u) = u^H A u + s ||u - G||_M^2,
+//! ```
+//!
+//! so `s = 0` recovers the unguided eigenproblem of [`solve`], and
+//! `s -> infinity` recovers `u = G`. GODF (Eq. 16 of the paper) instead uses a
+//! Lagrange multiplier, `(A - lambda_t M) u = M q`, with a norm constraint;
+//! the thesis does not print an alignment line in Algorithm 1, and this module
+//! implements the soft-penalty form requested for it. The guidance weight is
+//! unrelated to the holomorphic parameter `s` of Eq. 18.
+//!
+//! # Accurate mass and Dirichlet integrals
+//!
+//! The flat-triangle limits quoted by the thesis are
+//!
+//! ```text
+//! M_ii = |t|/6,                 M_ij = conj(r_ij) |t|/12
+//! A_ii = |p_jk|^2 / (4|t|)
+//! A_ij = conj(r_ij) <p_ki, p_jk> / (4|t|)
+//! ```
+//!
+//! with `p_jk = p_k - p_j`, `p_ki = p_i - p_k` and cyclic permutations. They
+//! are used when [`Options::accurate`] is `false`.
+//!
+//! With `accurate = true` the curvature-aware helper integrals of GODF
+//! Appendix D are used (Appendix D of the thesis's reference [KCPS13]; the
+//! thesis quotes them as Eqs. 17-18). Let `Omega = arg(r_ij r_jk r_ki)` be the
+//! triangle holonomy, `r_pq = exp(i rho_pq)` the transport coefficient on the
+//! counter-clockwise edge `p -> q`, and
+//!
+//! ```text
+//! g11 = |p_p - p_r|^2,  g12 = <p_p - p_r, p_q - p_r>,  g22 = |p_q - p_r|^2
+//! ```
+//!
+//! for the ordered pair `(p, q)` with third vertex `r`. Then
+//!
+//! ```text
+//! MassIJ(Omega) = (6 e^{i Omega} - 6 - 6 i Omega + 3 Omega^2 + i Omega^3)
+//!                 / (3 Omega^4),
+//! M_pq          = conj(r_pq) |t| MassIJ(Omega),
+//!
+//! DirichletIJ(Omega, g11, g12, g22) =
+//!     [ (3 g11 + 4 g12 + 3 g22)
+//!       + i Omega (g11 + g12 + g22)
+//!       - i Omega^3 g12 / 6
+//!       + Omega^4 (g11 - 2 g12 + g22) / 24
+//!       - i Omega^5 (g11 - 2 g12 + g22) / 60
+//!       + ( -(3 g11 + 4 g12 + 3 g22)
+//!           + i Omega (2 g11 + 3 g12 + 2 g22)
+//!           + Omega^2 (g11 + 2 g12 + g22) / 2 ) e^{i Omega} ] / Omega^4,
+//! A_pq          = conj(r_pq) DirichletIJ(Omega, g11, g12, g22) / |t|,
+//!
+//! Delta_cc      = [ |p_uv|^2
+//!                   + Omega^2 (|p_cu|^2 + <p_cu, p_cv> + |p_cv|^2) / 90 ]
+//!                 / (4 |t|),
+//! ```
+//!
+//! where `c` is the centre vertex and `u, v` the other two vertices in
+//! counter-clockwise order. `MassIJ` and `DirichletIJ` have the removable
+//! singularities `MassIJ(0) = 1/12` and
+//! `DirichletIJ(0, g11, g12, g22) = -g12/4`; both are evaluated with a Taylor
+//! series for `|Omega| < 0.1` and with the closed forms otherwise.
+//!
 //! # Deviations (documented on purpose)
 //!
-//! * **Helper integrals.** The curvature-aware `MassIJ` and `DirichletIJ`
-//!   functions of Knöppel et al. (GODF, Appendix D) are not reproduced here.
-//!   Their flat-triangle limits are used instead, exactly the approximations
-//!   the thesis quotes for the mass matrix:
-//!
-//!   ```text
-//!   M_ii = |t|/6,                 M_ij = r_ij |t|/12
-//!   A_ii = |p_jk|^2 / (4|t|)
-//!   A_ij = r_ij <p_ki, p_jk> / (4|t|)
-//!   ```
-//!
-//!   with `p_jk = p_k - p_j`, `p_ki = p_i - p_k` and cyclic permutations.
-//!   Consequently the `Omega_ijk` correction that GODF carries inside
-//!   `MassIJ`/`DirichletIJ` is not applied; only the leading flat term is.
-//!   The transport coefficients still carry the size-gradient connection, so
-//!   the global graded behaviour of the field is retained, while the
-//!   per-triangle curvature corrections are `O(Omega^2)` and are omitted.
+//! * **Guidance form.** The soft penalty above is used instead of GODF's
+//!   Lagrange-multiplier alignment. The thesis only asks for a field that can
+//!   be biased toward a target, not for a norm-constrained alignment solve.
 //! * **Vertex gradients.** Algorithm 1 consumes a per-vertex gradient `g_i`.
 //!   It is obtained here as the area-weighted average of the constant
-//!   gradients of the incident triangles, as the task specifies. A uniform
-//!   average would change the coefficients only slightly.
+//!   gradients of the incident triangles. A uniform average would change the
+//!   coefficients only slightly.
 //! * **Shift scaling.** Line 33 literally adds `10^-8 M`. To remain meaningful
 //!   on meshes of very different length scales the same relative shift
 //!   `1e-8 * trace(A)/trace(M)` is used; it is `1e-8` for a unit-scale mesh.
@@ -78,10 +144,17 @@
 //!   before the shift), which is the smooth constant field; the shift makes
 //!   that eigenvalue `1e-8` rather than exactly zero, so the returned
 //!   eigenpair is the smallest of the shifted pencil, as in Algorithm 1.
+//! * **Guided iteration budget.** The guided problem is a single linear solve,
+//!   not an eigen-iteration. `iterations` still has to be positive; the
+//!   conjugate-gradient cap is `max(400 + 8|V|, iterations)`, bounded by 6000.
+//! * **Accurate integral evaluation.** The closed forms lose precision near
+//!   `Omega = 0`; a Taylor series (terms through `Omega^8`) is used for
+//!   `|Omega| < 0.1`, which is far below the accuracy of the double-precision
+//!   closed form on either side of the switch.
 //!
 //! # Not implemented
 //!
-//! Guidance/alignment terms, the holomorphic/anti-holomorphic split (`s != 0`),
+//! The holomorphic/anti-holomorphic split of Eq. 18 (`s != 0` there),
 //! anisotropic sizing (Chapter 4), adaptive background-mesh refinement,
 //! singularity placement, boundary constraints, and the extraction of a quad
 //! mesh. The input is assumed planar: `z` is ignored and only `x, y` are used.
@@ -97,6 +170,33 @@ const ENERGY_SHIFT: f64 = 1e-8;
 const OUTER_TOLERANCE: f64 = 1e-8;
 /// Relative tolerance of the inner conjugate-gradient solve.
 const INNER_TOLERANCE: f64 = 1e-9;
+/// Below this holonomy the helper integrals are evaluated by Taylor series.
+const INTEGRAL_SERIES_THRESHOLD: f64 = 0.1;
+
+/// Options for [`solve_with_options`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    /// Use the curvature-aware `MassIJ`/`DirichletIJ` integrals of GODF
+    /// Appendix D (quoted by the thesis as Eqs. 17-18) instead of their
+    /// flat-triangle limits. The default, `false`, is the flat limit used by
+    /// the original implementation.
+    pub accurate: bool,
+}
+
+/// A per-vertex target cross field for [`solve_with_guidance`].
+///
+/// `angle[i]` is the target cross-field angle at vertex `i`, in the same
+/// representation as the angles returned by the solver (a rotation of the
+/// cross, with `arg(u_i) = 4 * angle[i]`). Values are taken modulo `pi/2`.
+/// `weight` is the non-negative soft-alignment weight `s`; `weight = 0`
+/// reproduces the unguided field.
+#[derive(Clone, Debug)]
+pub struct Guidance {
+    /// Non-negative alignment weight `s`.
+    pub weight: f64,
+    /// One target angle per vertex, in radians.
+    pub angle: Vec<f64>,
+}
 
 /// A complex number. The public API deals only in angles, so this stays private.
 #[derive(Clone, Copy, Debug, Default)]
@@ -171,6 +271,70 @@ fn dot(a: &[Complex], b: &[Complex]) -> Complex {
 
 fn euclidean_norm(values: &[Complex]) -> f64 {
     dot(values, values).re.max(0.0).sqrt()
+}
+
+/// The high-accuracy `MassIJ` integral of GODF Appendix D (thesis Eq. 17).
+///
+/// The flat limit is `1/12`. The closed form has a removable `0/0` at
+/// `Omega = 0`, so a Taylor series through `Omega^8` is used for small `Omega`.
+fn mass_integral(omega: f64) -> Complex {
+    if omega.abs() < INTEGRAL_SERIES_THRESHOLD {
+        let o2 = omega * omega;
+        let o4 = o2 * o2;
+        let o6 = o4 * o2;
+        let o8 = o4 * o4;
+        let re = 1.0 / 12.0 - o2 / 360.0 + o4 / 20160.0 - o6 / 1814400.0 + o8 / 239_500_800.0;
+        let im = omega * (1.0 / 60.0 - o2 / 2520.0 + o4 / 181_440.0 - o6 / 19_958_400.0);
+        Complex::new(re, im)
+    } else {
+        let phase = Complex::from_angle(omega);
+        let numerator = phase
+            .scale(6.0)
+            .sub(Complex::new(6.0, 0.0))
+            .sub(Complex::new(0.0, 6.0 * omega))
+            .add(Complex::new(3.0 * omega * omega, 0.0))
+            .add(Complex::new(0.0, omega * omega * omega));
+        numerator.scale((3.0 * omega * omega * omega * omega).recip())
+    }
+}
+
+/// The high-accuracy `DirichletIJ` integral of GODF Appendix D (thesis
+/// Eq. 18), with `g11`, `g12`, `g22` defined for the ordered edge.
+///
+/// The flat limit is `-g12/4`. A Taylor series through `Omega^8` is used for
+/// small `Omega` to avoid catastrophic cancellation in the closed form.
+fn dirichlet_integral(omega: f64, g11: f64, g12: f64, g22: f64) -> Complex {
+    if omega.abs() < INTEGRAL_SERIES_THRESHOLD {
+        let o2 = omega * omega;
+        let o4 = o2 * o2;
+        let o6 = o4 * o2;
+        let o8 = o4 * o4;
+        let edges = g11 + g22;
+        let re = -0.25 * g12
+            + edges * (o2 / 120.0 - o4 / 2688.0 + o6 / 129_600.0 - o8 / 10_644_480.0)
+            + g12 * (o2 / 45.0 - o4 / 1120.0 + o6 / 56_700.0 - o8 / 4_790_016.0);
+        let im = omega
+            * (edges * (-1.0 / 24.0 + o2 / 504.0 - o4 / 17_280.0 + o6 / 1_108_800.0)
+                + g12 * (-1.0 / 24.0 + 5.0 * o2 / 1008.0 - 7.0 * o4 / 51_840.0 + o6 / 492_800.0));
+        Complex::new(re, im)
+    } else {
+        let o2 = omega * omega;
+        let o3 = o2 * omega;
+        let o4 = o2 * o2;
+        let o5 = o4 * omega;
+        let a = 3.0 * g11 + 4.0 * g12 + 3.0 * g22;
+        let b = g11 + g12 + g22;
+        let c = g11 - 2.0 * g12 + g22;
+        let d = g11 + 2.0 * g12 + g22;
+        let e = 2.0 * g11 + 3.0 * g12 + 2.0 * g22;
+        let tail = Complex::new(-a + 0.5 * o2 * d, omega * e).mul(Complex::from_angle(omega));
+        let bracket = Complex::new(
+            a + o4 * c / 24.0,
+            omega * b - o3 * g12 / 6.0 - o5 * c / 60.0,
+        )
+        .add(tail);
+        bracket.scale(o4.recip())
+    }
 }
 
 /// Real diagonal plus one complex value for every edge, for a Hermitian matrix.
@@ -254,6 +418,27 @@ fn rotate_90(a: [f64; 2]) -> [f64; 2] {
 
 fn scale2(a: [f64; 2], factor: f64) -> [f64; 2] {
     [a[0] * factor, a[1] * factor]
+}
+
+/// The `Delta_cc` diagonal of the Dirichlet matrix (GODF Eq. 18).
+///
+/// `center`, `next` and `previous` are consecutive vertices in
+/// counter-clockwise order; `area` is the triangle area. The `Omega^2` term is
+/// the one printed by the thesis (`|p_uv|^2` plus the three squared/dot edge
+/// terms over 90).
+fn dirichlet_diagonal(
+    omega: f64,
+    area: f64,
+    center: [f64; 2],
+    next: [f64; 2],
+    previous: [f64; 2],
+) -> f64 {
+    let p_cu = sub2(next, center);
+    let p_cv = sub2(previous, center);
+    let opposite = sub2(previous, next);
+    let numerator = dot2(opposite, opposite)
+        + omega * omega * (dot2(p_cu, p_cu) + dot2(p_cu, p_cv) + dot2(p_cv, p_cv)) / 90.0;
+    numerator / (4.0 * area)
 }
 
 /// Geometry of one triangle, with its vertices already ordered counter-clockwise.
@@ -407,6 +592,28 @@ fn validate(
     Ok(points.len())
 }
 
+/// Validates a guidance request against a mesh with `vertices` vertices.
+fn validate_guidance(vertices: usize, guidance: &Guidance) -> Result<(), String> {
+    if !guidance.weight.is_finite() || guidance.weight < 0.0 {
+        return Err(format!(
+            "guidance weight {} is not finite and non-negative",
+            guidance.weight
+        ));
+    }
+    if guidance.angle.len() != vertices {
+        return Err(format!(
+            "guidance has {} angles but the mesh has {vertices} vertices",
+            guidance.angle.len()
+        ));
+    }
+    for (i, angle) in guidance.angle.iter().enumerate() {
+        if !angle.is_finite() {
+            return Err(format!("guidance angle[{i}] = {angle} is not finite"));
+        }
+    }
+    Ok(())
+}
+
 /// Jacobi-preconditioned conjugate gradients for the Hermitian system `matrix x = rhs`.
 ///
 /// Returns the iterate and the number of iterations actually performed.
@@ -515,36 +722,31 @@ fn cross_angle(value: Complex) -> f64 {
     angle
 }
 
-/// Computes a size-aware cross field on a planar triangle mesh.
-///
-/// `points` are the mesh vertices (`z` is ignored), `tris` the triangles
-/// (either orientation; they are reordered counter-clockwise internally) and
-/// `size` the size function sampled at the vertices. The returned vector holds,
-/// for every vertex, the field angle `arg(u_i)/4` in radians, reduced to
-/// `[0, pi/2)` modulo the four-fold symmetry of a cross.
-///
-/// `iterations` bounds the number of shifted inverse-power iterations. The
-/// function returns an error when the mesh, the sizes or the iterations are
-/// invalid, when a triangle is degenerate, or when the eigen-solve does not
-/// converge.
-///
-/// # Example
-///
-/// ```no_run
-/// let points = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
-/// let tris = vec![[0, 1, 2]];
-/// let size = vec![1.0, 1.0, 1.0];
-/// if let Ok(angle) = pedroso_mesher::simons_godf::solve(&points, &tris, &size, 50) {
-///     assert_eq!(angle.len(), 3);
-/// }
-/// ```
-pub fn solve(
+/// Converts the complex vertex values to cross-field angles.
+fn angles_from(values: &[Complex]) -> Result<Vec<f64>, String> {
+    let mut angles = Vec::with_capacity(values.len());
+    for value in values {
+        if !value.re.is_finite() || !value.im.is_finite() {
+            return Err("the computed field contains a non-finite value".into());
+        }
+        angles.push(cross_angle(*value));
+    }
+    Ok(angles)
+}
+
+/// Shared implementation of the unguided and guided solves.
+fn solve_impl(
     points: &[[f64; 3]],
     tris: &[[usize; 3]],
     size: &[f64],
+    options: &Options,
+    guidance: Option<&Guidance>,
     iterations: usize,
 ) -> Result<Vec<f64>, String> {
     let n = validate(points, tris, size, iterations)?;
+    if let Some(guidance) = guidance {
+        validate_guidance(n, guidance)?;
+    }
 
     // Pass 1: per-triangle geometry, per-vertex area-weighted size gradients and
     // the unique edge list.
@@ -603,7 +805,8 @@ pub fn solve(
         )?);
     }
 
-    // Pass 2: Hermitian mass and energy matrices (Algorithm 1, lines 12-32).
+    // Pass 2: Hermitian mass and energy matrices (Algorithm 1, lines 12-32,
+    // with the appendix helper integrals when `options.accurate`).
     let mut mass = Hermitian::zero(n, edge_a.clone(), edge_b.clone());
     let mut energy = Hermitian::zero(n, edge_a.clone(), edge_b.clone());
     for geometry in &geometries {
@@ -615,24 +818,9 @@ pub fn solve(
         mass.diagonal[j] += area / 6.0;
         mass.diagonal[k] += area / 6.0;
 
-        let p_jk = sub2(p[2], p[1]);
-        let p_ki = sub2(p[0], p[2]);
-        let p_ij = sub2(p[1], p[0]);
-        let quarter_area = (4.0 * area).recip();
-        energy.diagonal[i] += dot2(p_jk, p_jk) * quarter_area;
-        energy.diagonal[j] += dot2(p_ki, p_ki) * quarter_area;
-        energy.diagonal[k] += dot2(p_ij, p_ij) * quarter_area;
-
-        // The three unordered pairs, the geometric Dirichlet coefficient of
-        // each, and the corresponding (canonical) edge.
-        let pairs = [(i, j), (j, k), (k, i)];
-        let coefficients = [
-            dot2(p_ki, p_jk) * quarter_area,
-            dot2(p_ij, p_ki) * quarter_area,
-            dot2(p_jk, p_ij) * quarter_area,
-        ];
-        for (pair, coefficient) in pairs.iter().zip(coefficients.iter()) {
-            let (u, v) = *pair;
+        // Holonomy of the counter-clockwise triangle (Eq. 13).
+        let mut holonomy = Complex::ONE;
+        for (u, v) in [(i, j), (j, k), (k, i)] {
             let key = if u < v { (u, v) } else { (v, u) };
             let edge = match edge_map.get(&key) {
                 Some(&edge) => edge,
@@ -642,12 +830,85 @@ pub fn solve(
                     )
                 }
             };
-            // The canonical entry (a, b) is r_ab times the real integral; the
-            // entry (b, a) is generated as its conjugate by `Hermitian::apply`.
-            mass.off_diagonal[edge] =
-                mass.off_diagonal[edge].add(transport[edge].scale(area / 12.0));
-            energy.off_diagonal[edge] =
-                energy.off_diagonal[edge].add(transport[edge].scale(*coefficient));
+            let r_uv = if u < v {
+                transport[edge]
+            } else {
+                transport[edge].conj()
+            };
+            holonomy = holonomy.mul(r_uv);
+        }
+        let omega = holonomy.argument();
+
+        if options.accurate {
+            energy.diagonal[i] += dirichlet_diagonal(omega, area, p[0], p[1], p[2]);
+            energy.diagonal[j] += dirichlet_diagonal(omega, area, p[1], p[2], p[0]);
+            energy.diagonal[k] += dirichlet_diagonal(omega, area, p[2], p[0], p[1]);
+        } else {
+            let quarter_area = (4.0 * area).recip();
+            let p_jk = sub2(p[2], p[1]);
+            let p_ki = sub2(p[0], p[2]);
+            let p_ij = sub2(p[1], p[0]);
+            energy.diagonal[i] += dot2(p_jk, p_jk) * quarter_area;
+            energy.diagonal[j] += dot2(p_ki, p_ki) * quarter_area;
+            energy.diagonal[k] += dot2(p_ij, p_ij) * quarter_area;
+        }
+
+        // The three counter-clockwise oriented pairs `(p, q)` with the third
+        // vertex `r`, expressed as local indices into `geometry.positions`.
+        let pairs = [(0usize, 1usize, 2usize), (1, 2, 0), (2, 0, 1)];
+        for &(p_local, q_local, r_local) in pairs.iter() {
+            let p_vertex = geometry.vertices[p_local];
+            let q_vertex = geometry.vertices[q_local];
+            let key = if p_vertex < q_vertex {
+                (p_vertex, q_vertex)
+            } else {
+                (q_vertex, p_vertex)
+            };
+            let edge = match edge_map.get(&key) {
+                Some(&edge) => edge,
+                None => {
+                    return Err(
+                        "internal error: a triangle edge is missing from the edge list".into(),
+                    )
+                }
+            };
+            let r_pq = if p_vertex < q_vertex {
+                transport[edge]
+            } else {
+                transport[edge].conj()
+            };
+            let p_p = geometry.positions[p_local];
+            let p_q = geometry.positions[q_local];
+            let p_r = geometry.positions[r_local];
+            let from_r_to_p = sub2(p_p, p_r);
+            let from_r_to_q = sub2(p_q, p_r);
+            let g11 = dot2(from_r_to_p, from_r_to_p);
+            let g12 = dot2(from_r_to_p, from_r_to_q);
+            let g22 = dot2(from_r_to_q, from_r_to_q);
+
+            let mass_scalar = if options.accurate {
+                mass_integral(omega)
+            } else {
+                Complex::new(1.0 / 12.0, 0.0)
+            };
+            let mass_entry = r_pq.conj().mul(mass_scalar).scale(area);
+            let energy_entry = if options.accurate {
+                r_pq.conj()
+                    .mul(dirichlet_integral(omega, g11, g12, g22))
+                    .scale(area.recip())
+            } else {
+                r_pq.conj().scale(-g12 * (4.0 * area).recip())
+            };
+
+            // Store the entry for the canonical edge `(a, b)` with `a < b`;
+            // the transposed entry is generated as its conjugate.
+            let (mass_value, energy_value) = if p_vertex < q_vertex {
+                (mass_entry, energy_entry)
+            } else {
+                (mass_entry.conj(), energy_entry.conj())
+            };
+            mass.off_diagonal[edge] = mass.off_diagonal[edge].add(mass_value);
+            energy.off_diagonal[edge] = energy.off_diagonal[edge].add(energy_value);
         }
     }
 
@@ -662,6 +923,28 @@ pub fn solve(
 
     // Algorithm 1, line 33, made scale-relative; see the module documentation.
     let shift = ENERGY_SHIFT * energy_trace / mass_trace;
+
+    // Guided solve: `(A + s M) u = s M G`, a single Hermitian linear solve.
+    if let Some(guidance) = guidance {
+        if guidance.weight > 0.0 {
+            let target: Vec<Complex> = guidance
+                .angle
+                .iter()
+                .map(|&angle| Complex::from_angle(FIELD_SYMMETRY * angle))
+                .collect();
+            let rhs: Vec<Complex> = mass
+                .apply(&target)
+                .iter()
+                .map(|value| value.scale(guidance.weight))
+                .collect();
+            let system = energy.shifted(shift + guidance.weight, &mass)?;
+            let max_iterations = (400 + 8 * n).max(iterations).min(6000);
+            let (solution, _) = conjugate_gradient(&system, &rhs, INNER_TOLERANCE, max_iterations)?;
+            return angles_from(&solution);
+        }
+    }
+
+    // Unguided solve: smallest eigenpair of the shifted pencil.
     let shifted = energy.shifted(shift, &mass)?;
     let average_diagonal = energy_trace / n as f64;
 
@@ -734,14 +1017,134 @@ pub fn solve(
         ));
     }
 
-    let mut angles = Vec::with_capacity(n);
-    for value in &x {
-        if !value.re.is_finite() || !value.im.is_finite() {
-            return Err("the computed field contains a non-finite value".into());
-        }
-        angles.push(cross_angle(*value));
-    }
-    Ok(angles)
+    angles_from(&x)
+}
+
+/// Computes a size-aware cross field on a planar triangle mesh.
+///
+/// `points` are the mesh vertices (`z` is ignored), `tris` the triangles
+/// (either orientation; they are reordered counter-clockwise internally) and
+/// `size` the size function sampled at the vertices. The returned vector holds,
+/// for every vertex, the field angle `arg(u_i)/4` in radians, reduced to
+/// `[0, pi/2)` modulo the four-fold symmetry of a cross.
+///
+/// `iterations` bounds the number of shifted inverse-power iterations. The
+/// function returns an error when the mesh, the sizes or the iterations are
+/// invalid, when a triangle is degenerate, or when the eigen-solve does not
+/// converge.
+///
+/// This is the `s = 0` case of [`solve_with_guidance`]; it uses the flat
+/// triangle integrals of [`Options::default`]. Use [`solve_with_options`] for
+/// the accurate integrals.
+///
+/// # Example
+///
+/// ```no_run
+/// let points = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+/// let tris = vec![[0, 1, 2]];
+/// let size = vec![1.0, 1.0, 1.0];
+/// if let Ok(angle) = pedroso_mesher::simons_godf::solve(&points, &tris, &size, 50) {
+///     assert_eq!(angle.len(), 3);
+/// }
+/// ```
+pub fn solve(
+    points: &[[f64; 3]],
+    tris: &[[usize; 3]],
+    size: &[f64],
+    iterations: usize,
+) -> Result<Vec<f64>, String> {
+    solve_impl(points, tris, size, &Options::default(), None, iterations)
+}
+
+/// Computes a size-aware cross field with explicit [`Options`].
+///
+/// With `options.accurate == true` the curvature-aware `MassIJ` and
+/// `DirichletIJ` integrals of GODF Appendix D replace the flat limits. The
+/// `s = 0` eigenproblem and the returned angles are otherwise identical to
+/// [`solve`].
+///
+/// # Example
+///
+/// ```no_run
+/// let options = pedroso_mesher::simons_godf::Options { accurate: true };
+/// let alpha = pedroso_mesher::simons_godf::solve_with_options(
+///     &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+///     &[[0, 1, 2]],
+///     &[1.0, 1.0, 1.0],
+///     &options,
+///     50,
+/// )?;
+/// assert_eq!(alpha.len(), 3);
+/// # Ok::<(), String>(())
+/// ```
+pub fn solve_with_options(
+    points: &[[f64; 3]],
+    tris: &[[usize; 3]],
+    size: &[f64],
+    options: &Options,
+    iterations: usize,
+) -> Result<Vec<f64>, String> {
+    solve_impl(points, tris, size, options, None, iterations)
+}
+
+/// Computes a size-aware cross field biased toward a per-vertex target field.
+///
+/// The guided field solves `(A + s M) u = s M G` with `s = guidance.weight`,
+/// `G_i = exp(4 i guidance.angle[i])`, and `A`, `M` the Dirichlet energy and
+/// mass matrices. `guidance.weight == 0` returns exactly the unguided field of
+/// [`solve`]; larger weights favour the target. The returned angles have the
+/// same representation and `[0, pi/2)` range as [`solve`].
+///
+/// Returns an error when the mesh is invalid, when `guidance.weight` is
+/// negative or non-finite, or when `guidance.angle` does not have one finite
+/// value per vertex.
+///
+/// # Example
+///
+/// ```no_run
+/// let points = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+/// let tris = vec![[0, 1, 2]];
+/// let size = vec![1.0, 1.0, 1.0];
+/// let guidance = pedroso_mesher::simons_godf::Guidance {
+///     weight: 1.0,
+///     angle: vec![0.3, 0.3, 0.3],
+/// };
+/// if let Ok(alpha) = pedroso_mesher::simons_godf::solve_with_guidance(
+///     &points, &tris, &size, &guidance, 50,
+/// ) {
+///     assert_eq!(alpha.len(), 3);
+/// }
+/// ```
+pub fn solve_with_guidance(
+    points: &[[f64; 3]],
+    tris: &[[usize; 3]],
+    size: &[f64],
+    guidance: &Guidance,
+    iterations: usize,
+) -> Result<Vec<f64>, String> {
+    solve_impl(
+        points,
+        tris,
+        size,
+        &Options::default(),
+        Some(guidance),
+        iterations,
+    )
+}
+
+/// Computes a guided cross field with explicit [`Options`].
+///
+/// Combines the accurate-integral switch of [`solve_with_options`] with the
+/// soft alignment of [`solve_with_guidance`].
+pub fn solve_with_guidance_and_options(
+    points: &[[f64; 3]],
+    tris: &[[usize; 3]],
+    size: &[f64],
+    guidance: &Guidance,
+    options: &Options,
+    iterations: usize,
+) -> Result<Vec<f64>, String> {
+    solve_impl(points, tris, size, options, Some(guidance), iterations)
 }
 
 /// Interpolates the cross-field angle at a planar query point.
@@ -894,6 +1297,59 @@ mod tests {
         maximum
     }
 
+    /// Circular mean of the fourth-power angles, back in `[0, pi/2)`.
+    fn mean_angle(alpha: &[f64]) -> f64 {
+        let mut sum = Complex::ZERO;
+        for &value in alpha {
+            sum = sum.add(Complex::from_angle(4.0 * value));
+        }
+        cross_angle(sum)
+    }
+
+    /// Mean 4-RoSy distance to a constant target angle.
+    fn mean_distance_to(alpha: &[f64], target: f64) -> f64 {
+        let total: f64 = alpha
+            .iter()
+            .map(|&value| rosy_distance(value, target))
+            .sum();
+        total / alpha.len() as f64
+    }
+
+    #[test]
+    fn helper_integrals_have_the_flat_limit() {
+        let mass = mass_integral(0.0);
+        assert!((mass.re - 1.0 / 12.0).abs() < 1e-15);
+        assert!(mass.im.abs() < 1e-15);
+
+        let dirichlet = dirichlet_integral(0.0, 3.0, -0.7, 2.0);
+        assert!((dirichlet.re - 0.175).abs() < 1e-15);
+        assert!(dirichlet.im.abs() < 1e-15);
+
+        // The series and closed-form branches must join continuously at the
+        // switch. (The closed form itself loses ~1e-11 relative accuracy at
+        // Omega = 0.1 because of cancellation, which is why the series is used
+        // below the threshold.)
+        for omega in [
+            INTEGRAL_SERIES_THRESHOLD - 1e-12,
+            -INTEGRAL_SERIES_THRESHOLD + 1e-12,
+        ] {
+            let series_mass = mass_integral(omega);
+            let closed_mass = mass_integral(omega.signum() * (INTEGRAL_SERIES_THRESHOLD + 1e-12));
+            assert!((series_mass.re - closed_mass.re).abs() < 1e-10);
+            assert!((series_mass.im - closed_mass.im).abs() < 1e-10);
+
+            let series_dirichlet = dirichlet_integral(omega, 3.0, -0.7, 2.0);
+            let closed_dirichlet = dirichlet_integral(
+                omega.signum() * (INTEGRAL_SERIES_THRESHOLD + 1e-12),
+                3.0,
+                -0.7,
+                2.0,
+            );
+            assert!((series_dirichlet.re - closed_dirichlet.re).abs() < 1e-10);
+            assert!((series_dirichlet.im - closed_dirichlet.im).abs() < 1e-10);
+        }
+    }
+
     #[test]
     fn constant_size_gives_a_constant_field() -> Result<(), String> {
         let n = 8;
@@ -912,7 +1368,7 @@ mod tests {
         let spread = max_pairwise_distance(&alpha);
         let edge_spread = max_edge_distance(&alpha, &tris);
         println!(
-            "constant-size {}x{} square: vertices={}, triangles={}, \
+            "constant-size {}x{} square (flat): vertices={}, triangles={}, \
              max pairwise 4-RoSy spread={spread:.3e} rad, max edge spread={edge_spread:.3e} rad",
             n,
             n,
@@ -920,6 +1376,34 @@ mod tests {
             tris.len()
         );
         assert!(spread < 0.05, "angle spread {spread} is not small");
+        Ok(())
+    }
+
+    #[test]
+    fn constant_size_accurate_gives_a_constant_field() -> Result<(), String> {
+        let n = 8;
+        let (points, tris) = square_mesh(n);
+        let size = vec![1.0; points.len()];
+        let alpha = solve_with_options(&points, &tris, &size, &Options { accurate: true }, 100)?;
+
+        let spread = max_pairwise_distance(&alpha);
+        let edge_spread = max_edge_distance(&alpha, &tris);
+        println!(
+            "constant-size {}x{} square (accurate): vertices={}, triangles={}, \
+             max pairwise 4-RoSy spread={spread:.3e} rad, max edge spread={edge_spread:.3e} rad",
+            n,
+            n,
+            points.len(),
+            tris.len()
+        );
+        assert!(
+            spread < 1e-6,
+            "accurate constant-size angle spread {spread} exceeds 1e-6 rad"
+        );
+        assert!(
+            edge_spread < 1e-6,
+            "accurate constant-size edge spread {edge_spread} exceeds 1e-6 rad"
+        );
         Ok(())
     }
 
@@ -934,7 +1418,7 @@ mod tests {
         let spread = max_pairwise_distance(&alpha);
         let (valence_3, valence_5) = count_singularities(&alpha, &tris);
         println!(
-            "linear growth sigma=1+0.5x on a {n}x{n} square: \
+            "linear growth sigma=1+0.5x on a {n}x{n} square (flat): \
              max adjacent 4-RoSy angle step={edge_spread:.4} rad, \
              max pairwise 4-RoSy spread={spread:.4} rad, \
              singularities: valence-3={valence_3}, valence-5={valence_5}"
@@ -948,6 +1432,147 @@ mod tests {
             spread > 0.2,
             "the field did not rotate measurably (spread {spread})"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn linear_growth_accurate_rotates_smoothly() -> Result<(), String> {
+        let n = 8;
+        let (points, tris) = square_mesh(n);
+        let size: Vec<f64> = points.iter().map(|p| 1.0 + 0.5 * p[0]).collect();
+        let alpha = solve_with_options(&points, &tris, &size, &Options { accurate: true }, 100)?;
+        let flat = solve(&points, &tris, &size, 100)?;
+
+        let edge_spread = max_edge_distance(&alpha, &tris);
+        let spread = max_pairwise_distance(&alpha);
+        let (valence_3, valence_5) = count_singularities(&alpha, &tris);
+        let mean_difference = alpha
+            .iter()
+            .zip(flat.iter())
+            .map(|(&accurate, &approx)| rosy_distance(accurate, approx))
+            .sum::<f64>()
+            / alpha.len() as f64;
+        println!(
+            "linear growth sigma=1+0.5x on a {n}x{n} square (accurate): \
+             max adjacent 4-RoSy angle step={edge_spread:.4} rad, \
+             max pairwise 4-RoSy spread={spread:.4} rad, \
+             singularities: valence-3={valence_3}, valence-5={valence_5}, \
+             mean 4-RoSy difference to flat={mean_difference:.3e} rad"
+        );
+
+        assert!(
+            edge_spread < 0.12,
+            "adjacent angle step {edge_spread} is too large"
+        );
+        assert!(
+            spread > 0.2,
+            "the field did not rotate measurably (spread {spread})"
+        );
+        assert!(
+            mean_difference < 0.05,
+            "the accurate correction moved the field too far from the flat solution \
+             (mean difference {mean_difference} rad)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn guided_square_aligns_better_than_unguided() -> Result<(), String> {
+        let n = 8;
+        let (points, tris) = square_mesh(n);
+        let size = vec![1.0; points.len()];
+        let unguided = solve(&points, &tris, &size, 100)?;
+        let base = mean_angle(&unguided);
+        let target = (base + 0.3).rem_euclid(HALF_PI);
+        let guidance = Guidance {
+            weight: 1.0,
+            angle: vec![target; points.len()],
+        };
+        let guided = solve_with_guidance(&points, &tris, &size, &guidance, 100)?;
+
+        let distance_unguided = mean_distance_to(&unguided, target);
+        let distance_guided = mean_distance_to(&guided, target);
+        let guided_spread = max_pairwise_distance(&guided);
+        println!(
+            "guided {}x{} square: target={target:.6} rad, s=0 mean 4-RoSy distance={distance_unguided:.6} rad, \
+             s=1 mean 4-RoSy distance={distance_guided:.3e} rad, guided pairwise spread={guided_spread:.3e} rad",
+            n, n
+        );
+
+        assert!(
+            distance_unguided > 0.2,
+            "the s=0 field is already aligned with the target ({distance_unguided})"
+        );
+        assert!(
+            distance_guided < 1e-6,
+            "guided field is not aligned with the target: mean distance {distance_guided} rad"
+        );
+        assert!(
+            distance_guided < distance_unguided * 1e-3,
+            "guidance did not improve alignment: {distance_guided} vs {distance_unguided}"
+        );
+        assert!(
+            guided_spread < 1e-6,
+            "guided constant-size field has spread {guided_spread} rad"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn guided_graded_square_is_biased() -> Result<(), String> {
+        let n = 8;
+        let (points, tris) = square_mesh(n);
+        let size: Vec<f64> = points.iter().map(|p| 1.0 + 0.5 * p[0]).collect();
+        let unguided = solve(&points, &tris, &size, 100)?;
+        let target = (mean_angle(&unguided) + 0.3).rem_euclid(HALF_PI);
+        let guidance = Guidance {
+            weight: 1.0,
+            angle: vec![target; points.len()],
+        };
+        let guided = solve_with_guidance(&points, &tris, &size, &guidance, 100)?;
+        let stronger = Guidance {
+            weight: 10.0,
+            angle: vec![target; points.len()],
+        };
+        let strongly_guided = solve_with_guidance(&points, &tris, &size, &stronger, 100)?;
+
+        let before = mean_distance_to(&unguided, target);
+        let after = mean_distance_to(&guided, target);
+        let after_strong = mean_distance_to(&strongly_guided, target);
+        println!(
+            "graded {}x{} square, target={target:.6} rad: s=0 mean 4-RoSy distance={before:.6} rad,              s=1={after:.6} rad, s=10={after_strong:.6} rad",
+            n, n
+        );
+        assert!(before > 0.2, "the graded s=0 field is already aligned");
+        assert!(
+            after < 0.5 * before,
+            "weight 1 did not bias the graded field: {after} vs {before}"
+        );
+        assert!(
+            after_strong < after,
+            "a larger weight did not improve the alignment: {after_strong} vs {after}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn zero_weight_guidance_matches_the_unguided_field() -> Result<(), String> {
+        let n = 4;
+        let (points, tris) = square_mesh(n);
+        let size: Vec<f64> = points.iter().map(|p| 1.0 + 0.5 * p[0]).collect();
+        let unguided = solve(&points, &tris, &size, 100)?;
+        let guidance = Guidance {
+            weight: 0.0,
+            angle: vec![0.2; points.len()],
+        };
+        let guided = solve_with_guidance(&points, &tris, &size, &guidance, 100)?;
+        let difference = unguided
+            .iter()
+            .zip(guided.iter())
+            .map(|(&a, &b)| rosy_distance(a, b))
+            .fold(0.0f64, f64::max);
+        println!("zero-weight guidance: max 4-RoSy difference to solve()={difference:.3e} rad");
+        assert!(difference < 1e-12);
         Ok(())
     }
 
@@ -1035,5 +1660,44 @@ mod tests {
         let degenerate = vec![[0, 1, 1]];
         assert!(solve(&points, &degenerate, &size, 10).is_err());
         assert!(interp_angle(&size[..n - 1], &points, &tris, [0.5, 0.5]).is_nan());
+
+        // Options must not change the invalid-input contract.
+        assert!(solve_with_options(&points, &tris, &size, &Options { accurate: true }, 0).is_err());
+
+        // Guidance validation.
+        let short = Guidance {
+            weight: 1.0,
+            angle: vec![0.0; n - 1],
+        };
+        assert!(solve_with_guidance(&points, &tris, &size, &short, 10).is_err());
+        let negative = Guidance {
+            weight: -1.0,
+            angle: vec![0.0; n],
+        };
+        assert!(solve_with_guidance(&points, &tris, &size, &negative, 10).is_err());
+        let infinite = Guidance {
+            weight: f64::INFINITY,
+            angle: vec![0.0; n],
+        };
+        assert!(solve_with_guidance(&points, &tris, &size, &infinite, 10).is_err());
+        let mut bad_angle = vec![0.0; n];
+        bad_angle[0] = f64::NAN;
+        let non_finite = Guidance {
+            weight: 1.0,
+            angle: bad_angle,
+        };
+        assert!(solve_with_guidance(&points, &tris, &size, &non_finite, 10).is_err());
+        assert!(solve_with_guidance_and_options(
+            &points,
+            &tris,
+            &size,
+            &Guidance {
+                weight: 1.0,
+                angle: vec![0.0; n],
+            },
+            &Options { accurate: true },
+            0,
+        )
+        .is_err());
     }
 }

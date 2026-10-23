@@ -157,13 +157,21 @@ pub enum Route {
     /// strip). **6 of the 7 corpus parts**; the 0.6 mm perf plate (64-gon hole)
     /// returns a clean error because the channel cannot be closed there.
     Sized,
+
+    /// **Features** — the Simons 2024 interior-feature constraints (Chapter 2):
+    /// a through-going polyline splits the domain and both halves are meshed
+    /// with `sized`/fallbacks and welded along one sampled seam; a terminating
+    /// polyline becomes a thin slot (a hole) at the measured size. The feature
+    /// polylines come from [`MeshConfig::features`]; the route needs at least
+    /// one.
+    Features,
 }
 
 impl Route {
-    /// All ten routes, in shipping order (the order the tables and the
+    /// All eleven routes, in shipping order (the order the tables and the
     /// configuration examples use). Every route in this array is callable by
     /// [`generate`]; not every route passes the gate on every part.
-    pub const ALL: [Route; 10] = [
+    pub const ALL: [Route; 11] = [
         Route::Qmorph,
         Route::Paving,
         Route::Bipartite,
@@ -174,6 +182,7 @@ impl Route {
         Route::Untangle,
         Route::L1,
         Route::Sized,
+        Route::Features,
     ];
 
     /// The stable lowercase name used in tables, JSON and logs.
@@ -192,6 +201,7 @@ impl Route {
             Route::Untangle => "untangle",
             Route::L1 => "l1",
             Route::Sized => "sized",
+            Route::Features => "features",
         }
     }
 }
@@ -248,6 +258,11 @@ pub struct MeshConfig {
     /// Options of the `sized` route (the Simons 2024 channel route; currently
     /// empty because the thesis knobs are fixed at their measured defaults).
     pub sized: crate::sized::Options,
+
+    /// Interior feature polylines for [`Route::Features`] (empty otherwise).
+    /// A through-going polyline (both endpoints on the domain boundary) splits
+    /// the region; a terminating one becomes a slot (a thin hole).
+    pub features: Vec<Vec<[f64; 2]>>,
 }
 
 impl MeshConfig {
@@ -389,6 +404,15 @@ pub fn generate(
         }
         Route::L1 => crate::alt_l1::mesh_with_options(domain, sizing, &config.l1)?,
         Route::Sized => crate::sized::mesh_with_options(domain, sizing, &config.sized)?,
+        Route::Features => {
+            if config.features.is_empty() {
+                return Err("the features route needs at least one feature polyline".into());
+            }
+            let features = crate::simons_features::Features {
+                polylines: config.features.clone(),
+            };
+            crate::simons_features::mesh(domain, &features, sizing)?
+        }
     };
     // Step 2: the generator's own row. Measuring before smoothing is what lets
     // a caller compare a route against its measured table and see the smoother's
@@ -535,15 +559,24 @@ mod tests {
             // The channel route needs room for an interior grid next to its
             // 1.4 h boundary cull; the other routes are happy on the small test
             // square.
-            let (domain, sizing) = if route == Route::Sized {
-                (
+            let (domain, sizing, features) = match route {
+                Route::Sized => (
                     Domain::rectangle(10.0, 10.0).unwrap(),
                     crate::two_d::Sizing::uniform(1.0).unwrap(),
-                )
-            } else {
-                square()
+                    Vec::new(),
+                ),
+                Route::Features => (
+                    Domain::rectangle(10.0, 10.0).unwrap(),
+                    crate::two_d::Sizing::uniform(1.0).unwrap(),
+                    vec![vec![[5.0, 0.0], [5.0, 10.0]]],
+                ),
+                _ => {
+                    let (d, s) = square();
+                    (d, s, Vec::new())
+                }
             };
-            let config = MeshConfig::new(route);
+            let mut config = MeshConfig::new(route);
+            config.features = features;
             let out = generate(&domain, &sizing, &config)
                 .unwrap_or_else(|e| panic!("{} failed on its test domain: {e}", route.name()));
             assert!(

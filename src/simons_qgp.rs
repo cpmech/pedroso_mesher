@@ -31,7 +31,10 @@
 //!    edge (a boundary-to-boundary path) or back at the starting edge (a loop).
 //!    Every edge and every start sign is tried; the path with the most negative
 //!    energy change is applied and the search repeats until no unit augmentation
-//!    lowers the energy, as described in Section 5.1.2.
+//!    lowers the energy, as described in Section 5.1.2. A unit augmentation
+//!    changes one edge, i.e. one side's sum by one; a constraint that has already
+//!    been balanced is never touched again, so a side may carry any number of
+//!    edges without changing the bookkeeping.
 //!
 //! 2. **Coons patch meshing (5.1.3).** [`coons`] / [`coons_curves`] take four
 //!    boundary polylines with counter-clockwise winding and the subdivision
@@ -367,9 +370,21 @@ impl<'a> AugmentSearch<'a> {
         }
     }
 
-    fn try_step(&mut self, y: usize, sign: i32, cost: f64) {
+    fn try_step(&mut self, y: usize, sign: i32, cost: f64, current_constraint: usize) {
         if self.visited.get(y).copied().unwrap_or(true) {
             return;
+        }
+        // A constraint that has already been balanced must never be touched
+        // again: changing `y` would alter one of its side sums after the fact.
+        // This matters as soon as a tile side carries more than one edge,
+        // because another edge of the same side can otherwise be reached
+        // through a different constraint and silently unbalance this one.
+        if let Some(incidences) = self.graph.incidence.get(y) {
+            for &ci in incidences {
+                if ci != current_constraint && self.used.get(ci).copied() == Some(true) {
+                    return;
+                }
+            }
         }
         let s = match self.counts.get(y) {
             Some(&v) => v,
@@ -458,11 +473,15 @@ impl<'a> AugmentSearch<'a> {
             let current_in_a = a.contains(&current);
             let (same, opposite) = if current_in_a { (&a, &b) } else { (&b, &a) };
 
+            // The constraint is an equality of side sums, not of edge ids.
+            // Changing one edge changes its side's sum by one, so exactly one
+            // edge of each side is touched per unit augmentation; the number
+            // of edges a side carries does not enter the bookkeeping.
             // Crossing the tile: an edge on the opposite side changes with the
             // same sign.
             let opposite_partners: Vec<usize> = opposite.clone();
             for y in opposite_partners {
-                self.try_step(y, delta, cost);
+                self.try_step(y, delta, cost, ci);
             }
 
             // Redirecting the chord: another edge on the same side changes
@@ -470,7 +489,7 @@ impl<'a> AugmentSearch<'a> {
             let same_partners: Vec<usize> =
                 same.iter().copied().filter(|&y| y != current).collect();
             for y in same_partners {
-                self.try_step(y, -delta, cost);
+                self.try_step(y, -delta, cost, ci);
             }
 
             self.used[ci] = false;
@@ -1459,6 +1478,74 @@ mod tests {
             report.bent_quads,
             report.bent_min_area
         );
+        Ok(())
+    }
+
+    #[test]
+    fn multi_edge_sides_are_summed_not_single_ids() -> Result<(), String> {
+        // Reproducer: region A's shared right side is split into two edges
+        // e0,e1, and region B's left side is the same two edges. Before the
+        // used-constraint guard this ended with the final error
+        // "constraint 3 is not balanced after the solve (2 != 1)".
+        let split = [
+            Region::new([vec![2], vec![0, 1], vec![3], vec![4]]),
+            Region::new([vec![6], vec![5], vec![7], vec![0, 1]]),
+        ];
+        let split_ideal = [2.0, 2.0, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0];
+        let split_counts = solve_counts(&split, &split_ideal)?;
+        assert!(constraints_hold(&split, &split_counts));
+        let shared_split = split_counts[0] + split_counts[1];
+        assert_eq!(shared_split, split_counts[4], "A: e0+e1 = e4");
+        assert_eq!(shared_split, split_counts[5], "B: e5 = e0+e1");
+
+        // Collapse that two-edge side to a single edge whose ideal is the sum
+        // of the two segment ideals. One edge and two edges must produce the
+        // same side sums and a balanced result.
+        let coarse = [
+            Region::new([vec![1], vec![0], vec![2], vec![3]]),
+            Region::new([vec![5], vec![4], vec![6], vec![0]]),
+        ];
+        let coarse_ideal = [4.0, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0];
+        let coarse_counts = solve_counts(&coarse, &coarse_ideal)?;
+        assert!(constraints_hold(&coarse, &coarse_counts));
+        assert_eq!(shared_split, coarse_counts[0], "shared side sum");
+        assert_eq!(split_counts[2], coarse_counts[1], "A bottom");
+        assert_eq!(split_counts[3], coarse_counts[2], "A top");
+        assert_eq!(split_counts[4], coarse_counts[3], "A left");
+        assert_eq!(split_counts[5], coarse_counts[4], "B right");
+        assert_eq!(split_counts[6], coarse_counts[5], "B bottom");
+        assert_eq!(split_counts[7], coarse_counts[6], "B top");
+
+        assert_eq!(split_counts, vec![1, 0, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(coarse_counts, vec![1, 1, 1, 1, 1, 1, 1]);
+        assert!(energy(&split_counts, &split_ideal)?.is_finite());
+        Ok(())
+    }
+
+    #[test]
+    fn multi_edge_solves_always_balance() -> Result<(), String> {
+        // Regression sweep over the split-side graph: every solve must return
+        // non-negative counts that satisfy both side-sum constraints.
+        let regions = [
+            Region::new([vec![2], vec![0, 1], vec![3], vec![4]]),
+            Region::new([vec![6], vec![5], vec![7], vec![0, 1]]),
+        ];
+        for i0 in 1..=6 {
+            for i1 in 1..=6 {
+                for i4 in 1..=6 {
+                    for i5 in 1..=6 {
+                        let ideal = [
+                            i0 as f64, i1 as f64, 1.0, 1.0, i4 as f64, i5 as f64, 1.0, 1.0,
+                        ];
+                        let counts = solve_counts(&regions, &ideal)?;
+                        assert!(
+                            constraints_hold(&regions, &counts),
+                            "unbalanced solve for ideals {ideal:?}: {counts:?}"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
