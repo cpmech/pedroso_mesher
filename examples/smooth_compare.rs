@@ -12,6 +12,9 @@ use pedroso_mesher::two_d::{Domain, Sizing};
 
 type Route = fn(&Domain, &Sizing) -> Result<Mesh, String>;
 
+/// Where the comparison output (PNGs and `stats.json`) is written.
+const OUT: &str = "/tmp/pedroso_mesher/compare";
+
 fn routes() -> Vec<(&'static str, Route)> {
     vec![
         ("paving", pedroso_mesher::alt_paving::mesh),
@@ -95,7 +98,7 @@ fn main() {
     } else {
         args.iter().map(String::as_str).collect()
     };
-    std::fs::create_dir_all("figures/smooth").unwrap();
+    std::fs::create_dir_all(OUT).unwrap();
     let options = SmoothOptions {
         // measure the smoother itself; the route output is the "before" state
         reject_if_worse: false,
@@ -161,15 +164,15 @@ fn main() {
                 draw::draw_domain_with_mesh(
                     &domain,
                     mesh,
-                    &format!("figures/smooth/{name}-{part_name}-{state}.png"),
+                    &format!("{OUT}/{name}-{part_name}-{state}.png"),
                     &opts,
                 )
                 .unwrap();
             }
         }
     }
-    let path = "figures/smooth/stats.json";
-    std::fs::write(path, serde_json::to_string_pretty(&records).unwrap()).unwrap();
+    let path = format!("{OUT}/stats.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&records).unwrap()).unwrap();
     println!("\nwrote {path} ({} records)", records.len());
     println!("\n| route | pass before | pass after |");
     println!("|---|---:|---:|");
