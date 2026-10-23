@@ -569,6 +569,10 @@ fn relax_interior(
     };
     let aspect_ceiling = probe.aspect_ratio.max.max(aspect_cap);
     let mut moved = 0usize;
+    // Scratch buffers reused across nodes and sweeps: a per-node `Vec` here was
+    // a real allocation cost on a 20k-node mesh (two per node per sweep).
+    let mut ring: Vec<usize> = Vec::with_capacity(8);
+    let mut candidates: Vec<[f64; 2]> = Vec::with_capacity(17);
     for _ in 0..iterations {
         let mut sweep = 0usize;
         for v in 0..n {
@@ -578,7 +582,7 @@ fn relax_interior(
             let here = [mesh.points[v][0], mesh.points[v][1]];
             // The one-ring: every other node of every incident cell. Its
             // centroid is the cheap "regular position" candidate.
-            let mut ring: Vec<usize> = Vec::new();
+            ring.clear();
             for &c in &incident[v] {
                 for &u in &mesh.cells[c].nodes {
                     if u != v && u < n && !ring.contains(&u) {
@@ -621,7 +625,8 @@ fn relax_interior(
             let current = score(mesh, v);
             let mut best = current;
             let mut best_pos = here;
-            let mut candidates = vec![centroid];
+            candidates.clear();
+            candidates.push(centroid);
             // Two radii: the coarse one can jump past a whole cell, the fine
             // one polishes locally. 8 points per ring keeps the cost
             // deterministic (17 candidates per node).
@@ -631,7 +636,7 @@ fn relax_interior(
                     candidates.push([here[0] + radius * a.cos(), here[1] + radius * a.sin()]);
                 }
             }
-            for cand in candidates {
+            for &cand in &candidates {
                 // `contains` is the only geometric restriction: a node may not
                 // leave the domain even if the margin would improve.
                 if !domain.contains(cand) {

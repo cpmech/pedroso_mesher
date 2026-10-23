@@ -181,6 +181,21 @@ pub struct CellMesh {
 
     /// Edges incident to each node, for side-edge definition by angle.
     node_edges: HashMap<usize, Vec<(usize, usize)>>,
+
+    /// Live triangle ids, in insertion order. The parity guard walks the
+    /// unconverted triangles; scanning the whole cell array (which keeps
+    /// removed ids as `None`) made each guard call pay for the converted half
+    /// of the mesh too. Removed triangles stay in the list with
+    /// `tri_alive[id] == false`; ids are never reused, so this is a stable
+    /// append-only log.
+    tri_list: Vec<usize>,
+
+    /// `tri_alive[id]` is true while cell `id` is a live triangle.
+    tri_alive: Vec<bool>,
+
+    /// `tri_listed[id]` is true once `id` has been appended to `tri_list`;
+    /// a flip re-indexes the same triangle, and the log must not duplicate it.
+    tri_listed: Vec<bool>,
 }
 
 impl CellMesh {
@@ -204,6 +219,9 @@ impl CellMesh {
             // and the fragment guard see twice the real region.
             live_tris: 0,
             node_edges: HashMap::new(),
+            tri_list: Vec::new(),
+            tri_alive: vec![false; tris.len()],
+            tri_listed: vec![false; tris.len()],
         };
         for id in 0..mesh.cells.len() {
             mesh.index_cell(id);
@@ -279,6 +297,15 @@ impl CellMesh {
         };
         if cell.is_tri() {
             self.live_tris += 1;
+            if self.tri_alive.len() <= id {
+                self.tri_alive.resize(id + 1, false);
+                self.tri_listed.resize(id + 1, false);
+            }
+            self.tri_alive[id] = true;
+            if !self.tri_listed[id] {
+                self.tri_listed[id] = true;
+                self.tri_list.push(id);
+            }
         }
         for i in 0..cell.n_nodes() {
             let edge = cell.edge(i);
@@ -303,6 +330,9 @@ impl CellMesh {
         };
         if cell.is_tri() {
             self.live_tris = self.live_tris.saturating_sub(1);
+            if let Some(alive) = self.tri_alive.get_mut(id) {
+                *alive = false;
+            }
         }
         for i in 0..cell.n_nodes() {
             let edge = cell.edge(i);
@@ -392,8 +422,9 @@ impl CellMesh {
         let mut seen = vec![false; self.cells.len()];
         let mut sizes = Vec::new();
         let mut stack = Vec::new();
-        for start in self.cell_ids() {
-            if seen[start] || !self.cells[start].as_ref().is_some_and(Cell::is_tri) {
+        for index in 0..self.tri_list.len() {
+            let start = self.tri_list[index];
+            if seen[start] || !self.tri_alive[start] {
                 continue;
             }
             seen[start] = true;
@@ -458,10 +489,9 @@ impl CellMesh {
         for &id in region {
             scratch.stamp[id] = generation;
         }
-        for start in self.cell_ids() {
-            if scratch.stamp[start] == generation
-                || !self.cells[start].as_ref().is_some_and(Cell::is_tri)
-            {
+        for start in 0..self.tri_list.len() {
+            let start = self.tri_list[start];
+            if scratch.stamp[start] == generation || !self.tri_alive[start] {
                 continue;
             }
             scratch.stamp[start] = generation;

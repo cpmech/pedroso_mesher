@@ -113,6 +113,25 @@ the `simons_*` modules implement.
    Used in: The motorcycle graph of sections 3.1.9/5 (cited, not implemented).
 
 
+## Module map (thesis)
+
+Where each `simons_*` module sits in the thesis, and which reference above it
+follows. The public route names are in `src/config.rs`.
+
+| Module | Thesis section | Primary reference |
+| --- | --- | --- |
+| `simons_channel` | Ch. 2 grid interior, boundary channel, patch cover | `simons-2024-thesis`, `SA17`, `BS91` |
+| `simons_features` | Ch. 2 interior feature constraints | `simons-2024-thesis` |
+| `simons_godf` | Ch. 3 size-aware Globally-Optimal Direction Field | `KCPS13` |
+| `simons_sizefamily` | Ch. 4 size families, anisotropy A (4.7), streamline optimisation | `simons-2024-thesis` |
+| `simons_limit` | §4.12 removable limit cycles | `simons-2024-thesis` |
+| `simons_regions` | §3.1.6–3.1.12 singularities/separatrices/motorcycle graph, §5.1.4 tiles and nautilus | `KCPS13`, `EGKT08` |
+| `simons_qgp` | Ch. 5 Quantized Global Parameterization, Coons extraction | `CBK15`, `Coo67` |
+| `simons_graded` | Ch. 5 graded tile-grid QGP | `CBK15`, `Coo67` |
+| `simons_smooth` | §2.2.10 angle + stretch smoothing | `simons-2024-thesis` |
+| `simons_pipeline` | Ch. 2–5 integration (field → QGP → channel → smooth) | all of the above |
+| `sized` | product wrapper around `simons_channel` (Chapter 2 route) | `simons-2024-thesis` |
+
 ## Notes
 
 - The thesis' own bibliography has about 100 entries; only the ones implemented or

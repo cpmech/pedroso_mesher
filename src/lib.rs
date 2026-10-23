@@ -3,12 +3,16 @@
 //! is the data model (`Mesh`, `Cell`, `Node`, `Topology`); `two_d` is the
 //! planar substrate and the default quad-dominant `mesh_2d`; `quad` is the
 //! gate-checked all-quad pipeline (Q-Morph + Sun closure); `config` is the
-//! shipped API that selects any of the nine routes and applies the shared
+//! shipped API that selects any of the twelve routes and applies the shared
 //! smoother; `qmorph`, `parity`, `twostage`, `sun`, `recovery`, `grid`, `smooth`
 //! and `quality` are the shared stages; `stats`, `verify` and `bench` are the
 //! measurements; `draw`, `io` and `msh` are the I/O and diagnostics;
 //! `alt_paving`, `alt_bipartite`, `alt_quadtree`, `alt_decompose`, `alt_hybrid`,
-//! `alt_crossfield`, `alt_untangle` and `alt_l1` are the alternative routes.
+//! `alt_crossfield`, `alt_untangle` and `alt_l1` are the alternative routes;
+//! `sized` is the Simons 2024 channel route, and `simons_channel`,
+//! `simons_features`, `simons_godf`, `simons_sizefamily`, `simons_limit`,
+//! `simons_regions`, `simons_qgp`, `simons_graded`, `simons_smooth` and
+//! `simons_pipeline` implement the thesis chapters (see `README.md`).
 //! The rules are: every algorithm is implemented from public journal papers and
 //! university theses (the clean-room policy in `AGENTS.md` and the corpus
 //! `INDEX.md`); no code is ported or copied, BSD code needs prior authorization,

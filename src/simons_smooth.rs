@@ -228,6 +228,8 @@ pub fn smooth_with_stats(
     let boundary = boundary_nodes(mesh);
     let mut moved = vec![false; points.len()];
     let mut sweeps = 0;
+    // Reused across nodes: the hoisted constants of the current node's star.
+    let mut star: Vec<StarCell> = Vec::with_capacity(8);
 
     for _ in 0..options.iterations {
         let mut moved_this_sweep = 0usize;
@@ -260,7 +262,44 @@ pub fn smooth_with_stats(
             if !f_start.is_finite() || f_start >= INVALID {
                 continue;
             }
-            let mut f = evaluate;
+            // The objective is a sum of squares, so no candidate can score
+            // below zero. A node already within the acceptance tolerance of
+            // zero therefore cannot accept any move: the acceptance test is
+            // `f_best < f_start - ACCEPT_TOLERANCE * (1 + f_start)`, whose
+            // right-hand side is negative when `f_start <= ACCEPT_TOLERANCE`.
+            // Skipping the search here is exact, not a heuristic; it removes
+            // the Nelder-Mead work on the (large) part of a good mesh whose
+            // stars are already perfectly square.
+            if f_start <= ACCEPT_TOLERANCE {
+                continue;
+            }
+            // Hoist the candidate-independent part of the star before the
+            // search. `StarCell::new` repeats the starting geometry, which the
+            // f_start evaluation above has already validated.
+            star.clear();
+            let mut star_ok = true;
+            for &index in incident {
+                match StarCell::new(&points, &mesh.cells, index, node) {
+                    Some(cell) => star.push(cell),
+                    None => {
+                        star_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !star_ok {
+                continue;
+            }
+            let mut f = |p: [f64; 2]| -> f64 {
+                let d = (p[0] - start[0]).hypot(p[1] - start[1]);
+                if !d.is_finite() || d > max_step {
+                    return INVALID;
+                }
+                if boundary_node && !inside_or_on(domain, p, size) {
+                    return INVALID;
+                }
+                star_objective(&star, p, weight)
+            };
             let best = if options.simplex {
                 nelder_mead(start, 0.25 * size, 80, &mut f)
             } else {
@@ -595,6 +634,155 @@ fn local_objective(
         }
         if weight > 0.0 {
             total += weight * stretch_penalty(&quad);
+        }
+    }
+    total
+}
+
+/// The part of one incident quad that does not depend on the moving node's
+/// position: the moving corner itself, the opposite corner's angle (it is
+/// determined by the three fixed points), the two edge lengths away from the
+/// moving node, and the one diagonal that does not touch it.
+///
+/// Hoisting these out of the Nelder-Mead search removes four of the search's
+/// transcendental evaluations per quad per candidate (one `atan2` and three
+/// `hypot`s), which is most of the shape pass's cost on a large mesh. The
+/// values are computed with the same helpers ([`corner_angle`], [`distance`])
+/// and inserted at the same positions in the same accumulations, so the
+/// objective is bit-identical to [`local_objective`].
+struct StarCell {
+    /// Position of the moving node in the cell.
+    slot: usize,
+    /// The four corner positions of the incident quad when the node is at its
+    /// current position. The search only replaces `slot`, so caching the whole
+    /// quad keeps the fixed three corners in one cache line instead of four.
+    fixed: [[f64; 2]; 4],
+    /// Position of the opposite corner.
+    opposite: usize,
+    /// `(corner_angle(opposite) - RIGHT_ANGLE)^2`; constant for the star.
+    opposite_dev2: f64,
+    /// Two edges, as `(edge index, length)`, that do not touch the moving node.
+    fixed_edges: [(usize, f64); 2],
+    /// Which diagonal is constant: 0 for `q0-q2`, 1 for `q1-q3`.
+    fixed_diagonal: usize,
+    /// Length of that constant diagonal.
+    fixed_diagonal_len: f64,
+}
+
+impl StarCell {
+    /// Build the constants for one incident cell of `node`.
+    fn new(points: &[[f64; 3]], cells: &[Cell], index: usize, node: usize) -> Option<Self> {
+        let cell = cells.get(index)?;
+        let quad = quad_points(cell, points);
+        let slot = (0..4).find(|&k| cell.nodes[k] == node)?;
+        let opposite = (slot + 2) % 4;
+        let opposite_dev2 = {
+            let deviation = corner_angle(&quad, opposite) - RIGHT_ANGLE;
+            deviation * deviation
+        };
+        // Edges `slot+1` and `slot+2` (mod 4) do not contain the moving node.
+        let mut fixed_edges = [(0usize, 0.0); 2];
+        for (k, edge) in [(slot + 1) % 4, (slot + 2) % 4].into_iter().enumerate() {
+            fixed_edges[k] = (edge, distance(quad[edge], quad[(edge + 1) % 4]));
+        }
+        // Exactly one diagonal touches the moving node; the other is fixed.
+        let fixed_diagonal = if slot % 2 == 0 { 1 } else { 0 };
+        let (a, b) = if fixed_diagonal == 0 {
+            (0usize, 2usize)
+        } else {
+            (1usize, 3usize)
+        };
+        let fixed_diagonal_len = distance(quad[a], quad[b]);
+        Some(Self {
+            slot,
+            fixed: quad,
+            opposite,
+            opposite_dev2,
+            fixed_edges,
+            fixed_diagonal,
+            fixed_diagonal_len,
+        })
+    }
+}
+
+/// [`local_objective`] with the per-star constants of [`StarCell`] hoisted.
+///
+/// The arithmetic is deliberately the same as [`local_objective`]'s: the same
+/// cross and dot products, the same `hypot`-based lengths, and the same sum
+/// order including the opposite corner's contribution. Only the evaluations
+/// that cannot depend on the candidate are skipped.
+fn star_objective(star: &[StarCell], candidate: [f64; 2], weight: f64) -> f64 {
+    let mut total = 0.0;
+    for s in star {
+        let mut quad = s.fixed;
+        quad[s.slot] = candidate;
+        if quad_area(&quad) <= 0.0 {
+            return INVALID;
+        }
+        for i in 0..4 {
+            if i == s.opposite {
+                // Its two edges are fixed, so its angle is fixed too; the
+                // star was built on a valid quad (the caller checked the
+                // starting objective), so its Jacobian is known good.
+                total += s.opposite_dev2;
+                continue;
+            }
+            let prev = quad[(i + 3) % 4];
+            let next = quad[(i + 1) % 4];
+            let ax = quad[i][0] - prev[0];
+            let ay = quad[i][1] - prev[1];
+            let bx = next[0] - quad[i][0];
+            let by = next[1] - quad[i][1];
+            let cross = ax * by - ay * bx;
+            let dot = ax * bx + ay * by;
+            let denom = ax.hypot(ay) * bx.hypot(by);
+            let jacobian = if denom > 0.0 {
+                cross / denom
+            } else {
+                f64::NEG_INFINITY
+            };
+            if jacobian <= MIN_CORNER_JACOBIAN || jacobian.is_nan() {
+                return INVALID;
+            }
+            // `corner_angle` measures the angle from `(prev - q[i])` and
+            // `(next - q[i])`; this cross and dot are the negated pair, which
+            // is exact in IEEE arithmetic, so negating `dot` here gives the
+            // same angle as `corner_angle` computes.
+            let deviation = cross.abs().atan2(-dot) - RIGHT_ANGLE;
+            total += deviation * deviation;
+        }
+        if weight > 0.0 {
+            // Same order as `raw_stretch`: the two diagonals first, then the
+            // four edges; the fixed values are identical to the recomputed
+            // ones, so the `min` sequence is identical.
+            let d0 = if s.fixed_diagonal == 0 {
+                s.fixed_diagonal_len
+            } else {
+                distance(quad[0], quad[2])
+            };
+            let d1 = if s.fixed_diagonal == 1 {
+                s.fixed_diagonal_len
+            } else {
+                distance(quad[1], quad[3])
+            };
+            let mut shortest = f64::INFINITY;
+            for i in 0..4 {
+                let length = match s.fixed_edges {
+                    [(edge, value), _] if edge == i => value,
+                    [_, (edge, value)] if edge == i => value,
+                    _ => distance(quad[i], quad[(i + 1) % 4]),
+                };
+                shortest = shortest.min(length);
+            }
+            let stretch = if shortest <= 0.0 {
+                f64::INFINITY
+            } else {
+                d0.max(d1) / shortest / std::f64::consts::SQRT_2
+            };
+            if !stretch.is_finite() {
+                return INVALID;
+            }
+            total += weight * (stretch - 1.0).powi(2);
         }
     }
     total
@@ -1245,6 +1433,57 @@ mod tests {
         for p in &smoothed.points {
             assert!(p[0] >= -1.0e-8 && p[0] <= 6.0 + 1.0e-8);
             assert!(p[1] >= -1.0e-8 && p[1] <= 6.0 + 1.0e-8);
+        }
+    }
+    /// The hoisted star evaluation must reproduce the full one bit for bit;
+    /// this is what lets the shape pass be optimised without changing a mesh.
+    #[test]
+    fn hoisted_star_objective_is_bit_identical() {
+        let mesh = perturbed_ok(4, 1.0, 0.3, 0.25);
+        // Interior node (2, 2) of the 5 x 5 point grid.
+        let side = 5usize;
+        let node = 2 * side + 2;
+        let incident = build_node_cells(&mesh)
+            .get(node)
+            .cloned()
+            .unwrap_or_default();
+        assert!(!incident.is_empty(), "the middle node must be in cells");
+        let start = [mesh.points[node][0], mesh.points[node][1]];
+        for weight in [0.0, 1.0] {
+            let mut star: Vec<StarCell> = Vec::with_capacity(incident.len());
+            for &index in &incident {
+                match StarCell::new(&mesh.points, &mesh.cells, index, node) {
+                    Some(cell) => star.push(cell),
+                    None => {
+                        assert!(false, "every incident cell must contain the node");
+                    }
+                }
+            }
+            let offsets = [
+                [0.0, 0.0],
+                [0.1, -0.2],
+                [-0.3, 0.15],
+                [0.5, 0.5],
+                [-0.4, 0.3],
+                [0.05, 0.05],
+            ];
+            for offset in offsets {
+                let candidate = [start[0] + offset[0], start[1] + offset[1]];
+                let full = local_objective(
+                    &mesh.points,
+                    &incident,
+                    &mesh.cells,
+                    node,
+                    candidate,
+                    weight,
+                );
+                let hoisted = star_objective(&star, candidate, weight);
+                assert_eq!(
+                    full.to_bits(),
+                    hoisted.to_bits(),
+                    "weight {weight}, candidate {candidate:?}: {full} vs {hoisted}"
+                );
+            }
         }
     }
 }

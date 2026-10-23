@@ -1,11 +1,15 @@
 //! Generate a mesh with any route from a `MeshConfig`.
 //!
 //! ```text
-//! cargo run --release --offline --example generate -- [route] [part] [--config in.json] [--write-config out.json] [--json stats.json] [--no-smooth]
+//! cargo run --release --offline --example generate -- [route] [part] [--config in.json] [--write-config out.json] [--json stats.json] [--no-smooth] [--hash]
 //! ```
 //!
-//! `route` is one of `qmorph, paving, bipartite, quadtree, decompose, hybrid,
-//! crossfield, untangle, l1`; the default is `quadtree` on `plate-hole-2mm`.
+//! `route` is one of the twelve [`Route`] names (`qmorph, paving, bipartite,
+//! quadtree, decompose, hybrid, crossfield, untangle, l1, sized, features,
+//! pipeline`); the default is `quadtree` on `plate-hole-2mm`. `--hash` prints a
+//! stable FNV-1a hash of the returned mesh (nodes and cells), which is what the
+//! performance work uses to prove that an optimisation did not change the
+//! output.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use pedroso_mesher::config::{generate, MeshConfig, Route};
@@ -72,6 +76,7 @@ fn main() {
     let mut part_name = "plate-hole-2mm".to_string();
     let mut json_out: Option<String> = None;
     let mut config_out: Option<String> = None;
+    let mut print_hash = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -85,6 +90,7 @@ fn main() {
                 json_out = Some(args[i].clone());
             }
             "--no-smooth" => config.smoothing.enabled = false,
+            "--hash" => print_hash = true,
             "--write-config" => {
                 i += 1;
                 config_out = Some(args[i].clone());
@@ -119,6 +125,30 @@ fn main() {
         out.statistics.line(),
         out.seconds
     );
+    if print_hash {
+        // FNV-1a over the exact bit patterns: stable across processes and
+        // independent of the (unspecified) hash seed. A changed node or cell
+        // changes the hash; this is how the timed runs are checked against the
+        // pre-optimisation binary.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |value: u64| {
+            hash ^= value;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for point in &out.mesh.points {
+            for coordinate in point {
+                eat(coordinate.to_bits());
+            }
+        }
+        for cell in &out.mesh.cells {
+            eat(cell.kind as u64);
+            eat(cell.nodes.len() as u64);
+            for &node in &cell.nodes {
+                eat(node as u64);
+            }
+        }
+        println!("mesh hash: {hash:016x}");
+    }
     println!("generator only: {}", out.before.line());
     if let Some(s) = &out.smoothing {
         println!("smoothing accepted: {}", s.accepted);

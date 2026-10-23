@@ -1088,12 +1088,18 @@ impl WalkMesh {
         // 0. Compact region grown by Euclidean radius. A one-cell corridor is
         // often too thin to quadrangulate; a disk around the residual is not.
         if size > 0.0 {
-            for factor in [
-                2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0, 30.0, 40.0,
-            ] {
-                let region = self.compact_region(seed, factor * size);
-                if region.len() > 1 && self.try_cavity_region(&region) {
-                    return true;
+            // One growing region reused across the factors: the radii are
+            // increasing, so each factor only adds the ring the previous one
+            // did not reach. The set is the same one a fresh grow returns.
+            let mut region: HashSet<usize> = HashSet::from([seed]);
+            if let Some(center) = self.center(seed) {
+                for factor in [
+                    2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0, 30.0, 40.0,
+                ] {
+                    self.grow_compact_region(&mut region, center, factor * size);
+                    if region.len() > 1 && self.try_cavity_region(&region) {
+                        return true;
+                    }
                 }
             }
         }
@@ -1116,12 +1122,15 @@ impl WalkMesh {
         // 1b. Compact region around both residuals (no hole between them).
         if let Some(partner) = self.nearest_tris(seed).into_iter().next() {
             if partner != seed && size > 0.0 {
-                for factor in [
-                    2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0, 30.0, 40.0,
-                ] {
-                    let region = self.compact_region_both(seed, partner, factor * size);
-                    if region.len() > 2 && self.try_cavity_region(&region) {
-                        return true;
+                if let Some(center) = self.both_center(seed, partner) {
+                    let mut region: HashSet<usize> = HashSet::from([seed, partner]);
+                    for factor in [
+                        2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0, 30.0, 40.0,
+                    ] {
+                        self.grow_compact_region(&mut region, center, factor * size);
+                        if region.len() > 2 && self.try_cavity_region(&region) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -1158,88 +1167,45 @@ impl WalkMesh {
         false
     }
 
-    /// Connected quads within `radius` of the seed's centre, plus the seed.
-    /// Connected quads within `radius` of the seed's centre, plus the seed.
+    /// Grow `region` to every edge-connected quad whose centroid is within
+    /// `radius` of `center`, in place.
     ///
-    /// Growth is by edge adjacency and stops when no new quad's centroid lies
-    /// inside the radius; the result is a disk-like patch, not a shortest path.
-    /// Returns just `{seed}` when the seed has no centre (removed cell).
-    fn compact_region(&self, seed: usize, radius: f64) -> HashSet<usize> {
-        let Some(center) = self.center(seed) else {
-            return HashSet::from([seed]);
-        };
-        let mut region: HashSet<usize> = HashSet::from([seed]);
-        loop {
-            let mut candidates = Vec::new();
-            for &id in region.iter() {
-                let Some(cell) = self.cell(id) else {
-                    continue;
-                };
-                for i in 0..cell.n_nodes() {
-                    for &other in self.edge_cells(cell.edge(i)) {
-                        if region.contains(&other) || self.quad(other).is_none() {
-                            continue;
-                        }
-                        let Some(c) = self.center(other) else {
-                            continue;
-                        };
-                        if (c[0] - center[0]).hypot(c[1] - center[1]) <= radius {
-                            candidates.push(other);
-                        }
+    /// This is the same fixed point as growing a fresh region from the seed:
+    /// membership is by reachability through quads inside the radius, so the
+    /// starting set only has to be a subset of the answer (it is, for a larger
+    /// radius than the one that produced it). The cavity search asks for a
+    /// sequence of growing radii around one seed; reusing the previous region
+    /// turns twelve independent growths into one incremental one. The visit is
+    /// a queue over the region rather than a rescan of it per growth step, so a
+    /// cell is examined once per call.
+    fn grow_compact_region(&self, region: &mut HashSet<usize>, center: [f64; 2], radius: f64) {
+        let mut queue: Vec<usize> = region.iter().copied().collect();
+        while let Some(id) = queue.pop() {
+            let Some(cell) = self.cell(id) else {
+                continue;
+            };
+            for i in 0..cell.n_nodes() {
+                for &other in self.edge_cells(cell.edge(i)) {
+                    if region.contains(&other) || self.quad(other).is_none() {
+                        continue;
+                    }
+                    let Some(c) = self.center(other) else {
+                        continue;
+                    };
+                    if (c[0] - center[0]).hypot(c[1] - center[1]) <= radius {
+                        region.insert(other);
+                        queue.push(other);
                     }
                 }
             }
-            candidates.sort_unstable();
-            candidates.dedup();
-            if candidates.is_empty() {
-                break;
-            }
-            for other in candidates {
-                region.insert(other);
-            }
         }
-        region
     }
 
-    /// Connected quads within `radius` of the midpoint of two residuals, with
-    /// both residuals included. This avoids a hole in the region when the two
-    /// residuals are close enough to cover together.
-    fn compact_region_both(&self, a: usize, b: usize, radius: f64) -> HashSet<usize> {
-        let (Some(ca), Some(cb)) = (self.center(a), self.center(b)) else {
-            return HashSet::from([a, b]);
-        };
-        let center = [(ca[0] + cb[0]) * 0.5, (ca[1] + cb[1]) * 0.5];
-        let mut region: HashSet<usize> = HashSet::from([a, b]);
-        loop {
-            let mut candidates = Vec::new();
-            for &id in region.iter() {
-                let Some(cell) = self.cell(id) else {
-                    continue;
-                };
-                for i in 0..cell.n_nodes() {
-                    for &other in self.edge_cells(cell.edge(i)) {
-                        if region.contains(&other) || self.quad(other).is_none() {
-                            continue;
-                        }
-                        let Some(c) = self.center(other) else {
-                            continue;
-                        };
-                        if (c[0] - center[0]).hypot(c[1] - center[1]) <= radius {
-                            candidates.push(other);
-                        }
-                    }
-                }
-            }
-            candidates.sort_unstable();
-            candidates.dedup();
-            if candidates.is_empty() {
-                break;
-            }
-            for other in candidates {
-                region.insert(other);
-            }
-        }
-        region
+    /// Midpoint of two cells' centres, or `None` if either is gone.
+    fn both_center(&self, a: usize, b: usize) -> Option<[f64; 2]> {
+        let ca = self.center(a)?;
+        let cb = self.center(b)?;
+        Some([(ca[0] + cb[0]) * 0.5, (ca[1] + cb[1]) * 0.5])
     }
 
     /// Shortest path from `start` to `target` through quad cells (the end
@@ -2006,19 +1972,25 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
     if n < 4 || n % 2 == 1 {
         return None;
     }
-    type Memo = HashMap<(usize, usize), Option<(f64, usize, usize)>>;
+    // Dense memo: state `(i, j)` is stored at `i * n + j`. A `HashMap` here is
+    // the inner loop of an O(n^4) recursion (n is the simplified loop length,
+    // up to a few hundred), and the hash of a pair of small integers cost more
+    // than the recurrences around it.
+    type State = Option<(f64, usize, usize)>;
+    let mut memo: Vec<Option<State>> = vec![None; n * n];
     fn solve(
         i: usize,
         j: usize,
+        n: usize,
         loopv: &[usize],
         points: &[Node],
-        memo: &mut Memo,
-    ) -> Option<(f64, usize, usize)> {
-        if let Some(cached) = memo.get(&(i, j)) {
-            return *cached;
+        memo: &mut [Option<State>],
+    ) -> State {
+        if let Some(cached) = memo[i * n + j] {
+            return cached;
         }
         if j == i + 1 {
-            memo.insert((i, j), Some((f64::INFINITY, 0, 0)));
+            memo[i * n + j] = Some(Some((f64::INFINITY, 0, 0)));
             return Some((f64::INFINITY, 0, 0));
         }
         if j == i + 3 {
@@ -2034,7 +2006,7 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
             } else {
                 None
             };
-            memo.insert((i, j), result);
+            memo[i * n + j] = Some(result);
             return result;
         }
         let mut best: Option<(f64, usize, usize)> = None;
@@ -2043,9 +2015,9 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
             let mut l = k + 1;
             while l < j {
                 if let (Some((s1, _, _)), Some((s2, _, _)), Some((s3, _, _))) = (
-                    solve(i, k, loopv, points, memo),
-                    solve(k, l, loopv, points, memo),
-                    solve(l, j, loopv, points, memo),
+                    solve(i, k, n, loopv, points, memo),
+                    solve(k, l, n, loopv, points, memo),
+                    solve(l, j, n, loopv, points, memo),
                 ) {
                     let quad = normalize_quad(points, [loopv[i], loopv[k], loopv[l], loopv[j]]);
                     if quad_simple(points, &quad) {
@@ -2062,16 +2034,22 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
             }
             k += 2;
         }
-        memo.insert((i, j), best);
+        memo[i * n + j] = Some(best);
         best
     }
-    let mut memo: Memo = HashMap::new();
-    let (_, top_k, top_l) = solve(0, n - 1, loopv, points, &mut memo)?;
-    fn build(i: usize, j: usize, loopv: &[usize], memo: &Memo, out: &mut Vec<[usize; 4]>) {
+    let (_, top_k, top_l) = solve(0, n - 1, n, loopv, points, &mut memo)?;
+    fn build(
+        i: usize,
+        j: usize,
+        n: usize,
+        loopv: &[usize],
+        memo: &[Option<State>],
+        out: &mut Vec<[usize; 4]>,
+    ) {
         if j <= i + 1 {
             return;
         }
-        let Some((_, k, l)) = memo.get(&(i, j)).copied().flatten() else {
+        let Some(Some((_, k, l))) = memo[i * n + j] else {
             return;
         };
         if j == i + 3 {
@@ -2080,16 +2058,16 @@ fn quadrangulate(points: &[Node], loopv: &[usize]) -> Option<Vec<[usize; 4]>> {
             // The quad at this node is part of the tiling; the recursions
             // only cover the three sub-polygons.
             out.push([loopv[i], loopv[k], loopv[l], loopv[j]]);
-            build(i, k, loopv, memo, out);
-            build(k, l, loopv, memo, out);
-            build(l, j, loopv, memo, out);
+            build(i, k, n, loopv, memo, out);
+            build(k, l, n, loopv, memo, out);
+            build(l, j, n, loopv, memo, out);
         }
     }
     let mut quads = Vec::new();
     if n == 4 {
         quads.push([loopv[0], loopv[1], loopv[2], loopv[3]]);
     } else {
-        build(0, n - 1, loopv, &memo, &mut quads);
+        build(0, n - 1, n, loopv, &memo, &mut quads);
         let _ = (top_k, top_l);
     }
     let polygon_area: f64 = (0..n)

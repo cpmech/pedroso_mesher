@@ -10,7 +10,7 @@
 //! [`crate::quad::QuadError::Unsupported`], and a route that cannot generate at
 //! all is [`crate::quad::QuadError::Route`].
 //!
-//! Nine routes are shipped behind this enum. Each is implemented from the public
+//! Twelve routes are shipped behind this enum. Each is implemented from the public
 //! paper named on its variant and measured on the crate corpus (six planar parts
 //! plus the 0.6 mm performance part); the alternative routes' `Options` defaults
 //! reproduce the constants they were measured with. The papers are cited by

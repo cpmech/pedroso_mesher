@@ -64,6 +64,15 @@
 //!    (5.2)) using its integer counts. The tile meshes are welded by coordinate
 //!    into one [`Mesh`].
 //!
+//! 7. **The nautilus tile (Section 5.1.4).** On a singularity-free field over a
+//!    domain with a hole, the motorcycle graph leaves one annular region rather
+//!    than four-side tiles. [`build_nautilus`] keeps it as the thesis's
+//!    self-referential ring tile and meshes it by angular correspondence about
+//!    the hole centre: every ray meets both star-shaped loops exactly once, so
+//!    the rows close around the hole with positive quads by construction. The
+//!    stitched circular annulus is measured in [`stitch_demo`] (192 kept
+//!    interior quads, coverage 1.000, min SJ > 0.9, min angle > 80 degrees).
+//!
 //! # Faithful
 //!
 //! Per-triangle holonomy and one singularity per triangle, the exact zero
@@ -99,9 +108,18 @@
 //! are reported in [`Regions::degenerate_tiles`] and left out of the mesh, which
 //! leaves a crack. The thesis removes exactly these tiles: it carves quads away
 //! from the boundary and fills the gap with the channel of Chapter 2 (Section
-//! 5.1.8.2), which this module does not implement. On the annulus demo the
-//! interior tiles are meshed and the boundary ring is not, which is measured and
-//! reported by [`demo`].
+//! 5.1.8.2), which this module does not implement. On the *singular* annulus
+//! demo the interior tiles are meshed and the boundary ring is not, which is
+//! measured and reported by [`demo`].
+//!
+//! The one exception is the **nautilus tile of Section 5.1.4**: when the field
+//! is singularity-free on a domain with a hole, the remaining region is a single
+//! annular tile, not a tiling of four-sided tiles. [`build_nautilus`] meshes it
+//! by angular correspondence about the hole (every ray meets each loop once, so
+//! the ring closes exactly); the stitched circular annulus is measured in
+//! [`stitch_demo`] at 192 kept interior quads and coverage 1.000 with min
+//! SJ > 0.9 and min angle > 80 degrees. The singular annulus still needs the
+//! channel or Section 5.1.5.2 merging.
 //!
 //! Measured attempts at avoiding the channel, all rejected:
 //!
@@ -180,22 +198,27 @@
 //! and 3 incident tiles with total areas 2.075, 5.794, 2.061 and 1.816. A
 //! merged region is therefore a non-convex 6-to-10-corner polygon spanning up
 //! to most of the annulus, which the four-side convex Coons machinery cannot
-//! mesh; it needs a multi-block or non-convex block decomposition, and that is
-//! what still separates this module from a QGP ring on the annulus.
+//! mesh; it needs a multi-block or non-convex block decomposition. That merging
+//! is what still separates this module from a QGP ring on the *singular* annulus;
+//! the singularity-free annulus closes through the nautilus tile instead.
 //!
-//! Measured attempts at the ring, all rejected: coarser annulus meshes (40x4,
-//! 60x6) keep the same rejected faces; the bent-horseshoe Coons patch folds
-//! when its long sides are sampled by arc length (fixed here by the angular
-//! sampling); a phase sweep over 0-35 degrees of the cross field never leaves a
-//! ring component (at phase 0 the carved interior is blobs of 11, 10 and 4
-//! quads, each with a single loop); and a two-band path on a
-//! hole-enclosing loop finds no such loop.
+//! Measured attempts at the singular ring, all rejected: coarser annulus meshes
+//! (40x4, 60x6) keep the same rejected faces; the bent-horseshoe Coons patch
+//! folds when its long sides are sampled by arc length (fixed here by the
+//! angular sampling); a phase sweep over 0-35 degrees of the cross field never
+//! leaves a ring component (at phase 0 the carved interior is blobs of 11, 10
+//! and 4 quads, each with a single loop); and a two-band path on a
+//! hole-enclosing loop finds no such loop. The nautilus tile works because the
+//! boundary-constrained field on the circular annulus is singularity-free, so
+//! the region really is one ring; the singular square-with-a-hole field is not.
 //!
 //! # Not implemented
 //!
-//! Extra singularity pairs and the nautilus relaxation of Section 5.1.4 (a tile
-//! whose two opposite sides are the same edge, or an annular tile, is rejected
-//! with an error); singularity merging (Section 5.1.5.2); degenerate-tile
+//! Extra singularity pairs (Section 5.1.4) for the singular case: the nautilus
+//! ring itself is implemented for a star-shaped annulus, but a tile whose two
+//! opposite sides are the same edge in a singular field is still rejected with
+//! an error. Also not implemented: singularity merging (Section 5.1.5.2);
+//! degenerate-tile
 //! collapse into a single vertex (Section 5.1.6: the tile is skipped and
 //! counted instead); limit cycles (an arm that closes on itself is not
 //! detected, it runs to the boundary); the boundary carving, channel and
