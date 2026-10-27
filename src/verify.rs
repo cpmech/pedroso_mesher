@@ -344,6 +344,347 @@ fn overlapping_pairs(mesh: &Mesh) -> usize {
     shared.values().filter(|&&count| count > 1).count()
 }
 
+/// Geometric checks that are too expensive for every smoothing iteration.
+///
+/// Unlike [`Gate`], this report checks actual polygon intersections, containment
+/// in the domain, coincident nodes, non-manifold connectivity and total material
+/// area. It is intended for the final API boundary. `overlapping_pairs` counts
+/// pairs with positive-area intersection; touching at an edge or vertex is not
+/// an overlap. `coincident_points` counts duplicate referenced nodes after the
+/// first copy; unused point-storage entries are ignored.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GeometryReport {
+    /// Planar cell pairs whose interiors intersect.
+    pub overlapping_pairs: usize,
+    /// Planar cells with a vertex, edge or interior sample outside the domain.
+    pub outside_cells: usize,
+    /// Extra referenced nodes at exactly the same 3D coordinates as an earlier node.
+    pub coincident_points: usize,
+    /// Edges shared by more than two planar cells.
+    pub non_manifold_edges: usize,
+    /// Interior edges traversed in the same direction by both adjacent cells.
+    pub inconsistent_edges: usize,
+    /// Cells other than `Quad4` and `Tri3`, which this planar report cannot check.
+    pub unsupported_cells: usize,
+    /// Absolute difference between mesh area and domain area, in area units.
+    pub area_error: f64,
+    /// Allowed absolute area difference, relative to the domain area.
+    pub area_tolerance: f64,
+}
+
+impl GeometryReport {
+    /// Whether every geometric acceptance criterion passes.
+    pub fn passes(&self) -> bool {
+        self.overlapping_pairs == 0
+            && self.outside_cells == 0
+            && self.coincident_points == 0
+            && self.non_manifold_edges == 0
+            && self.inconsistent_edges == 0
+            && self.unsupported_cells == 0
+            && self.area_error.is_finite()
+            && self.area_error <= self.area_tolerance
+    }
+
+    /// The first failure, in structural-then-geometric order.
+    pub fn reason(&self) -> Option<String> {
+        if self.unsupported_cells > 0 {
+            return Some(format!(
+                "{} cell(s) are not planar quads or triangles",
+                self.unsupported_cells
+            ));
+        }
+        if self.non_manifold_edges > 0 {
+            return Some(format!("{} non-manifold edge(s)", self.non_manifold_edges));
+        }
+        if self.inconsistent_edges > 0 {
+            return Some(format!(
+                "{} inconsistently oriented interior edge(s)",
+                self.inconsistent_edges
+            ));
+        }
+        if self.coincident_points > 0 {
+            return Some(format!(
+                "{} coincident duplicate node(s)",
+                self.coincident_points
+            ));
+        }
+        if self.overlapping_pairs > 0 {
+            return Some(format!(
+                "{} geometrically overlapping cell pair(s)",
+                self.overlapping_pairs
+            ));
+        }
+        if self.outside_cells > 0 {
+            return Some(format!(
+                "{} cell(s) extend outside the domain",
+                self.outside_cells
+            ));
+        }
+        if !self.area_error.is_finite() || self.area_error > self.area_tolerance {
+            return Some(format!(
+                "mesh area differs from domain area by {:.3e} (tolerance {:.3e})",
+                self.area_error, self.area_tolerance
+            ));
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CellGeometry {
+    vertices: Vec<[f64; 2]>,
+    centroid: [f64; 2],
+    min: [f64; 2],
+    max: [f64; 2],
+}
+
+/// Run the full planar geometric acceptance checks.
+///
+/// Structural validation runs first, so malformed indices return [`MeshError`]
+/// instead of reaching geometric code. Area uses a relative `1e-8` tolerance;
+/// containment uses `1e-12` of the domain diagonal only to absorb round-off.
+/// The check assumes the simple, convex cells required by [`Gate`]. Inverted or
+/// self-intersecting cells remain the quality gate's responsibility.
+pub fn geometry(
+    domain: &crate::two_d::Domain,
+    mesh: &Mesh,
+) -> Result<GeometryReport, crate::mesh::MeshError> {
+    mesh.validate()?;
+    let topology = mesh.topology();
+    let mut used = vec![false; mesh.points.len()];
+    for cell in &mesh.cells {
+        for &id in &cell.nodes {
+            used[id] = true;
+        }
+    }
+    let mut coincident: HashMap<(u64, u64, u64), usize> = HashMap::new();
+    for (id, &p) in mesh.points.iter().enumerate() {
+        if used[id] {
+            *coincident.entry(coordinate_key(p)).or_default() += 1;
+        }
+    }
+    let coincident_points = coincident.values().map(|n| n.saturating_sub(1)).sum();
+
+    let mut cells = Vec::with_capacity(mesh.cells.len());
+    let mut unsupported_cells = 0usize;
+    let mut area = 0.0;
+    let mut compensation = 0.0;
+    for cell in &mesh.cells {
+        if cell.kind == Kind::Hex8 {
+            unsupported_cells += 1;
+            continue;
+        }
+        let value = quality::volume(cell, &mesh.points).abs();
+        let y = value - compensation;
+        let t = area + y;
+        compensation = (t - area) - y;
+        area = t;
+        cells.push(cell_geometry(&mesh.points, cell));
+    }
+
+    let overlapping_pairs = count_geometric_overlaps(&cells);
+    let domain_area = domain.area();
+    let area_error = if domain_area.is_finite() && domain_area > 0.0 && area.is_finite() {
+        (area - domain_area).abs()
+    } else {
+        f64::INFINITY
+    };
+    let area_tolerance = if domain_area.is_finite() && domain_area > 0.0 {
+        1.0e-8 * domain_area
+    } else {
+        0.0
+    };
+    let outside_cells = if unsupported_cells == 0 {
+        (0..mesh.cells.len())
+            .filter(|&id| cell_extends_outside(domain, &mesh.points, &mesh.cells[id], &cells[id]))
+            .count()
+    } else {
+        0
+    };
+
+    Ok(GeometryReport {
+        overlapping_pairs,
+        outside_cells,
+        coincident_points,
+        non_manifold_edges: topology.non_manifold,
+        inconsistent_edges: topology.inconsistent,
+        unsupported_cells,
+        area_error,
+        area_tolerance,
+    })
+}
+
+fn coordinate_key(p: crate::mesh::Node) -> (u64, u64, u64) {
+    fn bits(x: f64) -> u64 {
+        if x == 0.0 {
+            0.0f64.to_bits()
+        } else {
+            x.to_bits()
+        }
+    }
+    (bits(p[0]), bits(p[1]), bits(p[2]))
+}
+
+fn cell_geometry(points: &[crate::mesh::Node], cell: &crate::mesh::Cell) -> CellGeometry {
+    let mut vertices = Vec::with_capacity(cell.nodes.len());
+    let mut centroid = [0.0; 2];
+    let mut min = [f64::INFINITY; 2];
+    let mut max = [f64::NEG_INFINITY; 2];
+    for &id in &cell.nodes {
+        let p = [points[id][0], points[id][1]];
+        vertices.push(p);
+        centroid[0] += p[0] / cell.nodes.len() as f64;
+        centroid[1] += p[1] / cell.nodes.len() as f64;
+        min[0] = min[0].min(p[0]);
+        min[1] = min[1].min(p[1]);
+        max[0] = max[0].max(p[0]);
+        max[1] = max[1].max(p[1]);
+    }
+    CellGeometry {
+        vertices,
+        centroid,
+        min,
+        max,
+    }
+}
+
+fn count_geometric_overlaps(cells: &[CellGeometry]) -> usize {
+    let mut order: Vec<usize> = (0..cells.len()).collect();
+    order.sort_by(|&a, &b| {
+        cells[a].min[0]
+            .total_cmp(&cells[b].min[0])
+            .then_with(|| a.cmp(&b))
+    });
+    let mut active: Vec<usize> = Vec::new();
+    let mut overlapping = 0usize;
+    for current in order {
+        active.retain(|&other| cells[other].max[0] >= cells[current].min[0]);
+        for &other in &active {
+            if boxes_overlap(&cells[other], &cells[current])
+                && polygons_overlap(&cells[other], &cells[current])
+            {
+                overlapping += 1;
+            }
+        }
+        active.push(current);
+    }
+    overlapping
+}
+
+fn boxes_overlap(a: &CellGeometry, b: &CellGeometry) -> bool {
+    a.min[0] <= b.max[0] && a.max[0] >= b.min[0] && a.min[1] <= b.max[1] && a.max[1] >= b.min[1]
+}
+
+fn polygons_overlap(a: &CellGeometry, b: &CellGeometry) -> bool {
+    for i in 0..a.vertices.len() {
+        let a0 = a.vertices[i];
+        let a1 = a.vertices[(i + 1) % a.vertices.len()];
+        for j in 0..b.vertices.len() {
+            let b0 = b.vertices[j];
+            let b1 = b.vertices[(j + 1) % b.vertices.len()];
+            if proper_segment_intersection(a0, a1, b0, b1) {
+                return true;
+            }
+        }
+    }
+    if a.vertices
+        .iter()
+        .any(|&p| strictly_inside_convex(p, &b.vertices))
+        || b.vertices
+            .iter()
+            .any(|&p| strictly_inside_convex(p, &a.vertices))
+    {
+        return true;
+    }
+    strictly_inside_convex(a.centroid, &b.vertices)
+        || strictly_inside_convex(b.centroid, &a.vertices)
+}
+
+fn cross(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> f64 {
+    (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+}
+
+fn proper_segment_intersection(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    let ab_c = cross(a, b, c);
+    let ab_d = cross(a, b, d);
+    let cd_a = cross(c, d, a);
+    let cd_b = cross(c, d, b);
+    ((ab_c > 0.0 && ab_d < 0.0) || (ab_c < 0.0 && ab_d > 0.0))
+        && ((cd_a > 0.0 && cd_b < 0.0) || (cd_a < 0.0 && cd_b > 0.0))
+}
+
+fn strictly_inside_convex(p: [f64; 2], polygon: &[[f64; 2]]) -> bool {
+    let mut sign = 0i8;
+    for i in 0..polygon.len() {
+        let value = cross(polygon[i], polygon[(i + 1) % polygon.len()], p);
+        if value == 0.0 {
+            return false;
+        }
+        let current = if value > 0.0 { 1 } else { -1 };
+        if sign == 0 {
+            sign = current;
+        } else if sign != current {
+            return false;
+        }
+    }
+    sign != 0
+}
+
+fn cell_extends_outside(
+    domain: &crate::two_d::Domain,
+    points: &[crate::mesh::Node],
+    cell: &crate::mesh::Cell,
+    geometry: &CellGeometry,
+) -> bool {
+    let tolerance = 1.0e-12 * domain_diagonal(domain);
+    let inside = |p: [f64; 2]| domain.contains(p) || domain.distance_to_boundary(p) <= tolerance;
+    if cell.nodes.iter().any(|&id| points[id][2].abs() > tolerance)
+        || geometry.vertices.iter().any(|&p| !inside(p))
+        || !inside(geometry.centroid)
+    {
+        return true;
+    }
+    let segments = domain.segments();
+    for i in 0..geometry.vertices.len() {
+        let a = geometry.vertices[i];
+        let b = geometry.vertices[(i + 1) % geometry.vertices.len()];
+        let midpoint = [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])];
+        if !inside(midpoint)
+            || segments
+                .iter()
+                .any(|&(c, d)| proper_segment_intersection(a, b, c, d))
+        {
+            return true;
+        }
+    }
+    for &(a, b) in &segments {
+        let midpoint = [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])];
+        if strictly_inside_convex(a, &geometry.vertices)
+            || strictly_inside_convex(b, &geometry.vertices)
+            || strictly_inside_convex(midpoint, &geometry.vertices)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn domain_diagonal(domain: &crate::two_d::Domain) -> f64 {
+    let mut min = [f64::INFINITY; 2];
+    let mut max = [f64::NEG_INFINITY; 2];
+    for (a, b) in domain.segments() {
+        for p in [a, b] {
+            min[0] = min[0].min(p[0]);
+            min[1] = min[1].min(p[1]);
+            max[0] = max[0].max(p[0]);
+            max[1] = max[1].max(p[1]);
+        }
+    }
+    ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2))
+        .sqrt()
+        .max(1.0e-12)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -513,5 +854,171 @@ mod tests {
         mesh.cells.push(Cell::tri3([0, 1, 2]));
         let g = gate(&mesh);
         assert_eq!(g.reason().unwrap_or_default(), "1 triangle(s) left");
+    }
+
+    fn two_quad_rectangle() -> (crate::two_d::Domain, Mesh) {
+        let domain = crate::two_d::Domain::rectangle(2.0, 1.0).unwrap();
+        let mesh = Mesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [2.0, 1.0, 0.0],
+            ],
+            vec![Cell::quad4([0, 1, 4, 3]), Cell::quad4([1, 2, 5, 4])],
+        );
+        (domain, mesh)
+    }
+
+    #[test]
+    fn strict_geometry_accepts_a_shared_edge_and_full_coverage() {
+        let (domain, mesh) = two_quad_rectangle();
+        let report = geometry(&domain, &mesh).unwrap();
+        assert!(report.passes(), "{report:?}");
+        assert_eq!(report.overlapping_pairs, 0);
+        assert_eq!(report.area_error, 0.0);
+    }
+
+    #[test]
+    fn strict_geometry_ignores_unused_duplicate_point_entries() {
+        let (domain, mut mesh) = two_quad_rectangle();
+        mesh.points.push([0.0, 0.0, 0.0]);
+        mesh.points.push([1.0, 1.0, 0.0]);
+        let report = geometry(&domain, &mesh).unwrap();
+        assert_eq!(report.coincident_points, 0);
+        assert!(report.passes(), "{report:?}");
+    }
+
+    #[test]
+    fn strict_geometry_detects_overlap_without_shared_node_indices() {
+        let domain = crate::two_d::Domain::rectangle(3.0, 3.0).unwrap();
+        let mesh = Mesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 2.0, 0.0],
+                [0.0, 2.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [3.0, 1.0, 0.0],
+                [3.0, 3.0, 0.0],
+                [1.0, 3.0, 0.0],
+            ],
+            vec![Cell::quad4([0, 1, 2, 3]), Cell::quad4([4, 5, 6, 7])],
+        );
+        assert_eq!(gate(&mesh).overlapping, 0);
+        let report = geometry(&domain, &mesh).unwrap();
+        assert_eq!(report.overlapping_pairs, 1);
+        assert!(!report.passes());
+    }
+
+    #[test]
+    fn strict_geometry_detects_a_duplicated_cell_with_new_indices() {
+        let domain = crate::two_d::Domain::rectangle(1.0, 1.0).unwrap();
+        let points = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let mesh = Mesh::new(
+            points,
+            vec![Cell::quad4([0, 1, 2, 3]), Cell::quad4([4, 5, 6, 7])],
+        );
+        let report = geometry(&domain, &mesh).unwrap();
+        assert_eq!(report.overlapping_pairs, 1);
+        assert_eq!(report.coincident_points, 4);
+        assert!(!report.passes());
+    }
+
+    #[test]
+    fn strict_geometry_rejects_missing_domain_area() {
+        let domain = crate::two_d::Domain::rectangle(2.0, 2.0).unwrap();
+        let report = geometry(&domain, &unit_quad()).unwrap();
+        assert_eq!(report.overlapping_pairs, 0);
+        assert_eq!(report.outside_cells, 0);
+        assert_eq!(report.area_error, 3.0);
+        assert!(!report.passes());
+        assert!(report.reason().unwrap_or_default().contains("area"));
+    }
+
+    #[test]
+    fn strict_geometry_rejects_a_cell_outside_with_the_right_area() {
+        let domain = crate::two_d::Domain::rectangle(1.0, 1.0).unwrap();
+        let mesh = Mesh::new(
+            vec![
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [3.0, 1.0, 0.0],
+                [2.0, 1.0, 0.0],
+            ],
+            vec![Cell::quad4([0, 1, 2, 3])],
+        );
+        let report = geometry(&domain, &mesh).unwrap();
+        assert!(report.area_error < 1.0e-12);
+        assert_eq!(report.outside_cells, 1);
+        assert!(!report.passes());
+    }
+
+    #[test]
+    fn strict_geometry_rejects_a_cell_covering_a_hole() {
+        let domain = crate::two_d::Domain::new(
+            vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]],
+            vec![vec![[1.5, 1.5], [2.5, 1.5], [2.5, 2.5], [1.5, 2.5]]],
+        )
+        .unwrap();
+        let mesh = Mesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [4.0, 4.0, 0.0],
+                [0.0, 4.0, 0.0],
+            ],
+            vec![Cell::quad4([0, 1, 2, 3])],
+        );
+        let report = geometry(&domain, &mesh).unwrap();
+        assert_eq!(report.outside_cells, 1);
+        assert_eq!(report.area_error, 1.0);
+        assert!(!report.passes());
+    }
+
+    #[test]
+    fn strict_geometry_rejects_non_manifold_edges() {
+        let domain = crate::two_d::Domain::rectangle(1.0, 1.0).unwrap();
+        let mesh = Mesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.5, 1.0, 0.0],
+                [0.5, -1.0, 0.0],
+            ],
+            vec![
+                Cell::tri3([0, 1, 2]),
+                Cell::tri3([1, 0, 3]),
+                Cell::tri3([0, 1, 3]),
+            ],
+        );
+        let report = geometry(&domain, &mesh).unwrap();
+        assert_eq!(report.non_manifold_edges, 1);
+        assert!(!report.passes());
+    }
+
+    #[test]
+    fn strict_geometry_validates_indices_before_geometric_access() {
+        let domain = crate::two_d::Domain::rectangle(1.0, 1.0).unwrap();
+        let mesh = Mesh::new(vec![[0.0, 0.0, 0.0]; 4], vec![Cell::quad4([0, 1, 2, 9])]);
+        assert_eq!(
+            geometry(&domain, &mesh),
+            Err(crate::mesh::MeshError::IndexOutOfRange {
+                cell: 0,
+                node: 3,
+                index: 9,
+            })
+        );
     }
 }

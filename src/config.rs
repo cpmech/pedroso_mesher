@@ -493,10 +493,10 @@ pub fn generate(
 /// [`crate::quad::Route::Front`] because this adapter only wraps the front
 /// pipeline, while the new `generator` field records the actual [`Route`].
 ///
-/// Note: unlike [`crate::quad::mesh_quads`], this adapter enforces the mesh gate
-/// but not its separate boundary/corner offset checks. The offsets are carried
-/// in [`crate::quad::Stats`], so a caller that needs the full geometry contract
-/// must test them or call the front route directly.
+/// In addition to the mesh gate, this adapter enforces boundary/corner
+/// conformity and the full [`crate::verify::geometry`] contract. A geometric
+/// failure is [`crate::quad::QuadError::Unsupported`] and carries the mesh for
+/// diagnosis, just like a quality failure.
 pub fn generate_quad(
     domain: &Domain,
     sizing: &Sizing,
@@ -548,6 +548,22 @@ pub fn generate_quad(
             timing,
             route: Conversion::Front,
             reason: gate.reason().unwrap_or_default(),
+            refusals,
+            mesh: out.mesh,
+        })));
+    }
+    let geometry_reason = match crate::verify::geometry(domain, &out.mesh) {
+        Ok(report) => report.reason(),
+        Err(e) => Some(format!("invalid mesh: {e}")),
+    };
+    if let Some(reason) = geometry_reason {
+        return Err(QuadError::Unsupported(Box::new(Unsupported {
+            gate,
+            raw_gate: gate,
+            stats,
+            timing,
+            route: Conversion::Front,
+            reason,
             refusals,
             mesh: out.mesh,
         })));

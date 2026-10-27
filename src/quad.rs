@@ -419,8 +419,6 @@ pub fn mesh_quads_with_route(
             mesh,
         })));
     }
-    // Last: the quality/topology gate. Geometry is already known good, so the
-    // reported reason is about the mesh itself.
     if !gate.passes() {
         return Err(QuadError::Unsupported(Box::new(Unsupported {
             gate,
@@ -429,6 +427,25 @@ pub fn mesh_quads_with_route(
             timing,
             route,
             reason: gate.reason().unwrap_or_default(),
+            refusals,
+            mesh,
+        })));
+    }
+    // The fast gate cannot see intersections between cells with disjoint node
+    // indices or prove domain coverage. Run the full geometric contract once at
+    // the final API boundary, after all generation and quality passes.
+    let geometry_reason = match verify::geometry(domain, &mesh) {
+        Ok(report) => report.reason(),
+        Err(e) => Some(format!("invalid mesh: {e}")),
+    };
+    if let Some(reason) = geometry_reason {
+        return Err(QuadError::Unsupported(Box::new(Unsupported {
+            gate,
+            raw_gate,
+            stats,
+            timing,
+            route,
+            reason,
             refusals,
             mesh,
         })));
