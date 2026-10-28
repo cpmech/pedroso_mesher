@@ -2534,6 +2534,35 @@ mod tests {
         assert!(gate.passes(), "{:?}", gate.reason());
     }
 
+    /// The dense one-hole O-grid passes raw; the common external post-pass
+    /// must not degrade its first hole ring below the acceptance gate.
+    #[test]
+    fn dense_hole_o_grid_survives_common_post_smoothing() {
+        let domain = Domain::plate_with_hole(100.0, 60.0, 10.0, 48).unwrap();
+        let size = 1.0;
+        let mesh = check_all_quads(&domain, size);
+        let raw = verify::gate(&mesh);
+        assert!(raw.passes(), "raw mesh: {:?}", raw.reason());
+
+        let options = crate::smooth::SmoothOptions {
+            iterations: 80,
+            move_boundary: true,
+            perturb_rounds: 200,
+            reject_if_worse: false,
+            shape_pass: false,
+            ..crate::smooth::SmoothOptions::default()
+        };
+        let targets = vec![size; mesh.points.len()];
+        let post = crate::smooth::smooth_with_targets(&domain, &mesh, &targets, &options).smoothed;
+
+        let offset = verify::boundary_offset(&domain, &post);
+        assert!(offset < 1.0e-9, "boundary offset {offset}");
+        assert_eq!(post.topology().cracks, 0, "cracks");
+        let gate = verify::gate(&post);
+        assert!(gate.min_scaled_jacobian > 0.0, "post mesh: {gate:?}");
+        assert!(gate.passes(), "post mesh: {:?}", gate.reason());
+    }
+
     /// A three-corner domain is refused with an error mentioning
     /// "triangular" (the three-sided template is not implemented); it must not
     /// fall back to a quad mesh.
