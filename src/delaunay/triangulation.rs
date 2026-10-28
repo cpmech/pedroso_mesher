@@ -146,6 +146,14 @@ impl Triangulation {
     /// input vertex and constraint is preserved and every output triangle is
     /// counter-clockwise and locally Delaunay away from constraints.
     pub fn from_domain(domain: &Domain) -> Result<Self, TriangulationError> {
+        Self::from_domain_and_points(domain, std::iter::empty())
+    }
+
+    /// Bulk constructor for a domain and a fixed set of additional points.
+    pub fn from_domain_and_points<I>(domain: &Domain, points: I) -> Result<Self, TriangulationError>
+    where
+        I: IntoIterator<Item = Point>,
+    {
         let mut input_points = Vec::new();
         for region in domain.regions() {
             input_points.extend_from_slice(region.boundary().points());
@@ -159,6 +167,7 @@ impl Triangulation {
         for feature in domain.features() {
             input_points.extend_from_slice(feature.path());
         }
+        let additional_points: Vec<Point> = points.into_iter().collect();
         let (minimum, maximum) = point_bounds(&input_points)?;
         let span = (maximum[0] - minimum[0]).max(maximum[1] - minimum[1]);
         if !span.is_finite() || span <= 0.0 {
@@ -183,7 +192,8 @@ impl Triangulation {
         let mut mesh = Self::new(artificial, vec![Triangle::new([0, 1, 2], 0)], temporary)?;
         let mut ids = BTreeMap::new();
         for point in input_points {
-            let vertex = mesh.insert_point(point)?;
+            let vertex = mesh.insert_point_unlegalized(point)?;
+            mesh.legalize_vertex(vertex)?;
             ids.insert(coordinate_key(point), vertex);
         }
 
@@ -229,7 +239,7 @@ impl Triangulation {
                 }
                 let a = lookup_vertex(&ids, pair[0])?;
                 let b = lookup_vertex(&ids, pair[1])?;
-                mesh.recover_constraint(Constraint::new(
+                mesh.recover_constraint_inner(Constraint::new(
                     [a, b],
                     feature.marker(),
                     ConstraintKind::Feature,
@@ -247,6 +257,18 @@ impl Triangulation {
             )));
         }
         mesh.legalize_inner()?;
+        let mut known: BTreeSet<(u64, u64)> = mesh
+            .points
+            .iter()
+            .map(|point| coordinate_key(*point))
+            .collect();
+        for point in additional_points {
+            if !known.insert(coordinate_key(point)) {
+                continue;
+            }
+            let vertex = mesh.insert_point_unlegalized(point)?;
+            mesh.legalize_vertex(vertex)?;
+        }
         mesh.validate()?;
         let area_error = (mesh.area() - domain.area()).abs();
         let tolerance = 1.0e-8 * domain.area().abs().max(f64::MIN_POSITIVE);
@@ -271,7 +293,7 @@ impl Triangulation {
         for index in 0..points.len() {
             let a = lookup_vertex(ids, points[index])?;
             let b = lookup_vertex(ids, points[(index + 1) % points.len()])?;
-            self.recover_constraint(Constraint::new([a, b], marker, kind, source))?;
+            self.recover_constraint_inner(Constraint::new([a, b], marker, kind, source))?;
         }
         Ok(())
     }
@@ -385,6 +407,42 @@ impl Triangulation {
     /// Insert a new point strictly inside a triangle or in the relative
     /// interior of an existing edge, then restore the local Delaunay property.
     pub fn insert_point(&mut self, point: Point) -> Result<usize, TriangulationError> {
+        self.insert_point_transaction(point, true)
+    }
+
+    pub(crate) fn insert_point_local(&mut self, point: Point) -> Result<usize, TriangulationError> {
+        self.insert_point_transaction(point, false)
+    }
+
+    fn insert_point_transaction(
+        &mut self,
+        point: Point,
+        validate: bool,
+    ) -> Result<usize, TriangulationError> {
+        let original = self.clone();
+        let old_area = self.area();
+        let vertex = match self.insert_point_unlegalized(point) {
+            Ok(vertex) => vertex,
+            Err(error) => {
+                *self = original;
+                return Err(error);
+            }
+        };
+        let result = self.legalize_vertex(vertex).and_then(|()| {
+            if validate {
+                self.finish_mutation(old_area)
+            } else {
+                self.check_mutation_area(old_area)
+            }
+        });
+        if let Err(error) = result {
+            *self = original;
+            return Err(error);
+        }
+        Ok(vertex)
+    }
+
+    fn insert_point_unlegalized(&mut self, point: Point) -> Result<usize, TriangulationError> {
         if !point[0].is_finite() || !point[1].is_finite() {
             return Err(TriangulationError::NonFinitePoint(self.points.len()));
         }
@@ -396,25 +454,12 @@ impl Triangulation {
             return Err(TriangulationError::DuplicatePoint(index));
         }
         let location = self.locate(point)?;
-        let original = self.clone();
-        let old_area = self.area();
         let vertex = self.points.len();
         self.points.push(point);
-        let mutation = match location {
+        match location {
             Location::Interior(triangle) => self.insert_in_triangle(triangle, vertex),
             Location::Edge(edge) => self.insert_on_edge(edge, vertex),
-        };
-        if let Err(error) = mutation {
-            *self = original;
-            return Err(error);
-        }
-        if let Err(error) = self
-            .legalize_inner()
-            .and_then(|()| self.finish_mutation(old_area))
-        {
-            *self = original;
-            return Err(error);
-        }
+        }?;
         Ok(vertex)
     }
 
@@ -536,7 +581,6 @@ impl Triangulation {
                     return Ok(());
                 }
                 self.constraints.insert(wanted, constraint);
-                self.validate()?;
                 return Ok(());
             }
 
@@ -561,7 +605,6 @@ impl Triangulation {
             };
             self.triangles[flip.first] = flip.first_triangle;
             self.triangles[flip.second] = flip.second_triangle;
-            self.validate()?;
             flips += 1;
             if flips > budget {
                 return Err(TriangulationError::RecoveryLimit);
@@ -667,7 +710,7 @@ impl Triangulation {
     }
 
     fn locate(&self, point: Point) -> Result<Location, TriangulationError> {
-        for (triangle_index, triangle) in self.triangles.iter().enumerate() {
+        for (triangle_index, triangle) in self.triangles.iter().enumerate().rev() {
             let [a, b, c] = triangle.vertices;
             let sides = [
                 orient2d(self.points[a], self.points[b], point),
@@ -776,6 +819,62 @@ impl Triangulation {
         Ok(())
     }
 
+    fn legalize_vertex(&mut self, vertex: usize) -> Result<(), TriangulationError> {
+        let mut pending = Vec::new();
+        for triangle in &self.triangles {
+            if let Some(local) = triangle.vertices.iter().position(|id| *id == vertex) {
+                pending.push(edge_key(
+                    triangle.vertices[(local + 1) % 3],
+                    triangle.vertices[(local + 2) % 3],
+                ));
+            }
+        }
+        pending.sort_unstable();
+        pending.dedup();
+        let budget = self
+            .triangles
+            .len()
+            .saturating_mul(20)
+            .clamp(1_000, 2_000_000);
+        let mut flips = 0usize;
+        while let Some(edge) = pending.pop() {
+            if self.constraints.contains_key(&edge) {
+                continue;
+            }
+            let incident = self.edge_incident(edge)?;
+            if incident.len() != 2 {
+                continue;
+            }
+            let first_opposite = self.triangles[incident[0].0].vertices[(incident[0].1 + 2) % 3];
+            let second_opposite = self.triangles[incident[1].0].vertices[(incident[1].1 + 2) % 3];
+            let incident = if first_opposite == vertex {
+                incident
+            } else if second_opposite == vertex {
+                vec![incident[1], incident[0]]
+            } else {
+                continue;
+            };
+            let Some(flip) = self.prepare_flip(edge, incident, true) else {
+                continue;
+            };
+            for triangle in [flip.first_triangle, flip.second_triangle] {
+                if let Some(local) = triangle.vertices.iter().position(|id| *id == vertex) {
+                    pending.push(edge_key(
+                        triangle.vertices[(local + 1) % 3],
+                        triangle.vertices[(local + 2) % 3],
+                    ));
+                }
+            }
+            self.triangles[flip.first] = flip.first_triangle;
+            self.triangles[flip.second] = flip.second_triangle;
+            flips += 1;
+            if flips > budget {
+                return Err(TriangulationError::LegalisationLimit);
+            }
+        }
+        Ok(())
+    }
+
     fn legalize_inner(&mut self) -> Result<(), TriangulationError> {
         let budget = self
             .triangles
@@ -801,7 +900,6 @@ impl Triangulation {
             };
             self.triangles[flip.first] = flip.first_triangle;
             self.triangles[flip.second] = flip.second_triangle;
-            self.validate()?;
             flips += 1;
             if flips > budget {
                 return Err(TriangulationError::LegalisationLimit);
@@ -851,6 +949,36 @@ impl Triangulation {
         })
     }
 
+    fn edge_incident(&self, edge: [usize; 2]) -> Result<Vec<(usize, usize)>, TriangulationError> {
+        let mut incident = Vec::with_capacity(2);
+        for (triangle_index, triangle) in self.triangles.iter().enumerate() {
+            for local in 0..3 {
+                let a = triangle.vertices[local];
+                let b = triangle.vertices[(local + 1) % 3];
+                if edge_key(a, b) == edge {
+                    incident.push((triangle_index, local));
+                }
+            }
+        }
+        if incident.len() > 2 {
+            return Err(TriangulationError::InvalidMesh(format!(
+                "edge {edge:?} has more than two incident triangles"
+            )));
+        }
+        if incident.len() == 2 {
+            let first = incident[0];
+            let second = incident[1];
+            let first_edge = directed_edge(self.triangles[first.0], first.1);
+            let second_edge = directed_edge(self.triangles[second.0], second.1);
+            if first_edge.0 != second_edge.1 || first_edge.1 != second_edge.0 {
+                return Err(TriangulationError::InvalidMesh(format!(
+                    "edge {edge:?} has inconsistently oriented neighbours"
+                )));
+            }
+        }
+        Ok(incident)
+    }
+
     fn edge_uses(&self) -> Result<BTreeMap<[usize; 2], Vec<(usize, usize)>>, TriangulationError> {
         let mut result = BTreeMap::new();
         for (triangle_index, triangle) in self.triangles.iter().enumerate() {
@@ -886,6 +1014,10 @@ impl Triangulation {
 
     fn finish_mutation(&self, old_area: f64) -> Result<(), TriangulationError> {
         self.validate()?;
+        self.check_mutation_area(old_area)
+    }
+
+    fn check_mutation_area(&self, old_area: f64) -> Result<(), TriangulationError> {
         let new_area = self.area();
         let tolerance = 128.0 * f64::EPSILON * old_area.abs().max(new_area.abs());
         if !new_area.is_finite() || (new_area - old_area).abs() > tolerance {

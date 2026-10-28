@@ -236,12 +236,27 @@ fn mesh_row(
 
 fn main() {
     let mut adversarial = false;
+    let mut selected = Vec::new();
+    let mut selected_part = None;
     let mut path = "/tmp/pedroso_mesher/phase-a/baselines.csv".to_string();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
             "--adversarial" => adversarial = true,
+            "--route" => {
+                i += 1;
+                let route = Route::ALL
+                    .iter()
+                    .copied()
+                    .find(|route| route.name() == args[i])
+                    .unwrap();
+                selected.push(route);
+            }
+            "--part" => {
+                i += 1;
+                selected_part = Some(args[i].clone());
+            }
             "--output" => {
                 i += 1;
                 path = args[i].clone();
@@ -250,7 +265,9 @@ fn main() {
         }
         i += 1;
     }
-    let routes: &[Route] = if adversarial {
+    let routes: &[Route] = if !selected.is_empty() {
+        &selected
+    } else if adversarial {
         &ADVERSARIAL_ROUTES
     } else {
         &Route::ALL
@@ -264,6 +281,12 @@ fn main() {
     let mut records = 0usize;
     for &route in routes {
         for &name in names {
+            if selected_part
+                .as_ref()
+                .is_some_and(|selected| selected != name)
+            {
+                continue;
+            }
             let (domain, size) = part(name).unwrap();
             let sizing = Sizing::uniform(size).unwrap();
             for stage in ["raw", "post"] {

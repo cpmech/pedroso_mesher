@@ -84,6 +84,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+use crate::delaunay::CdtAdapter;
 use crate::mesh::{Cell, Mesh, Node};
 use crate::parity;
 use crate::two_d::{Domain, Sizing};
@@ -705,13 +706,10 @@ fn field_aligned_triangulation(
     domain: &Domain,
     sizing: &Sizing,
 ) -> Result<(Vec<Node>, Vec<[usize; 3]>), String> {
-    use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
-
     let size = sizing.size;
     if !size.is_finite() || size <= 0.0 {
         return Err("bad size".to_string());
     }
-    let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
 
     // Boundary samples, at most 1.1 * size apart, then their constraints.
     let mut loops: Vec<Vec<[f64; 2]>> = Vec::new();
@@ -729,23 +727,11 @@ fn field_aligned_triangulation(
         }
         loops.push(sampled);
     }
-    for cycle in &loops {
-        for &[x, y] in cycle {
-            cdt.insert(Point2::new(x, y))
-                .map_err(|_| "a boundary point could not be inserted".to_string())?;
-        }
-        for i in 0..cycle.len() {
-            let a = cycle[i];
-            let b = cycle[(i + 1) % cycle.len()];
-            cdt.add_constraint_edge(Point2::new(a[0], a[1]), Point2::new(b[0], b[1]))
-                .map_err(|_| "a boundary edge could not be constrained".to_string())?;
-        }
-    }
 
     // One row following the boundary at ~0.8 size inside it. This is the piece
     // of the paper's frontal boundary layer that keeps boundary quads from
     // carrying two boundary edges (which makes them flat on a curved boundary).
-    let mut ring_points: Vec<[f64; 2]> = Vec::new();
+    let mut extra_points = Vec::new();
     let mut all_ring: Vec<[f64; 2]> = loops.iter().flatten().copied().collect();
     let offset = 0.8 * size;
     let probe = 0.5 * size;
@@ -778,10 +764,8 @@ fn field_aligned_triangulation(
             if too_close {
                 continue;
             }
-            if cdt.insert(Point2::new(p[0], p[1])).is_ok() {
-                ring_points.push(p);
-                all_ring.push(p);
-            }
+            extra_points.push(p);
+            all_ring.push(p);
         }
     }
 
@@ -811,7 +795,7 @@ fn field_aligned_triangulation(
                     .iter()
                     .any(|q| (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) < exclusion);
                 if !near {
-                    let _ = cdt.insert(Point2::new(x, y));
+                    extra_points.push(p);
                 }
             }
             y += size;
@@ -819,27 +803,18 @@ fn field_aligned_triangulation(
         x += size;
     }
 
-    // Keep the inner faces whose centroid is inside the domain (the hole loops
-    // are constraints, so faces inside a hole must be discarded).
+    let Some((outer, holes)) = loops.split_first() else {
+        return Err("the field-aligned triangulation has no outer loop".to_string());
+    };
+    let cdt = CdtAdapter::from_loops_and_points(outer.clone(), holes.to_vec(), extra_points)
+        .map_err(|error| format!("the field-aligned CDT failed: {error}"))?;
     let mut points: Vec<Node> = Vec::new();
     let mut index_of: HashMap<(u64, u64), usize> = HashMap::new();
     let mut tris: Vec<[usize; 3]> = Vec::new();
-    for face in cdt.inner_faces() {
-        let vertices = face.vertices();
-        let mut tri = [[0.0f64; 2]; 3];
-        for (slot, vertex) in vertices.iter().enumerate() {
-            let p = vertex.position();
-            tri[slot] = [p.x, p.y];
-        }
-        let centroid = [
-            (tri[0][0] + tri[1][0] + tri[2][0]) / 3.0,
-            (tri[0][1] + tri[1][1] + tri[2][1]) / 3.0,
-        ];
-        if !domain.contains(centroid) {
-            continue;
-        }
+    for triangle in cdt.triangles() {
         let mut ids = [0usize; 3];
-        for (slot, p) in tri.iter().enumerate() {
+        for (slot, vertex) in triangle.vertices.iter().enumerate() {
+            let p = cdt.points()[*vertex];
             let key = (p[0].to_bits(), p[1].to_bits());
             let id = *index_of.entry(key).or_insert_with(|| {
                 points.push([p[0], p[1], 0.0]);

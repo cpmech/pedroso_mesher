@@ -79,9 +79,11 @@
 //! on the stepped part, and the full front on the ring and the L-bracket. The
 //! choice is made after all four runs, so it costs four `generate` calls.
 //!
-//! **Measured.** All seven corpus parts are all-quad, conforming and pass the
-//! gate after the common post-pass (7/7 post; post SJ 0.23-0.78, minimum angle
-//! 30-55°). The 0.6 mm performance part needs the pre-walk fallback: it grows
+//! **Measured.** All seven corpus parts are all-quad and conforming; six pass
+//! the gate after the common post-pass with the clean-room CDT (post SJ
+//! 0.28-0.71, minimum angle 29.7-51.9°). The ring is below the gate (SJ 0.283,
+//! minimum angle 29.7°) after the triangulation migration. The 0.6 mm
+//! performance part needs the pre-walk fallback: it grows
 //! from 15 500 quads + 2 triangles to 20 586 quads (+5 086 quads, +33 %, and no
 //! triangles), because the cascade has to carry 48 residual triangles to the
 //! boundary. That +33 % is the price of the parity-safe fallback, and it is the
@@ -105,8 +107,8 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
+use crate::delaunay::CdtAdapter;
 use crate::mesh::{Cell, Kind, Mesh, Node};
 use crate::quality;
 use crate::sun;
@@ -1564,64 +1566,36 @@ fn close_component(
 ///
 /// A grid of candidate interior points at the element size is inserted with a
 /// `0.55 * size` clearance from the boundary, so the triangulation does not
-/// crowd the interface. Only faces whose centroid is inside the component
-/// domain are kept; this is what removes the convex-hull faces that `spade`
-/// creates outside a non-convex component. Returns `None` when the component
-/// cannot be constrained (a malformed front) or produces no face; the caller
-/// then skips the component.
+/// crowd the interface. The robust adapter removes exterior and hole faces.
+/// Returns `None` for a malformed front or an empty result; the caller then
+/// skips the component.
 fn triangulate_component(
     points: &mut Vec<Node>,
     component: &ResidualComponent,
     domain: &Domain,
     size: f64,
 ) -> Option<Vec<[usize; 3]>> {
-    let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
+    let coordinates = |ids: &[usize]| -> Option<Vec<[f64; 2]>> {
+        ids.iter()
+            .map(|id| points.get(*id).map(|point| [point[0], point[1]]))
+            .collect()
+    };
+    let outer = coordinates(&component.outer)?;
+    let holes = component
+        .holes
+        .iter()
+        .map(|hole| coordinates(hole))
+        .collect::<Option<Vec<_>>>()?;
     let mut lookup: HashMap<(u64, u64), usize> = HashMap::new();
     let mut all_boundary: Vec<usize> = component.outer.clone();
     for hole in &component.holes {
         all_boundary.extend(hole.iter().copied());
     }
     for &global in &all_boundary {
-        let p = points.get(global)?;
-        let point = Point2::new(p[0], p[1]);
-        let key = (p[0].to_bits(), p[1].to_bits());
-        // Two front loops can share a node at a pinch; spade rejects a duplicate
-        // position, so the bit key keeps only the first occurrence and the
-        // second loop reuses the same vertex through `lookup`.
-        if lookup.contains_key(&key) {
-            continue;
-        }
-        if cdt.insert(point).is_ok() {
-            lookup.insert(key, global);
-        }
-    }
-    // Constrain every loop edge. A failure here means the front is not a valid
-    // polygon (it should be by construction); skip the component rather than
-    // produce a mesh with a crack.
-    let add_loop = |cdt: &mut ConstrainedDelaunayTriangulation<Point2<f64>>,
-                    ids: &[usize],
-                    points: &[Node]|
-     -> bool {
-        let n = ids.len();
-        for i in 0..n {
-            let a = points[ids[i]];
-            let b = points[ids[(i + 1) % n]];
-            if cdt
-                .add_constraint_edge(Point2::new(a[0], a[1]), Point2::new(b[0], b[1]))
-                .is_err()
-            {
-                return false;
-            }
-        }
-        true
-    };
-    if !add_loop(&mut cdt, &component.outer, points) {
-        return None;
-    }
-    for hole in &component.holes {
-        if !add_loop(&mut cdt, hole, points) {
-            return None;
-        }
+        let point = points.get(global)?;
+        lookup
+            .entry((point[0].to_bits(), point[1].to_bits()))
+            .or_insert(global);
     }
 
     // Interior points, kept clear of the interface with the paving. The grid is
@@ -1631,56 +1605,45 @@ fn triangulate_component(
     let (xmin, xmax, ymin, ymax) = bounds_of_domain(domain);
     let step = size.max(1.0e-9);
     let margin = 0.55 * step;
+    let mut candidates = Vec::new();
     let mut x = xmin + 0.5 * step;
     while x < xmax {
         let mut y = ymin + 0.5 * step;
         while y < ymax {
             let p = [x, y];
-            if domain.contains(p) && domain.distance_to_boundary(p) > margin {
-                let point = Point2::new(x, y);
-                if cdt.insert(point).is_ok() {
-                    let global = points.len();
-                    points.push([x, y, 0.0]);
-                    lookup.insert((x.to_bits(), y.to_bits()), global);
-                }
+            let key = (x.to_bits(), y.to_bits());
+            if domain.contains(p)
+                && domain.distance_to_boundary(p) > margin
+                && !lookup.contains_key(&key)
+            {
+                candidates.push(p);
             }
             y += step;
         }
         x += step;
     }
+    let cdt = CdtAdapter::from_loops_and_points(outer, holes, candidates.clone()).ok()?;
+    for point in candidates {
+        let global = points.len();
+        points.push([point[0], point[1], 0.0]);
+        lookup.insert((point[0].to_bits(), point[1].to_bits()), global);
+    }
 
     let mut tris = Vec::new();
-    for face in cdt.inner_faces() {
-        let vertices = face.vertices();
+    for triangle in cdt.triangles() {
         let mut ids = [0usize; 3];
-        let mut p = [[0.0f64; 2]; 3];
         let mut complete = true;
-        for (k, vertex) in vertices.iter().enumerate() {
-            let q = vertex.position();
-            p[k] = [q.x, q.y];
-            let key = (q.x.to_bits(), q.y.to_bits());
-            // Every vertex should be one of the points inserted above; an
-            // unknown one would mean spade moved a point, which it does not.
-            match lookup.get(&key) {
-                Some(&global) => ids[k] = global,
+        for (slot, vertex) in triangle.vertices.iter().enumerate() {
+            let point = cdt.points()[*vertex];
+            match lookup.get(&(point[0].to_bits(), point[1].to_bits())) {
+                Some(&global) => ids[slot] = global,
                 None => {
                     complete = false;
                     break;
                 }
             }
         }
-        if !complete {
-            continue;
-        }
-        let centroid = [
-            (p[0][0] + p[1][0] + p[2][0]) / 3.0,
-            (p[0][1] + p[1][1] + p[2][1]) / 3.0,
-        ];
-        // The CDT fills the convex hull; a face between two separate loop arms
-        // (or across a hole) has a centroid outside the component and is
-        // dropped. This is the step that makes a non-convex component close
-        // without spurious faces.
-        if domain.contains(centroid) {
+        if complete {
             tris.push(ids);
         }
     }

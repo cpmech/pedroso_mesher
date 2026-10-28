@@ -41,7 +41,7 @@ use crate::parity::even_boundary_loops;
 use crate::qmorph::{convert_with_stats, Refusals};
 use crate::quality;
 use crate::sun;
-use crate::two_d::{smooth_mesh, triangulate, Domain, Sizing, TwoDError};
+use crate::two_d::{close_by_refinement, smooth_mesh, triangulate, Domain, Sizing, TwoDError};
 use crate::twostage;
 use crate::verify::{self, Gate};
 
@@ -332,6 +332,7 @@ pub fn mesh_quads_with_route(
     // is recorded in the output and in a failure so the post-passes' effect is
     // visible (a raw failure may become a passing final mesh).
     let raw_gate = verify::gate(&mesh);
+    let converted = mesh.clone();
 
     // Stages 4–6, in order: alternating smooth/walk rounds, the cavity pass if
     // triangles survive, then the quality repairs and polishing. Each stage is
@@ -339,6 +340,21 @@ pub fn mesh_quads_with_route(
     // after all of them.
     let rounds = close_rounds(&mut mesh, domain, size);
     let cavity_closures = close_cavities(&mut mesh, domain, size);
+    if !tri_cells(&mesh).is_empty() {
+        let refine = |source: &Mesh| {
+            let (quads, points, leftover) = close_by_refinement(
+                &quad_cells(source),
+                &tri_cells(source),
+                &source.points,
+                domain,
+            );
+            let candidate = Mesh::new(points, cells_of(&quads, &leftover));
+            candidate.topology().is_watertight().then_some(candidate)
+        };
+        if let Some(candidate) = refine(&mesh).or_else(|| refine(&converted)) {
+            mesh = candidate;
+        }
+    }
     let (low_repairs, degenerate_repairs, quality_swaps, perturbations) =
         quality_passes(&mut mesh, domain, size);
     let gate = verify::gate(&mesh);

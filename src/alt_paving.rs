@@ -106,8 +106,8 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
+use crate::delaunay::CdtAdapter;
 use crate::mesh::{Cell, Mesh, Node};
 use crate::quality;
 use crate::sun;
@@ -1619,82 +1619,54 @@ fn fan_fill(paving: &mut Paving, domain: &Domain) -> Result<(), String> {
 }
 
 /// Constrained Delaunay triangulation of the residual region: every live front
-/// node and front edge, plus the interior `extra` points. Faces whose centroid
-/// is outside the live loops are dropped (a hole is a constraint, so its inside
-/// is triangulated by `spade` too). Returns counter-clockwise triangles with
-/// the paving node ids, or an error when a point or constraint cannot be
-/// inserted.
+/// node and front edge, plus the interior `extra` points. Counter-clockwise
+/// loops are disjoint material regions and clockwise loops are holes. The
+/// adapter removes exterior faces before returning counter-clockwise triangles
+/// with stable paving node ids.
 fn triangulate_residual(paving: &Paving, extra: &[usize]) -> Result<Vec<[usize; 3]>, String> {
-    let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
-    let mut present: HashMap<(u64, u64), ()> = HashMap::new();
-    let mut insert = |cdt: &mut ConstrainedDelaunayTriangulation<Point2<f64>>,
-                      p: [f64; 2]|
-     -> Result<(), String> {
-        let key = (p[0].to_bits(), p[1].to_bits());
-        if present.insert(key, ()).is_none() {
-            cdt.insert(Point2::new(p[0], p[1]))
-                .map_err(|_| "a residual point could not be inserted".to_string())?;
-        }
-        Ok(())
-    };
-    for ids in &paving.loops {
-        for &id in ids {
-            insert(&mut cdt, paving.coord(id))?;
-        }
-        for i in 0..ids.len() {
-            let a = paving.coord(ids[i]);
-            let b = paving.coord(ids[(i + 1) % ids.len()]);
-            cdt.add_constraint_edge(Point2::new(a[0], a[1]), Point2::new(b[0], b[1]))
-                .map_err(|_| "a residual front edge could not be constrained".to_string())?;
-        }
-    }
-    for &id in extra {
-        insert(&mut cdt, paving.coord(id))?;
-    }
+    let mut outers = Vec::new();
+    let mut holes = Vec::new();
     let mut index_of: HashMap<(u64, u64), usize> = HashMap::new();
     for ids in &paving.loops {
-        for &id in ids {
-            let p = paving.coord(id);
-            index_of.insert((p[0].to_bits(), p[1].to_bits()), id);
+        let points: Vec<[f64; 2]> = ids.iter().map(|&id| paving.coord(id)).collect();
+        for (&id, &point) in ids.iter().zip(&points) {
+            index_of.insert((point[0].to_bits(), point[1].to_bits()), id);
+        }
+        if signed_area(&points) > 0.0 {
+            outers.push(points);
+        } else {
+            holes.push(points);
         }
     }
-    for &id in extra {
-        let p = paving.coord(id);
-        index_of.insert((p[0].to_bits(), p[1].to_bits()), id);
+    let extra_points: Vec<[f64; 2]> = extra.iter().map(|&id| paving.coord(id)).collect();
+    for (&id, &point) in extra.iter().zip(&extra_points) {
+        index_of.insert((point[0].to_bits(), point[1].to_bits()), id);
     }
+    let cdt = CdtAdapter::from_regions_and_points(outers, holes, extra_points)
+        .map_err(|error| format!("the residual front could not be triangulated: {error}"))?;
     let mut tris = Vec::new();
-    for face in cdt.inner_faces() {
-        let handles = face.vertices();
+    for triangle in cdt.triangles() {
         let mut ids = [0usize; 3];
-        let mut centroid = [0.0f64; 2];
-        let mut ok = true;
-        for k in 0..3 {
-            let p = handles[k].position();
-            let key = (p.x.to_bits(), p.y.to_bits());
-            match index_of.get(&key) {
-                Some(&id) => ids[k] = id,
+        let mut complete = true;
+        for (slot, vertex) in triangle.vertices.iter().enumerate() {
+            let point = cdt.points()[*vertex];
+            match index_of.get(&(point[0].to_bits(), point[1].to_bits())) {
+                Some(&id) => ids[slot] = id,
                 None => {
-                    ok = false;
+                    complete = false;
                     break;
                 }
             }
-            centroid[0] += p.x / 3.0;
-            centroid[1] += p.y / 3.0;
         }
-        if !ok || !point_in_loops(paving, centroid) {
+        if !complete {
             continue;
         }
         let a = paving.points[ids[0]];
         let b = paving.points[ids[1]];
         let c = paving.points[ids[2]];
         let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-        if area <= 1e-14 {
-            continue;
-        }
-        if area > 0.0 {
-            tris.push([ids[0], ids[1], ids[2]]);
-        } else {
-            tris.push([ids[0], ids[2], ids[1]]);
+        if area > 1e-14 {
+            tris.push(ids);
         }
     }
     Ok(tris)

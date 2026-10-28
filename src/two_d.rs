@@ -5,9 +5,8 @@
 //! 1. **Boundary sampling.** Every input segment is split so no piece is longer
 //!    than ~the size field (`sample_loops`); a long plate edge left as one
 //!    constrained edge would make every incident triangle a sliver.
-//! 2. **Constrained Delaunay triangulation** (`spade`, whose predicates follow
-//!    Shewchuk 1997, corpus `shewchuk-1997`), with every sampled boundary
-//!    segment inserted as a constraint.
+//! 2. **Constrained Delaunay triangulation** (the clean-room exact-predicate
+//!    kernel), with every sampled boundary segment inserted as a constraint.
 //! 3. **Ruppert/Delaunay refinement** (corpus
 //!    `shewchuk-2002-delaunay-refinement`): insert a triangle's circumcenter
 //!    when it is inside the domain, clear of the boundary and of existing
@@ -36,8 +35,8 @@
 //! only; it has no face open/close of the kind Q-Morph's clean-up uses.
 
 use mwmatching::{Matching, SENTINEL};
-use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
+use crate::delaunay::CdtAdapter;
 use crate::mesh::{Cell, Kind, Mesh, Node};
 use crate::quality;
 
@@ -969,10 +968,9 @@ fn spacing_ok(incident: &[usize], mesh: &Mesh, p: [f64; 2], v: usize, size: f64)
 
 /// Triangulate the domain and refine it to the size field.
 ///
-/// Pipeline: sample the loops (`sample_loops`), insert every sampled boundary
-/// point and constrain every sampled boundary segment in a constrained Delaunay
-/// triangulation (`spade`), refine with circumcenters (the private `refine`), and keep the
-/// triangles whose centroid is inside the domain.
+/// Pipeline: sample the loops (`sample_loops`), constrain every sampled segment
+/// in the clean-room CDT, refine with circumcenters (the private `refine`), and
+/// keep the triangles whose centroid is inside the domain.
 ///
 /// # Preconditions
 ///
@@ -1008,32 +1006,16 @@ pub fn triangulate(
     // it. A plate edge 100 mm long with a 1 mm size would otherwise be a single
     // constrained edge, and every triangle touching it would be a sliver.
     let loops = sample_loops(domain, sizing);
-    // Constrained Delaunay triangulation. The points have to be inserted before
-    // their constraint: `spade` recovers a constraint between existing vertices,
-    // it does not create the endpoints.
-    let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
-    for loop_points in &loops {
-        for &[x, y] in loop_points {
-            cdt.insert(Point2::new(x, y))
-                .map_err(|_| TwoDError::Triangulation("a boundary point could not be inserted"))?;
-        }
-        for i in 0..loop_points.len() {
-            let a = loop_points[i];
-            let b = loop_points[(i + 1) % loop_points.len()];
-            cdt.add_constraint_edge(Point2::new(a[0], a[1]), Point2::new(b[0], b[1]))
-                .map_err(|_| {
-                    TwoDError::Triangulation("a boundary edge could not be constrained")
-                })?;
-        }
-    }
+    let Some((outer, holes)) = loops.split_first() else {
+        return Err(TwoDError::Triangulation("the domain has no outer loop"));
+    };
+    let mut cdt = CdtAdapter::from_loops(outer.clone(), holes.to_vec())
+        .map_err(|_| TwoDError::Triangulation("the boundary could not be constrained"))?;
 
     // Ruppert refinement on the constrained triangulation; it only inserts
     // points, never moves a boundary vertex, so the constraints stay valid.
     refine(&mut cdt, domain, sizing);
 
-    // Triangles of the domain, keyed by spade's stable vertex indices. The
-    // filtering (centroid inside the domain) is what removes the triangles that
-    // fill a hole or lie outside the outer loop.
     let triangles = collect_triangles(&cdt, domain);
     if triangles.is_empty() {
         return Err(TwoDError::BadRequest("the domain triangulated to nothing"));
@@ -1102,17 +1084,10 @@ fn sample_loops(domain: &Domain, sizing: &Sizing) -> Vec<Vec<[f64; 2]>> {
 /// `BOUNDARY_MARGIN` and `MIN_SPACING_FRACTION` replace it. The loop is bounded
 /// by `MAX_PASSES` and `MAX_POINTS`; on either bound it returns with the current
 /// (still valid) triangulation rather than reporting an error.
-fn refine(
-    cdt: &mut ConstrainedDelaunayTriangulation<Point2<f64>>,
-    domain: &Domain,
-    sizing: &Sizing,
-) {
+fn refine(cdt: &mut CdtAdapter, domain: &Domain, sizing: &Sizing) {
     let mut grid = PointGrid::new(sizing.size);
-    for face in cdt.inner_faces() {
-        for vertex in face.vertices() {
-            let p = vertex.position();
-            grid.insert([p.x, p.y]);
-        }
+    for &point in cdt.points() {
+        grid.insert(point);
     }
     let mut inserted_total = 0usize;
     for _ in 0..MAX_PASSES {
@@ -1121,15 +1096,8 @@ fn refine(
         // circumcenter is unusable, the midpoint of the nearest boundary edge
         // (the boundary-recovery split).
         let mut candidates: Vec<[f64; 2]> = Vec::new();
-        for face in cdt.inner_faces() {
-            let vertices = face.vertices();
-            let p: Vec<[f64; 2]> = vertices
-                .iter()
-                .map(|v| {
-                    let q = v.position();
-                    [q.x, q.y]
-                })
-                .collect();
+        for triangle in cdt.triangles() {
+            let p = triangle.vertices.map(|vertex| cdt.points()[vertex]);
             if !domain.contains(centroid(&p)) {
                 continue;
             }
@@ -1173,7 +1141,7 @@ fn refine(
             if grid.nearest(center) < MIN_SPACING_FRACTION * sizing.size_at(center) {
                 continue;
             }
-            if cdt.insert(Point2::new(center[0], center[1])).is_ok() {
+            if cdt.insert_point(center).is_ok() {
                 grid.insert(center);
                 inserted += 1;
             }
@@ -1191,24 +1159,13 @@ fn refine(
 /// Hard cap on inserted points, so a bad size field cannot run away.
 const MAX_POINTS: usize = 200_000;
 
-/// Triangles whose centroid is inside the domain, as positions.
-///
-/// The centroid test is the domain filter: `spade` triangulates the convex hull
-/// of all inserted points, so the triangles filling holes or lying outside the
-/// outer loop must be discarded here. A triangle with all three vertices on the
-/// boundary but centroid outside is dropped with them.
-fn collect_triangles(
-    cdt: &ConstrainedDelaunayTriangulation<Point2<f64>>,
-    domain: &Domain,
-) -> Vec<[[f64; 2]; 3]> {
+/// Triangles whose centroid is inside the domain, as positions. The adapter
+/// has already removed exterior and hole faces; the route retains its centroid
+/// check as a defensive postcondition.
+fn collect_triangles(cdt: &CdtAdapter, domain: &Domain) -> Vec<[[f64; 2]; 3]> {
     let mut out = Vec::new();
-    for face in cdt.inner_faces() {
-        let vertices = face.vertices();
-        let mut tri = [[0.0f64; 2]; 3];
-        for (slot, vertex) in vertices.iter().enumerate() {
-            let p = vertex.position();
-            tri[slot] = [p.x, p.y];
-        }
+    for triangle in cdt.triangles() {
+        let tri = triangle.vertices.map(|vertex| cdt.points()[vertex]);
         if domain.contains(centroid(&tri)) {
             out.push(tri);
         }
@@ -1452,7 +1409,7 @@ fn quad_min_sj(q: &[[f64; 2]; 4]) -> f64 {
 /// either replaced by a valid cascade of quads or returned in `leftover`
 /// unchanged. A component that shares an edge with a triangle that is not being
 /// closed is never split, so no crack is introduced.
-fn close_by_refinement(
+pub fn close_by_refinement(
     quads: &[[usize; 4]],
     unpaired: &[[usize; 3]],
     points: &[Node],
@@ -1614,6 +1571,11 @@ fn close_one(
 
     let mut mids: std::collections::HashMap<(usize, usize), usize> =
         std::collections::HashMap::new();
+    let mut point_ids: std::collections::HashMap<(u64, u64), usize> = pts
+        .iter()
+        .enumerate()
+        .map(|(id, p)| ((p[0].to_bits(), p[1].to_bits()), id))
+        .collect();
     let mut split: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut queue: Vec<(usize, usize)> = (0..3).map(|i| (tri[i], tri[(i + 1) % 3])).collect();
     let mut steps = 0usize;
@@ -1626,7 +1588,7 @@ fn close_one(
         if protected.contains(&(a.min(b), a.max(b))) {
             return None; // belongs to a triangle we are not closing
         }
-        let m = midpoint(&mut pts, &mut mids, a, b);
+        let m = midpoint(&mut pts, &mut mids, &mut point_ids, a, b);
         let owners: Vec<usize> = (0..cells.len())
             .filter(|&i| cells[i].len() == 4 && has_edge(&cells[i], a, b))
             .collect();
@@ -1648,7 +1610,7 @@ fn close_one(
             if protected.contains(&(p2.min(p3), p2.max(p3))) {
                 return None;
             }
-            let m2 = midpoint(&mut pts, &mut mids, p2, p3);
+            let m2 = midpoint(&mut pts, &mut mids, &mut point_ids, p2, p3);
             let two = [[p0, m, m2, p3], [m, p1, p2, m2]];
             if !two.iter().all(|x| valid_quad(x, &pts)) {
                 return None;
@@ -1705,11 +1667,14 @@ fn has_edge(cell: &[usize], a: usize, b: usize) -> bool {
 /// Return the midpoint of `a`-`b`, inserting it once.
 ///
 /// The midpoint node is memoised by the *sorted* edge key, because a cascade can
-/// ask for the same edge from both of its cells; returning a fresh node twice
-/// would create two coincident points and a crack. The new node has `z = 0`.
+/// ask for the same edge from both of its cells. Exact coordinates also reuse a
+/// midpoint created while closing an adjacent residual triangle; returning a
+/// fresh node twice would create two coincident points and a crack. The new node
+/// has `z = 0`.
 fn midpoint(
     pts: &mut Vec<Node>,
     mids: &mut std::collections::HashMap<(usize, usize), usize>,
+    point_ids: &mut std::collections::HashMap<(u64, u64), usize>,
     a: usize,
     b: usize,
 ) -> usize {
@@ -1722,9 +1687,15 @@ fn midpoint(
         0.5 * (pts[a][1] + pts[b][1]),
         0.0,
     ];
+    let coordinates = (p[0].to_bits(), p[1].to_bits());
+    if let Some(&id) = point_ids.get(&coordinates) {
+        mids.insert(key, id);
+        return id;
+    }
     pts.push(p);
     let id = pts.len() - 1;
     mids.insert(key, id);
+    point_ids.insert(coordinates, id);
     id
 }
 

@@ -3,6 +3,7 @@
 //! This is a separate input model from [`crate::two_d::Domain`] while the new
 //! kernel is being built. Existing quad routes are not migrated by this module.
 
+mod adapter;
 mod domain;
 mod exact;
 mod geometry;
@@ -10,6 +11,7 @@ mod predicates;
 mod refinement;
 mod triangulation;
 
+pub use adapter::{AdapterError, CdtAdapter, CdtLocation};
 pub use domain::{Domain, DomainError, Feature, Loop, PointLocation, Region};
 pub use geometry::Point;
 pub use predicates::{encroaches, incircle, orient2d};

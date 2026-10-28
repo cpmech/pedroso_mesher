@@ -29,7 +29,7 @@
 //! 2. **L∞ geometry** (§4). `linf_distance`, the infinite-norm bisector
 //!    construction, `circumcenter`/`circumradius` (the minimal enclosing
 //!    axis-aligned square), and the right-isosceles L∞-equilateral apex.
-//! 3. **Frontal Delaunay point insertion** (§5), in a spade CDT. Triangles are
+//! 3. **Frontal Delaunay point insertion** (§5), in the clean-room CDT. Triangles are
 //!    classified as resolved/active/waiting by their L∞ circumradius; front
 //!    edges of the worst active triangle receive a new point at the far corner
 //!    of the local cross-frame circumsquare. A standard L2 Delaunay kernel
@@ -104,8 +104,8 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
+use crate::delaunay::{CdtAdapter, CdtLocation};
 use crate::mesh::{Cell, Kind, Mesh, Node};
 use crate::quality;
 use crate::two_d::{Domain, Sizing};
@@ -532,9 +532,8 @@ impl PointGrid {
 // CDT wrapper
 // ------------------------------------------------------------------------- //
 
-/// The `spade` constrained Delaunay triangulation used by the route; its
-/// vertices are [`Point2<f64>`] in world coordinates.
-type Cdt = ConstrainedDelaunayTriangulation<Point2<f64>>;
+/// The clean-room constrained Delaunay triangulation used by the route.
+type Cdt = CdtAdapter;
 
 /// Exact bit-pattern key of a point, used for vertex deduplication: two points
 /// are the same only when both coordinates have identical bits.
@@ -543,8 +542,7 @@ fn point_key(p: [f64; 2]) -> (u64, u64) {
 }
 
 /// The triangulation plus the bookkeeping the frontal loop needs: a stable
-/// point vector (the CDT stores coordinates, not indices), a duplicate map and
-/// the spacing grid.
+/// point vector, a duplicate map and the spacing grid.
 struct CdtState {
     /// The constrained Delaunay triangulation; its vertices are the same points
     /// as `points`, in insertion order.
@@ -555,8 +553,8 @@ struct CdtState {
     points: Vec<[f64; 2]>,
 
     /// Exact bit-pattern key -> index into `points`. Exact keys (not a
-    /// tolerance) mean "duplicate" is the same coordinate, which is what
-    /// `spade` also treats as a duplicate vertex.
+    /// tolerance) mean "duplicate" is the same coordinate, which is what the
+    /// adapter also treats as a duplicate vertex.
     index: HashMap<(u64, u64), usize>,
 
     /// Uniform grid over `points` for the minimum-spacing query (bucket side
@@ -565,15 +563,30 @@ struct CdtState {
 }
 
 impl CdtState {
-    /// An empty state with no vertices, an empty index and a spacing grid of
-    /// bucket side `0.5 * size`.
-    fn new(size: f64) -> CdtState {
-        CdtState {
-            cdt: Cdt::new(),
-            points: Vec::new(),
-            index: HashMap::new(),
-            grid: PointGrid::new(0.5 * size),
+    fn new(
+        size: f64,
+        outer: Vec<[f64; 2]>,
+        holes: Vec<Vec<[f64; 2]>>,
+        extra_points: Vec<[f64; 2]>,
+    ) -> Result<CdtState, String> {
+        let cdt = Cdt::from_loops_and_points(outer, holes, extra_points)
+            .map_err(|error| format!("the boundary could not be triangulated: {error}"))?;
+        let points = cdt.points().to_vec();
+        let index = points
+            .iter()
+            .enumerate()
+            .map(|(id, &point)| (point_key(point), id))
+            .collect();
+        let mut grid = PointGrid::new(0.5 * size);
+        for (id, &point) in points.iter().enumerate() {
+            grid.insert(id, point);
         }
+        Ok(CdtState {
+            cdt,
+            points,
+            index,
+            grid,
+        })
     }
 
     /// Insert a vertex if it is not already present. Returns its index.
@@ -583,8 +596,8 @@ impl CdtState {
             return Ok(id);
         }
         self.cdt
-            .insert(Point2::new(p[0], p[1]))
-            .map_err(|e| format!("spade could not insert a vertex: {e}"))?;
+            .insert_point(p)
+            .map_err(|error| format!("the CDT could not insert a vertex: {error}"))?;
         let id = self.points.len();
         self.points.push(p);
         self.index.insert(key, id);
@@ -592,31 +605,26 @@ impl CdtState {
         Ok(id)
     }
 
-    /// Index of the `CdtState` point at a `spade` position, or `None` when the
+    /// Index of the `CdtState` point at a CDT position, or `None` when the
     /// position is not one of the inserted vertices.
-    fn id_of(&self, p: Point2<f64>) -> Option<usize> {
-        self.index.get(&point_key([p.x, p.y])).copied()
+    fn id_of(&self, p: [f64; 2]) -> Option<usize> {
+        self.index.get(&point_key(p)).copied()
     }
 
     /// Triangles of the domain, counter-clockwise, with `CdtState` indices.
-    ///
-    /// `spade` also returns the faces of the outer triangulation (outside the
-    /// constrained boundary); a face is kept only when its centroid is inside
-    /// the domain. The centroid test is sound here because every boundary edge
-    /// is a constraint, so no triangle straddles a domain edge.
+    /// The adapter removes exterior and hole faces; the centroid check retains
+    /// the route's defensive domain postcondition.
     fn domain_triangles(&self, domain: &Domain) -> Vec<[usize; 3]> {
         let mut out = Vec::new();
-        for face in self.cdt.inner_faces() {
-            let pos = face.positions();
-            let area = (pos[1].x - pos[0].x) * (pos[2].y - pos[0].y)
-                - (pos[1].y - pos[0].y) * (pos[2].x - pos[0].x);
+        for triangle in self.cdt.triangles() {
+            let pos = triangle.vertices.map(|vertex| self.cdt.points()[vertex]);
+            let area = (pos[1][0] - pos[0][0]) * (pos[2][1] - pos[0][1])
+                - (pos[1][1] - pos[0][1]) * (pos[2][0] - pos[0][0]);
             if area.abs() <= 1.0e-14 {
                 continue;
             }
-            let cx = (pos[0].x + pos[1].x + pos[2].x) / 3.0;
-            let cy = (pos[0].y + pos[1].y + pos[2].y) / 3.0;
-            // The centroid test uses the domain's own contains(), which also
-            // handles holes and non-convex corners.
+            let cx = (pos[0][0] + pos[1][0] + pos[2][0]) / 3.0;
+            let cy = (pos[0][1] + pos[1][1] + pos[2][1]) / 3.0;
             if !domain.contains([cx, cy]) {
                 continue;
             }
@@ -634,8 +642,6 @@ impl CdtState {
             if !ok {
                 continue;
             }
-            // `spade` exposes the face orientation as it stores it; normalize to
-            // CCW so the matching and the quad construction see one convention.
             if area < 0.0 {
                 tri.swap(1, 2);
             }
@@ -828,22 +834,25 @@ fn frontal_refine(
             }
             // The candidate must land in a still-unresolved triangle: inserting
             // into a resolved region would only create a sliver.
-            match state.cdt.locate(Point2::new(candidate[0], candidate[1])) {
+            match state.cdt.locate(candidate) {
                 // A candidate on an interior edge is a perfectly good Delaunay
                 // insertion (and on a boundary edge it splits the constraint);
                 // only an existing vertex is a duplicate.
-                spade::PositionInTriangulation::OnEdge(_) => {}
-                spade::PositionInTriangulation::OnFace(face) => {
-                    let pos = state.cdt.face(face).positions();
+                CdtLocation::Edge(_) => {}
+                CdtLocation::Triangle(face) => {
+                    let Some(triangle) = state.cdt.triangles().get(face) else {
+                        continue;
+                    };
+                    let pos = triangle.vertices.map(|vertex| state.cdt.points()[vertex]);
                     let centroid = [
-                        (pos[0].x + pos[1].x + pos[2].x) / 3.0,
-                        (pos[0].y + pos[1].y + pos[2].y) / 3.0,
+                        (pos[0][0] + pos[1][0] + pos[2][0]) / 3.0,
+                        (pos[0][1] + pos[1][1] + pos[2][1]) / 3.0,
                     ];
                     let theta = field.angle(centroid);
                     let mut lo = [f64::INFINITY; 2];
                     let mut up = [f64::NEG_INFINITY; 2];
                     for q in &pos {
-                        let local = rotate(sub([q.x, q.y], centroid), -theta);
+                        let local = rotate(sub(*q, centroid), -theta);
                         for d in 0..2 {
                             lo[d] = lo[d].min(local[d]);
                             up[d] = up[d].max(local[d]);
@@ -854,7 +863,7 @@ fn frontal_refine(
                         continue;
                     }
                 }
-                _ => continue,
+                CdtLocation::Vertex(_) | CdtLocation::Outside => continue,
             }
             if state.add_vertex(candidate).is_err() {
                 continue;
@@ -1053,21 +1062,10 @@ fn rebuild_cdt(
     loops: &[Vec<[f64; 2]>],
     size: f64,
 ) -> Result<CdtState, String> {
-    let mut state = CdtState::new(size);
-    for &p in points {
-        state.add_vertex(p)?;
-    }
-    for loop_points in loops {
-        for i in 0..loop_points.len() {
-            let a = loop_points[i];
-            let b = loop_points[(i + 1) % loop_points.len()];
-            state
-                .cdt
-                .add_constraint_edge(Point2::new(a[0], a[1]), Point2::new(b[0], b[1]))
-                .map_err(|e| format!("a boundary edge could not be re-constrained: {e}"))?;
-        }
-    }
-    Ok(state)
+    let Some((outer, holes)) = loops.split_first() else {
+        return Err("the boundary could not be re-constrained".to_string());
+    };
+    CdtState::new(size, outer.clone(), holes.to_vec(), points.to_vec())
 }
 
 /// The quad formed by two triangles that share an edge, oriented CCW.
@@ -2085,26 +2083,11 @@ pub fn mesh_with_options(
         return Err("the boundary could not be discretized".to_string());
     }
 
-    // Insert the boundary points first, then constrain every boundary edge;
-    // the CDT below is built only from these constrained loops.
-    let mut state = CdtState::new(size);
-    for loop_points in &loops {
-        for &p in loop_points {
-            state.add_vertex(p)?;
-        }
-    }
-    for loop_points in &loops {
-        for i in 0..loop_points.len() {
-            let a = loop_points[i];
-            let b = loop_points[(i + 1) % loop_points.len()];
-            let pa = Point2::new(a[0], a[1]);
-            let pb = Point2::new(b[0], b[1]);
-            state
-                .cdt
-                .add_constraint_edge(pa, pb)
-                .map_err(|e| format!("a boundary edge could not be constrained: {e}"))?;
-        }
-    }
+    // Build the CDT directly from the sampled boundary loops.
+    let Some((outer, holes)) = loops.split_first() else {
+        return Err("the boundary could not be discretized".to_string());
+    };
+    let mut state = CdtState::new(size, outer.clone(), holes.to_vec(), Vec::new())?;
 
     // The frontal loop inserts points until every front is resolved or blocked;
     // the triangulation is a standard L2 Delaunay kernel (the paper observes

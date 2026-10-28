@@ -1938,11 +1938,24 @@ fn weld_all(meshes: &[Mesh], tol: f64) -> Result<Mesh, String> {
     Ok(merged)
 }
 
-/// If a route's raw mesh does not pass the gate, try the boundary-preserving
-/// smoother and keep whichever candidate is better.  Boundary nodes are never
-/// moved by the default smoother, so the seam stays valid.
-fn finish_side(domain: &Domain, mesh: Mesh, sizing: &Sizing) -> Mesh {
-    let raw = verify::gate(&mesh);
+/// If a route's raw mesh does not pass the gate, try untangling followed by the
+/// boundary-preserving smoother, keeping measured improvements. Boundary nodes
+/// are never moved, so the seam stays valid.
+fn finish_side(domain: &Domain, mut mesh: Mesh, sizing: &Sizing) -> Mesh {
+    let mut raw = verify::gate(&mesh);
+    if raw.inverted > 0 {
+        let candidate = crate::alt_untangle::untangle(
+            domain,
+            &mesh,
+            sizing.size,
+            &crate::alt_untangle::Options::default(),
+        );
+        let gate = verify::gate(&candidate);
+        if gate_score(&gate) > gate_score(&raw) {
+            mesh = candidate;
+            raw = gate;
+        }
+    }
     if raw.passes() {
         return mesh;
     }

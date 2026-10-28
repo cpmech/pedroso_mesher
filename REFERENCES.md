@@ -23,10 +23,10 @@ the `simons_*` modules implement.
    Used in: Blossom-Quad minimum-cost perfect matching: the default `two_d::mesh_2d` pairing (`src/two_d.rs`).
 
 5. **shewchuk-2002-delaunay-refinement** — Shewchuk J.R., 2002. "Delaunay refinement algorithms for triangular mesh generation." Computational Geometry, 22(1-3): 21-74.
-   Used in: Delaunay refinement used by the triangulator (`two_d::triangulate`, via `spade`).
+   Used in: Delaunay refinement used by the clean-room triangulator (`two_d::triangulate`, `src/delaunay`).
 
 6. **shewchuk-1997** — Shewchuk J.R., 1997. "Adaptive Precision Floating-Point Arithmetic and Fast Robust Geometric Predicates." Discrete & Computational Geometry, 18(3): 305-363.
-   Used in: Robust geometric predicates (the `spade` dependency).
+   Used in: Clean-room adaptive-precision geometric predicates (`src/delaunay/predicates.rs`).
 
 7. **knupp-2000-part1** — Knupp P.M., 2000. "Achieving finite element mesh quality via optimization of the Jacobian matrix norm and associated quantities. Part I: A framework for surface mesh optimization." International Journal for Numerical Methods in Engineering, 48(3): 401-420.
    Used in: Scaled Jacobian / quality metric definitions (`src/quality.rs`).

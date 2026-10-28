@@ -45,7 +45,7 @@ pub(crate) fn clean_path(points: &[Point]) -> Vec<Point> {
 }
 
 pub(crate) fn point_on_segment(point: Point, a: Point, b: Point) -> bool {
-    orient2d(a, b, point) == 0 && within_bounds(point, a, b)
+    within_bounds(point, a, b) && orient2d(a, b, point) == 0
 }
 
 fn within_bounds(point: Point, a: Point, b: Point) -> bool {
