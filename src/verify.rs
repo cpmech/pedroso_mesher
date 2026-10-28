@@ -811,10 +811,21 @@ fn proper_segment_intersection(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2
 }
 
 fn strictly_inside_convex(p: [f64; 2], polygon: &[[f64; 2]]) -> bool {
+    strictly_inside_convex_with_tolerance(p, polygon, 0.0)
+}
+
+fn strictly_inside_convex_with_tolerance(
+    p: [f64; 2],
+    polygon: &[[f64; 2]],
+    tolerance: f64,
+) -> bool {
     let mut sign = 0i8;
     for i in 0..polygon.len() {
-        let value = cross(polygon[i], polygon[(i + 1) % polygon.len()], p);
-        if value == 0.0 {
+        let a = polygon[i];
+        let b = polygon[(i + 1) % polygon.len()];
+        let value = cross(a, b, p);
+        let length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        if length == 0.0 || value.abs() <= tolerance * length {
             return false;
         }
         let current = if value > 0.0 { 1 } else { -1 };
@@ -856,9 +867,9 @@ fn cell_extends_outside(
     }
     for &(a, b) in &segments {
         let midpoint = [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])];
-        if strictly_inside_convex(a, &geometry.vertices)
-            || strictly_inside_convex(b, &geometry.vertices)
-            || strictly_inside_convex(midpoint, &geometry.vertices)
+        if strictly_inside_convex_with_tolerance(a, &geometry.vertices, tolerance)
+            || strictly_inside_convex_with_tolerance(b, &geometry.vertices, tolerance)
+            || strictly_inside_convex_with_tolerance(midpoint, &geometry.vertices, tolerance)
         {
             return true;
         }
@@ -1291,6 +1302,32 @@ mod tests {
             .located_reason()
             .unwrap_or_default()
             .contains("domain coverage"));
+    }
+
+    #[test]
+    fn strict_geometry_treats_a_shared_hole_edge_as_boundary() {
+        let domain = crate::two_d::Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
+        let mesh = Mesh::new(
+            vec![
+                [50.0, 40.0, 0.0],
+                [53.8268343236509, 39.23879532511287, 0.0],
+                [51.431769192423, 45.05907372400746, 0.0],
+            ],
+            vec![Cell::tri3([0, 1, 2])],
+        );
+        let report = geometry(&domain, &mesh).unwrap();
+        assert_eq!(report.outside_cells, 0);
+    }
+
+    #[test]
+    fn qmorph_smoothing_preserves_plate_hole_coverage() {
+        let domain = crate::two_d::Domain::plate_with_hole(100.0, 60.0, 10.0, 16).unwrap();
+        let sizing = crate::two_d::Sizing::uniform(4.0).unwrap();
+        let mut config = crate::config::MeshConfig::new(crate::config::Route::Qmorph);
+        config.smoothing.enabled = false;
+        let out = crate::config::generate(&domain, &sizing, &config).unwrap();
+        let report = geometry(&domain, &out.mesh).unwrap();
+        assert!(report.passes(), "{report:?}");
     }
 
     #[test]

@@ -181,9 +181,9 @@ impl Domain {
     /// Vertices where the boundary turns by more than 30 degrees.
     ///
     /// A circular boundary discretised as a 24-gon turns 15 degrees per vertex:
-    /// those are sampling points, not features, and a mesh may legitimately skip
-    /// one. A square corner turns 90 degrees and must be a mesh node. This is the
-    /// set `corner_offset` measures and that `smooth` must not slide.
+    /// those are sampling points, not sharp features. A square corner turns 90
+    /// degrees and must be a mesh node. This is the set `corner_offset` measures;
+    /// exact polygon coverage separately requires preserving shallow vertices too.
     ///
     /// The test is on the angle between the two incident edge vectors, so it is
     /// independent of loop orientation. Degenerate (zero-length) edges are
@@ -633,13 +633,13 @@ fn build_mesh(points: &[Node], quads: &[[usize; 4]], leftover: &[[usize; 3]]) ->
 
 /// Smooth nodes to raise the smallest corner angle without losing Jacobian.
 ///
-/// Interior nodes move to the centroid of their ring. Boundary nodes slide
-/// **along** the boundary segment they sit on, which is where the worst angles
-/// are: a boundary quad inherits the sampling of the curve, and moving the node
-/// sideways improves the quad without moving the geometry. A move is accepted
-/// only when it raises the smallest angle of every incident quad *and* does not
-/// lower the smallest scaled Jacobian — the lesson from the first smoothing
-/// attempt, which traded 0.37 of Jacobian for one degree of angle.
+/// Interior nodes move to the centroid of their ring. Boundary sampling nodes
+/// slide **along** the boundary segment they sit on, which is where the worst
+/// angles are. Original domain vertices stay fixed: removing even a shallow
+/// vertex replaces two boundary edges by a chord and changes the polygon. A move
+/// is accepted only when it raises the smallest angle of every incident quad
+/// *and* does not lower the smallest scaled Jacobian — the lesson from the first
+/// smoothing attempt, which traded 0.37 of Jacobian for one degree of angle.
 ///
 /// This is a nodally based quality objective in the spirit of Knupp 2000
 /// (corpus `knupp-2000-part1`), not the Laplacian smoother the name might
@@ -657,11 +657,12 @@ pub fn smooth_mesh(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f6
 /// Implementation of [`smooth_mesh`], also used internally by [`mesh_2d`].
 fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
     let n = mesh.points.len();
-    // A sharp corner is a feature of the geometry: sliding it along one of the
-    // two adjacent edges cuts the corner. Measured on the plate-with-hole: a
-    // 24-gon hole's shallow vertices were being slid, and on the ring a 90-degree
-    // corner sat 1.0 away from the nearest node after smoothing.
-    let corners = domain.sharp_corners();
+    let vertices: Vec<[f64; 2]> = domain
+        .outer
+        .iter()
+        .chain(domain.holes.iter().flatten())
+        .copied()
+        .collect();
     let mut incident: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (c, cell) in mesh.cells.iter().enumerate() {
         for &v in &cell.nodes {
@@ -678,7 +679,7 @@ fn smooth(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
             let current = [mesh.points[v][0], mesh.points[v][1]];
             let on_boundary = domain.distance_to_boundary(current) < 1e-9;
             if on_boundary
-                && corners
+                && vertices
                     .iter()
                     .any(|c| (c[0] - current[0]).powi(2) + (c[1] - current[1]).powi(2) < 1.0e-18)
             {

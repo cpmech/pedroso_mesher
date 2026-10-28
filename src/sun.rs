@@ -2257,8 +2257,8 @@ fn quad_min_angle(points: &[Node], quad: &[usize; 4]) -> f64 {
 /// `size` is the local element size in millimetres and sets the search radii
 /// (`0.02`, `0.05`, `0.1` of it). `domain` is required to keep boundary nodes on
 /// the geometry: with `None`, a node that lies on a mesh boundary edge is left
-/// alone; with `Some`, it may slide along its nearest domain segment. Domain
-/// sharp corners are never moved. `rounds` bounds the number of accepted moves.
+/// alone; with `Some`, it may slide along its nearest domain segment. Original
+/// domain vertices are never moved. `rounds` bounds the number of accepted moves.
 ///
 /// # Postconditions
 ///
@@ -2304,20 +2304,18 @@ pub fn perturb_low_quads(
             }
         }
     }
-    // A domain corner must stay at the corner: sliding it along one of the two
-    // adjacent edges cuts the corner while `boundary_offset` stays 0 (measured:
-    // (0,0) moved to (0,1.08) by the projection).
-    let mut at_corner = vec![false; pts.len()];
+    // Every original vertex must remain in the boundary polyline: removing even
+    // a shallow vertex replaces its two edges by a chord and changes the domain.
+    let mut at_vertex = vec![false; pts.len()];
     if let Some(d) = domain {
-        let corners = d.sharp_corners();
         for (v, p) in pts.iter().enumerate() {
             if !on_boundary[v] {
                 continue;
             }
-            for c in &corners {
+            for c in d.outer.iter().chain(d.holes.iter().flatten()) {
                 let dist = ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2)).sqrt();
                 if dist < 1.0e-9 {
-                    at_corner[v] = true;
+                    at_vertex[v] = true;
                     break;
                 }
             }
@@ -2359,7 +2357,7 @@ pub fn perturb_low_quads(
             for radius in [0.02 * size, 0.05 * size, 0.1 * size] {
                 for k in 0..8 {
                     let a = std::f64::consts::TAU * k as f64 / 8.0;
-                    if at_corner[v] {
+                    if at_vertex[v] {
                         continue;
                     }
                     let mut candidate = [here[0] + radius * a.cos(), here[1] + radius * a.sin()];
@@ -2751,6 +2749,27 @@ mod tests {
         let quads = [[0, 1, 2, 3]];
         let (pts, _, _, _) = perturb_low_quads(&points, &quads, &[], 1.0, 50, Some(&domain));
         assert!(pts[0][0].abs() < 1.0e-12 && pts[0][1].abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn a_shallow_domain_vertex_is_never_moved() {
+        let vertices = (0..16)
+            .map(|i| {
+                let angle = std::f64::consts::TAU * i as f64 / 16.0;
+                [angle.cos(), angle.sin()]
+            })
+            .collect();
+        let domain = crate::two_d::Domain::new(vertices, vec![]).unwrap();
+        assert!(domain.sharp_corners().is_empty());
+        let points = vec![
+            [1.0, 0.0, 0.0],
+            [0.9, 0.05, 0.0],
+            [-1.0, 0.0, 0.0],
+            [-0.02, -0.7, 0.0],
+        ];
+        let quads = [[0, 1, 2, 3]];
+        let (pts, _, _, _) = perturb_low_quads(&points, &quads, &[], 1.0, 50, Some(&domain));
+        assert_eq!(pts[0], points[0]);
     }
 
     #[test]

@@ -27,22 +27,26 @@ boundary/corner offsets, the existing gate, geometric conformity, and the full
 These are measurements, not claims that every row is shippable: inspect
 `status`, `gate`, `conforming`, `geometry`, and `detail` together.
 
-## Initial measurements
+## Measurements after containment fixes
 
 In the full baseline, 152 of 168 runs return meshes and 16 are explicit route
 errors (the Features route has no feature polylines in this generic matrix, and
 Pipeline has one error in each stage). Of the 152 meshes, 114 pass the legacy
-gate but only 44 pass full geometry. **75 rows pass the legacy gate and fail
-full geometry**, concentrated on the four plate-with-hole resolutions and the
-ring. These rows are evidence for investigating boundary containment, not new
-quality claims.
+gate, 66 pass full geometry, and 57 pass both. **57 rows pass the legacy gate
+and fail full geometry**, concentrated on the four plate-with-hole resolutions
+and the ring. The containment fixes raised full-geometry passes from 44 to 66
+and passes of both contracts from 39 to 57, with no legacy-gate regressions.
+Twenty-four mesh hashes changed intentionally when boundary smoothing began
+preserving every original domain vertex. The remaining failures are evidence
+for further investigation, not new quality claims.
 
 In the adversarial matrix, 34 of 42 runs return meshes and eight are explicit
 errors; 26 pass both gates. Four outside-hole rows pass the legacy gate but fail
 full geometry. Quadtree places cells outside the acute-corner domain, L-infinity
 leaves four triangles there, and Sized explicitly rejects the multiple-hole
 case. A repeated boundary node is currently accepted by all three routes; this
-is recorded behavior, not final input-validation policy.
+is recorded behavior, not final input-validation policy. This CSV was unchanged
+by the containment fixes.
 
 Reproducibility is checked by generating a second CSV and comparing the files
 byte-for-byte. Different legal meshes after an intentional algorithm change
