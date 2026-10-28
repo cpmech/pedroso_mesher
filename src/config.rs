@@ -120,9 +120,8 @@ pub enum Route {
     /// and `remacle-2013` §3. Character: a cross field on a background grid
     /// drives field-aligned paving rows; the interior is closed by the
     /// Q-Morph/matching stage. Measured table: `examples/alt_crossfield.rs`;
-    /// all-quad 7/7 and six of seven PASS after the common post-pass (post SJ
-    /// 0.28–0.71, corner 29.7–51.9 degrees); the ring is below the gate after
-    /// the clean-room CDT migration. The 0.6 mm part needs the pre-walk
+    /// all-quad 7/7 and PASS after the common post-pass (post SJ 0.28–0.71,
+    /// corner 30.2–51.9 degrees). The 0.6 mm part needs the pre-walk
     /// fallback and gains about 5.1k quads (20 586).
     Crossfield,
 

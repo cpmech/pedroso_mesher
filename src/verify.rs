@@ -500,7 +500,8 @@ struct CellGeometry {
 ///
 /// Structural validation runs first, so malformed indices return [`MeshError`]
 /// instead of reaching geometric code. Area uses a relative `1e-8` tolerance;
-/// containment uses `1e-12` of the domain diagonal only to absorb round-off.
+/// containment uses `1e-12` of the domain diagonal, and segment crossings use
+/// an absolute `1e-13` distance tolerance to absorb round-off.
 /// The check assumes the simple, convex cells required by [`Gate`]. Inverted or
 /// self-intersecting cells remain the quality gate's responsibility.
 pub fn geometry(
@@ -810,6 +811,26 @@ fn proper_segment_intersection(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2
         && ((cd_a > 0.0 && cd_b < 0.0) || (cd_a < 0.0 && cd_b > 0.0))
 }
 
+fn proper_segment_intersection_with_tolerance(
+    a: [f64; 2],
+    b: [f64; 2],
+    c: [f64; 2],
+    d: [f64; 2],
+    tolerance: f64,
+) -> bool {
+    let ab_length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+    let cd_length = ((d[0] - c[0]).powi(2) + (d[1] - c[1]).powi(2)).sqrt();
+    if ab_length == 0.0 || cd_length == 0.0 {
+        return false;
+    }
+    let ab_c = cross(a, b, c) / ab_length;
+    let ab_d = cross(a, b, d) / ab_length;
+    let cd_a = cross(c, d, a) / cd_length;
+    let cd_b = cross(c, d, b) / cd_length;
+    ((ab_c > tolerance && ab_d < -tolerance) || (ab_c < -tolerance && ab_d > tolerance))
+        && ((cd_a > tolerance && cd_b < -tolerance) || (cd_a < -tolerance && cd_b > tolerance))
+}
+
 fn strictly_inside_convex(p: [f64; 2], polygon: &[[f64; 2]]) -> bool {
     strictly_inside_convex_with_tolerance(p, polygon, 0.0)
 }
@@ -860,7 +881,7 @@ fn cell_extends_outside(
         if !inside(midpoint)
             || segments
                 .iter()
-                .any(|&(c, d)| proper_segment_intersection(a, b, c, d))
+                .any(|&(c, d)| proper_segment_intersection_with_tolerance(a, b, c, d, 1.0e-13))
         {
             return true;
         }
@@ -1317,6 +1338,46 @@ mod tests {
         );
         let report = geometry(&domain, &mesh).unwrap();
         assert_eq!(report.outside_cells, 0);
+    }
+
+    #[test]
+    fn outside_intersection_ignores_roundoff_but_not_a_real_crossing() {
+        let a = [8.572527594031472e-16, 14.0];
+        let b = [1.3448736777800105, 13.597590092085593];
+        let c = [1.2246467991473533e-15, 20.0];
+        let d = [6.123233995736766e-16, 10.0];
+        assert!(proper_segment_intersection(a, b, c, d));
+        assert!(!proper_segment_intersection_with_tolerance(
+            a, b, c, d, 1.0e-13
+        ));
+        assert!(proper_segment_intersection_with_tolerance(
+            [0.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            1.0e-13
+        ));
+    }
+
+    #[test]
+    fn crossfield_ring_roundoff_does_not_fail_geometry() {
+        let arc = |r: f64, a0: f64, a1: f64, n: usize| -> Vec<[f64; 2]> {
+            (0..=n)
+                .map(|i| {
+                    let a = a0 + (a1 - a0) * i as f64 / n as f64;
+                    [r * a.cos(), r * a.sin()]
+                })
+                .collect()
+        };
+        let mut points = arc(20.0, 0.0, std::f64::consts::FRAC_PI_2, 24);
+        points.extend(arc(10.0, std::f64::consts::FRAC_PI_2, 0.0, 12));
+        let domain = crate::two_d::Domain::new(points, vec![]).unwrap();
+        let sizing = crate::two_d::Sizing::uniform(1.0).unwrap();
+        let config = crate::config::MeshConfig::new(crate::config::Route::Crossfield);
+        let out = crate::config::generate(&domain, &sizing, &config).unwrap();
+        let report = geometry(&domain, &out.mesh).unwrap();
+        assert_eq!(report.outside_cells, 0, "{report:?}");
+        assert!(report.passes(), "{report:?}");
     }
 
     #[test]

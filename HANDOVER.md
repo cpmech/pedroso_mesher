@@ -1,9 +1,9 @@
 # Phase D handover — clean-room Delaunay migration
 
-Date: 2026-10-28
+Date: 2026-10-29
 Repository: `pedroso_mesher/`
 Branch: `main`
-State: **all tests passing; complete baseline review in progress**
+State: **Phase D review complete; final smoothing rescue uncommitted**
 
 ## Governing request and constraints
 
@@ -203,6 +203,25 @@ mixed feature demo now produces 113 quads with minimum SJ 0.2660, minimum angle
 32.0 degrees, zero cracks, and a passing gate. This is a quality decrease from
 the historical 112-quad SJ 0.6073 / 38.8-degree result and is recorded as such.
 
+## Crossfield ring resolution
+
+The first complete migrated matrix had only one new post-pass gate regression:
+Crossfield ring fell from a pass to 240 quads, minimum SJ 0.283266 and minimum
+angle 29.671 degrees. Its raw mesh was already failing at 8.730 degrees.
+
+A configuration probe showed that the existing `sun::perturb_low_quads` pass
+lifts the corner above 30 degrees without changing connectivity. The shared
+smoother now enables at most 64 perturbation rounds by default, but only when
+the current quality margin is below the gate. Passing meshes are unchanged;
+original domain vertices remain fixed, other boundary nodes can only slide on
+the polyline, and the existing `better` acceptance check remains the final veto.
+The 30-degree threshold was not changed.
+
+All seven Crossfield corpus parts pass the quality gate after this change. The
+ring remains at 240 quads, with minimum SJ 0.283 and minimum angle 30.2 degrees.
+The mixed feature demo is unchanged at 113 quads, SJ 0.2660 and 32.0 degrees.
+The complete suite, strict Clippy and the Wasm library build pass.
+
 ## Current important code state
 
 - `src/two_d.rs`: `close_by_refinement` is restored to `pub(crate)`.
@@ -227,14 +246,54 @@ It was useful for identifying the raw-versus-cleaned orientation issue. It
 required temporary public visibility of `close_by_refinement`, which has since
 been restored to crate-private; the probe is not part of the repository.
 
-## Validation still in progress
+## Floating-point-tolerant outside-cell decision
 
-1. Finish reviewing the regenerated complete raw/post baseline matrix. The
-   adversarial matrix is already reviewed: the only four classification changes
-   are intentional L-infinity errors for the self-intersecting outer loop and
-   outside hole. Other classifications are unchanged.
-2. Update `ObsidianVault/projects/Pedroso-Mesher.md` with frontmatter
-   `updated: 2026-10-28`, exact migration results, remaining quality changes,
-   and final test counts.
-3. Rerun `cargo test --offline` and `git diff --check` after the final
-   documentation edits. Do not begin Phase E.
+The 34 Crossfield ring outside-cell reports were investigated with highlighted
+figures and independent area measurements. The actual outside area was about
+6.4e-14, at floating-point round-off scale; whole-cell highlighting exaggerated
+the discrepancy. Exact-zero proper segment intersection tests were classifying
+nearly coincident cell/domain edges as crossings.
+
+`cell_extends_outside` now uses signed point-to-line distances with an absolute
+1e-13 tolerance for proper segment intersections. This change is local to
+outside-cell detection; exact geometric overlap detection is unchanged. A
+focused regression proves that a near-coincident crossing is accepted while an
+ordinary crossing is still rejected. An end-to-end regression generates the
+Crossfield ring and requires zero outside cells and a passing full geometry
+report. Both raw and post ring rows now pass geometry with unchanged mesh
+hashes. The post ring therefore passes quality, conformity and full geometry.
+
+The adversarial rerun changes only Quadtree acute-corner raw/post: their 22
+round-off outside-cell reports become geometry passes, while quality still fails
+at minimum SJ 0.091. No mesh hashes change. The full suite now has 412 library
+tests, 5 CLI tests and 11 doc tests, all passing with strict Clippy, Wasm and
+`git diff --check`.
+
+## Final baseline review and validation
+
+The final 168-row matrix has 154 meshes and 14 explicit errors, 116 quality-gate
+passes, 130 full-geometry passes, and 97 rows passing both contracts. The
+smoothing rescue changed exactly one row relative to the preceding migrated run:
+Crossfield ring post moved from quality-gate fail to pass, with angle 29.671 to
+30.191 degrees, unchanged SJ 0.283266, and aspect maximum 29.295 to 24.310. The
+subsequent 1e-13 outside-cell tolerance reclassified 64 rows from strict-geometry
+fail to pass, including Crossfield and Pipeline ring raw/post, without changing
+any mesh hash or quality field. Crossfield ring post now passes quality,
+conformity and full geometry.
+
+Relative to the frozen baseline, the only remaining acceptance-classification
+changes are Pipeline ring raw/post: explicit errors became valid 48-quad meshes
+passing quality, conformity and full geometry. The frozen files under
+`data/baselines/` were not modified.
+
+The 42-row adversarial rerun changes only Quadtree acute-corner raw/post from
+the preceding migrated run: 22 round-off outside-cell reports become geometry
+passes, while quality still fails at minimum SJ 0.091. Relative to the frozen
+baseline, its only other changes remain the four intentional L-infinity errors
+for invalid self-intersecting and outside-hole inputs.
+
+Final validation passed: **412 library tests, 5 CLI tests and 11 doc tests**,
+`cargo fmt`, strict Clippy, `wasm32-unknown-unknown` library build and
+`git diff --check`. `ObsidianVault/projects/Pedroso-Mesher.md` contains the final
+Phase D record. The smoothing, geometry-tolerance and documentation changes are
+uncommitted; Phase E has not started.

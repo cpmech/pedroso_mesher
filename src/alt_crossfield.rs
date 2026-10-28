@@ -79,10 +79,10 @@
 //! on the stepped part, and the full front on the ring and the L-bracket. The
 //! choice is made after all four runs, so it costs four `generate` calls.
 //!
-//! **Measured.** All seven corpus parts are all-quad and conforming; six pass
-//! the gate after the common post-pass with the clean-room CDT (post SJ
-//! 0.28-0.71, minimum angle 29.7-51.9°). The ring is below the gate (SJ 0.283,
-//! minimum angle 29.7°) after the triangulation migration. The 0.6 mm
+//! **Measured.** All seven corpus parts are all-quad, conforming and pass the
+//! gate after the common post-pass with the clean-room CDT (post SJ 0.28-0.71,
+//! minimum angle 30.2-51.9°). The failure-only boundary-aware perturbation lifts
+//! the ring from 29.7° to 30.2° without changing its 240-quad topology. The 0.6 mm
 //! performance part needs the pre-walk fallback: it grows
 //! from 15 500 quads + 2 triangles to 20 586 quads (+5 086 quads, +33 %, and no
 //! triangles), because the cascade has to carry 48 residual triangles to the

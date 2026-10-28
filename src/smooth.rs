@@ -1,11 +1,10 @@
 //! Boundary-preserving smoothing, applicable after any of the quad routes.
 //!
-//! By default the smoother moves **interior** nodes only: boundary nodes stay
-//! exactly where the generator put them, and sharp domain corners never move
-//! (that is what makes it safe after a structured O-grid). Two opt-in paths can
-//! slide a boundary node along the polyline (never off it, and never a corner):
-//! `move_boundary` for the relaxation, and `perturb_rounds > 0` for the
-//! perturbation. It maximises the worst incident gate margin
+//! The relaxation moves **interior** nodes only by default, and sharp domain
+//! corners never move (that is what makes it safe after a structured O-grid).
+//! Two paths can slide a non-vertex boundary node along the polyline (never off
+//! it): opt-in `move_boundary` relaxation, and `perturb_rounds > 0` when the
+//! quality gate still fails. The smoother maximises the worst incident gate margin
 //! `min(angle/30 deg, SJ/0.2, aspect_cap/aspect)` by coordinate search, then
 //! optionally runs the angle-driven quad edge swaps and the boundary-aware
 //! perturbation. It returns both the before/after statistics and whether the
@@ -68,9 +67,9 @@ use crate::two_d::{smooth_mesh, Domain};
 /// Options for [`smooth`].
 ///
 /// The defaults are the measured constants of the route (ten sweeps, swaps on,
-/// perturbation off), so `SmoothOptions::default()` is what the examples run.
-/// A setup that disables every pass is recognised by [`smooth`] and returns the
-/// input without work.
+/// failure-only perturbation on), so `SmoothOptions::default()` is what the
+/// examples run. A setup that disables every pass is recognised by [`smooth`]
+/// and returns the input without work.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SmoothOptions {
     /// Run the smoother at all (default `true`). When `false`, [`smooth`]
@@ -96,11 +95,10 @@ pub struct SmoothOptions {
     /// `max(current max, aspect_cap)` (see the module note).
     pub improve_angles: bool,
 
-    /// Rounds of the boundary-aware perturbation (0 = off): the nodes of low
-    /// quads are nudged by a fraction of the local size, boundary nodes only
-    /// along the boundary ([`crate::sun::perturb_low_quads`]). Off by default
-    /// because on the ring it moved boundary nodes up to 1.92 x size off the
-    /// domain; it is for the cases no swap reaches.
+    /// Maximum rounds of boundary-aware perturbation (default 64, 0 = off), run
+    /// only while the mesh is below the quality gate. Low-quad nodes are nudged
+    /// by a fraction of the local size; boundary nodes slide along the polyline
+    /// and original domain vertices stay fixed ([`crate::sun::perturb_low_quads`]).
     pub perturb_rounds: usize,
 
     /// If the smoothed mesh is worse than the input, reject it (default
@@ -156,7 +154,7 @@ impl Default for SmoothOptions {
             iterations: 10,
             move_boundary: false,
             improve_angles: true,
-            perturb_rounds: 0,
+            perturb_rounds: 64,
             reject_if_worse: true,
             aspect_cap: ASPECT_CAP,
             stretch_weight: 1.0,
@@ -325,10 +323,11 @@ pub fn smooth_with_targets(
             work = candidate;
         }
     }
-    if options.perturb_rounds > 0 {
-        // Perturbation is last and is not re-guarded afterwards: the caller's
-        // `better` check is the final veto, and on the ring the boundary was
-        // moved up to 1.92 x size, which the conforming flags then report.
+    let quality = MeshStatistics::of(domain, &work);
+    if options.perturb_rounds > 0 && quality.margin() < 1.0 - 1.0e-9 {
+        // Passing meshes do not pay for or change under this rescue. Domain
+        // vertices are fixed and other boundary nodes only slide on the
+        // polyline; `better` below remains the final quality/topology veto.
         let (points, quads, tris) = split(&work);
         let (p, q, t, _) = sun::perturb_low_quads(
             &points,
