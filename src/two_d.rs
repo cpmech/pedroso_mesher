@@ -1409,7 +1409,7 @@ fn quad_min_sj(q: &[[f64; 2]; 4]) -> f64 {
 /// either replaced by a valid cascade of quads or returned in `leftover`
 /// unchanged. A component that shares an edge with a triangle that is not being
 /// closed is never split, so no crack is introduced.
-pub fn close_by_refinement(
+pub(crate) fn close_by_refinement(
     quads: &[[usize; 4]],
     unpaired: &[[usize; 3]],
     points: &[Node],

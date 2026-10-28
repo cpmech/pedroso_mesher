@@ -12,8 +12,9 @@
 //!    triangles into quads; [`Route::TwoStage`] replaces it with the
 //!    experimental even-region front plus Blossom matching;
 //! 4. **closure** — leftover triangles are closed by alternating smoothing with
-//!    Sun's residual-triangle walk (`sun::close_residuals`, `sun-2015` §5),
-//!    then by the cavity pass when the walk stalls;
+//!    Sun's residual-triangle walk (`sun::close_residuals`, `sun-2015` §5), the
+//!    cavity pass, and watertight residual refinement. If cleanup made the mesh
+//!    inconsistent, refinement retries from the preserved raw conversion;
 //! 5. **quality passes** — low-quad repair, degenerate/collinear repair,
 //!    angle-driven edge swaps, a three-radius smoothing polish, and a final
 //!    degenerate repair plus boundary-aware perturbation;
@@ -335,9 +336,10 @@ pub fn mesh_quads_with_route(
     let converted = mesh.clone();
 
     // Stages 4–6, in order: alternating smooth/walk rounds, the cavity pass if
-    // triangles survive, then the quality repairs and polishing. Each stage is
-    // allowed to change the topology or the geometry; the gate is measured only
-    // after all of them.
+    // triangles survive, residual refinement, then quality repairs and polishing.
+    // A refinement candidate must be watertight; when the cleaned mesh cannot
+    // provide one, retry from the raw conversion before cleanup. The gate is
+    // measured only after all stages.
     let rounds = close_rounds(&mut mesh, domain, size);
     let cavity_closures = close_cavities(&mut mesh, domain, size);
     if !tri_cells(&mesh).is_empty() {

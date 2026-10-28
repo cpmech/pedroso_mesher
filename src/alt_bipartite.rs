@@ -57,8 +57,10 @@
 //!   are corrected locally: zero-area input triangles are dropped, pairs of
 //!   quads sharing two edges are merged into one quad (§5.3 doublet), free
 //!   reflex vertices are unfolded, the crate's two-quad re-split is applied, and
-//!   a transactional label-flip retry is tried when a fold or a flat quad
-//!   remains.
+//!   a transactional label-flip retry around the bad quads and their edge
+//!   neighbours is tried when a fold or a flat quad remains. A final
+//!   boundary-aware perturbation can slide non-corner boundary samples along
+//!   their original edges to repair low angles without changing the domain.
 //!
 //! Measured result
 //! ---------------
@@ -557,6 +559,11 @@ fn assemble(
         size,
         Some(domain),
     );
+    let (p, q, t, _) =
+        crate::sun::perturb_low_quads(points, &quads, &leftover, size, 64, Some(domain));
+    *points = p;
+    quads = q;
+    leftover = t;
     let overlaps = overlap_count(&quads);
     let min_sj = quads
         .iter()
@@ -609,28 +616,43 @@ fn overlap_count(quads: &[[usize; 4]]) -> usize {
 /// monochromatic. The one-ring expansion gives the retry a chance to fix a fold
 /// whose cause is the label of a neighbouring quad rather than a folded corner.
 fn fold_neighbourhood(points: &[Node], quads: &[[usize; 4]]) -> Vec<usize> {
-    // A vertex is on the boundary when it belongs to an edge used once.
-    let mut edge_uses: HashMap<Edge, usize> = HashMap::new();
-    for q in quads {
+    let mut edge_owners: HashMap<Edge, Vec<usize>> = HashMap::new();
+    for (id, q) in quads.iter().enumerate() {
         for i in 0..4 {
-            *edge_uses.entry(edge_key(q[i], q[(i + 1) % 4])).or_insert(0) += 1;
+            edge_owners
+                .entry(edge_key(q[i], q[(i + 1) % 4]))
+                .or_default()
+                .push(id);
         }
     }
     let mut on_boundary: HashSet<usize> = HashSet::new();
-    for (&(a, b), &uses) in &edge_uses {
-        if uses == 1 {
+    for (&(a, b), ids) in &edge_owners {
+        if ids.len() == 1 {
             on_boundary.insert(a);
             on_boundary.insert(b);
         }
     }
     let mut candidates: Vec<usize> = Vec::new();
-    for q in quads {
+    for (id, q) in quads.iter().enumerate() {
         if quad_min_sj(points, q) > 0.0 {
             continue;
         }
         for &v in q {
             if !on_boundary.contains(&v) && !candidates.contains(&v) {
                 candidates.push(v);
+            }
+        }
+        for i in 0..4 {
+            let edge = edge_key(q[i], q[(i + 1) % 4]);
+            for &adjacent in edge_owners.get(&edge).into_iter().flatten() {
+                if adjacent == id {
+                    continue;
+                }
+                for &v in &quads[adjacent] {
+                    if !on_boundary.contains(&v) && !candidates.contains(&v) {
+                        candidates.push(v);
+                    }
+                }
             }
         }
     }

@@ -831,7 +831,7 @@ fn candidate_key(local: Local) -> (u8, OrderedF64) {
 /// [`regressed`] fires or when the boundary offset is above `1e-9` (a numerical
 /// surprise, because boundary nodes never move). Returns the input mesh in
 /// those cases.
-pub(crate) fn untangle(domain: &Domain, mesh: &Mesh, size: f64, options: &Options) -> Mesh {
+fn untangle(domain: &Domain, mesh: &Mesh, size: f64, options: &Options) -> Mesh {
     let (quads, tris) = cells(mesh);
     let n = mesh.points.len();
     if quads.is_empty() || n == 0 {

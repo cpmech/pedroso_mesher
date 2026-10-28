@@ -3,7 +3,7 @@
 Date: 2026-10-28
 Repository: `pedroso_mesher/`
 Branch: `main`
-State: **work in progress, uncommitted, two tests still failing**
+State: **all tests passing; complete baseline review in progress**
 
 ## Governing request and constraints
 
@@ -169,88 +169,72 @@ Temporary instrumentation (subsequently removed) showed:
 8. **Log-barrier untangling in `finish_side`.** Made
    `alt_untangle::untangle` `pub(crate)` and called it for raw pieces with
    inversions, accepting only a gate-score improvement. The targeted mixed
-   feature test still fails with the same two bipartite inversions. This is the
-   current experimental code still present in `src/simons_features.rs` and
-   `src/alt_untangle.rs`; decide whether to retain or revert it after further
-   diagnosis.
+   feature test still failed with the same two bipartite inversions. The
+   experiment was subsequently reverted and `untangle` is private again.
 
 All temporary `eprintln!` seam/piece instrumentation in `simons_features.rs`
 was removed. The original five-route `ROUTES` list is restored.
 
+## Mixed-feature resolution after the WIP commit
+
+Temporary coordinate diagnostics found the two bipartite defects in the left
+piece:
+
+- A folded quad at the slot tip with corners `(1.5,4.1)`, `(1.5,5)`,
+  `(1.538060...,5.191342...)`, `(0.8,5)` and minimum SJ about -0.19509.
+- A flat quad at the slot mouth with corners `(2,0)`, `(2.5,0.5)`, `(2,0.5)`,
+  `(1.5,0.5)`. The last three nodes are collinear on the slot cap.
+
+`fold_neighbourhood` originally expanded only from free vertices already in a
+bad quad. The flat quad had only boundary vertices, so its neighbourhood was
+empty. The search now also includes free vertices of every edge-adjacent quad,
+then applies the existing one-ring expansion. The bounded single/pair label-flip
+retry then removed every inversion. The remaining failure changed to a quality
+failure: minimum corner angle 26.565 degrees.
+
+The ordinary smoother could not improve those corners because they occur at
+fixed geometric vertices. Added the existing `sun::perturb_low_quads` pass at
+the end of bipartite assembly. It slides non-corner boundary samples only along
+their original domain edges and leaves original domain vertices fixed. The
+mixed feature test and `demo_numbers_are_gate_passing` then passed.
+
+The full suite passed **410 library tests, 5 CLI tests, and 11 doc tests**. The
+mixed feature demo now produces 113 quads with minimum SJ 0.2660, minimum angle
+32.0 degrees, zero cracks, and a passing gate. This is a quality decrease from
+the historical 112-quad SJ 0.6073 / 38.8-degree result and is recorded as such.
+
 ## Current important code state
 
-- `src/two_d.rs`: `close_by_refinement` is temporarily **`pub fn`** for the
-  external probe. Restore it to `pub(crate)` before final validation.
-- `src/alt_untangle.rs`: `untangle` is currently `pub(crate)` for the
-  mixed-feature experiment.
-- `src/simons_features.rs`: `finish_side` currently tries that untangler on
-  inverted raw pieces, then the existing boundary-preserving smoother.
-- `src/quad.rs`: raw-conversion retry is present and fixes the square test.
-- `src/alt_bipartite.rs`: bulk `CdtAdapter::from_loops_and_points` is restored.
+- `src/two_d.rs`: `close_by_refinement` is restored to `pub(crate)`.
+- `src/alt_untangle.rs`: `untangle` is private; the unsuccessful feature-side
+  untangling experiment is removed.
+- `src/simons_features.rs`: `finish_side` uses only the existing
+  boundary-preserving smoother; all diagnostics are removed. The measured mixed
+  feature table is updated.
+- `src/quad.rs`: raw-conversion retry remains, and stage-4 comments describe the
+  watertight residual-refinement fallback.
+- `src/alt_bipartite.rs`: bulk `CdtAdapter::from_loops_and_points` remains;
+  edge-adjacent retry expansion and final boundary-aware perturbation are the
+  new fixes.
 - No extra Crossfield/L-infinity feature routes remain.
-- No debug prints remain in `simons_features.rs`.
-- No commit or push has been made for this work.
-
-Current modified/untracked paths from `git status --short`:
-
-```text
- M Cargo.toml
- M REFERENCES.md
- M examples/phase_a.rs
- M src/alt_bipartite.rs
- M src/alt_crossfield.rs
- M src/alt_l1.rs
- M src/alt_paving.rs
- M src/alt_untangle.rs
- M src/config.rs
- M src/delaunay/geometry.rs
- M src/delaunay/mod.rs
- M src/delaunay/triangulation.rs
- M src/quad.rs
- M src/simons_features.rs
- M src/two_d.rs
-?? src/delaunay/adapter.rs
-?? HANDOVER.md
-```
+- `cargo fmt`, strict Clippy, and the Wasm library build pass after the fixes.
 
 ## External probe
 
 `phase-d/probe.rs` in temporary storage extracts the failing Q-Morph square,
 prints fan quality, invokes `close_by_refinement`, and reports topology/gate.
 It was useful for identifying the raw-versus-cleaned orientation issue. It
-requires the temporary public visibility of `close_by_refinement` and is not
-part of the repository.
+required temporary public visibility of `close_by_refinement`, which has since
+been restored to crate-private; the probe is not part of the repository.
 
-## Recommended next steps
+## Validation still in progress
 
-1. Diagnose the two inverted quads at the bipartite conversion stage. The route
-   already has `assemble`, bounded single/pair label-flip retries, unfolding,
-   repositioning, and Sun repairs, but returns the invalid all-quad topology
-   when those fail. Inspect the offending quad coordinates and the pairing that
-   created them rather than weakening the gate or feature tests.
-2. Decide whether the unsuccessful `finish_side` untangling experiment should
-   be reverted. If retained, it must provide a measured benefit and pass all
-   quality checks.
-3. Restore `two_d::close_by_refinement` to `pub(crate)` after external probing
-   is finished.
-4. Rerun the two feature tests, then the complete suite.
-5. Update affected module comments, especially `quad.rs` stage 4 and stale
-   measured claims. Update feature measurements only after the mixed case is
-   actually fixed.
-6. Rerun Q-Morph and all other affected raw/post baselines because the new
-   refinement fallback changes downstream output. Run the complete adversarial
-   corpus and review every comparison.
-7. Run final validation:
-
-   ```bash
-   cargo fmt && cargo test --offline && \
-   cargo clippy --offline --all-targets -- -D warnings && \
-   cargo build --offline --target wasm32-unknown-unknown --lib && \
-   git diff --check
-   ```
-
-8. Update `ObsidianVault/projects/Pedroso-Mesher.md`
-   with frontmatter `updated: 2026-10-28`, exact migration results, remaining
-   quality regressions, and final test counts.
-9. Do not declare Phase D complete while tests are red, comparisons are
-   unreviewed, or any `spade` dependency remains. Do not begin Phase E.
+1. Finish reviewing the regenerated complete raw/post baseline matrix. The
+   adversarial matrix is already reviewed: the only four classification changes
+   are intentional L-infinity errors for the self-intersecting outer loop and
+   outside hole. Other classifications are unchanged.
+2. Update `ObsidianVault/projects/Pedroso-Mesher.md` with frontmatter
+   `updated: 2026-10-28`, exact migration results, remaining quality changes,
+   and final test counts.
+3. Rerun `cargo test --offline` and `git diff --check` after the final
+   documentation edits. Do not begin Phase E.
