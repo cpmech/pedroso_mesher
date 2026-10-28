@@ -1,8 +1,9 @@
 //! `pedroso_mesher` — clean-room, pure-Rust, MIT-licensed unstructured quad and
 //! hex mesh generation for finite element analysis. The module map is: `mesh`
 //! is the data model (`Mesh`, `Cell`, `Node`, `Topology`); `two_d` is the
-//! planar substrate and the default quad-dominant `mesh_2d`; `quad` is the
-//! gate-checked all-quad pipeline (Q-Morph + Sun closure); `config` is the
+//! planar substrate and the default quad-dominant `mesh_2d`; `delaunay` is the
+//! independent robust fixed/mutable CDT kernel being built in Phase B; `quad`
+//! is the gate-checked all-quad pipeline (Q-Morph + Sun closure); `config` is the
 //! shipped API that selects any of the twelve routes and applies the shared
 //! smoother; `qmorph`, `parity`, `twostage`, `sun`, `recovery`, `grid`, `smooth`
 //! and `quality` are the shared stages; `stats`, `verify` and `bench` are the
@@ -81,6 +82,8 @@ pub mod alt_decompose;
 pub mod alt_crossfield;
 
 pub mod config;
+
+pub mod delaunay;
 
 pub mod simons_godf;
 
