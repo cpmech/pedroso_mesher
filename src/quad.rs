@@ -435,7 +435,7 @@ pub fn mesh_quads_with_route(
     // indices or prove domain coverage. Run the full geometric contract once at
     // the final API boundary, after all generation and quality passes.
     let geometry_reason = match verify::geometry(domain, &mesh) {
-        Ok(report) => report.reason(),
+        Ok(report) => report.located_reason(),
         Err(e) => Some(format!("invalid mesh: {e}")),
     };
     if let Some(reason) = geometry_reason {

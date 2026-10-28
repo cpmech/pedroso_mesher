@@ -347,25 +347,42 @@ fn overlapping_pairs(mesh: &Mesh) -> usize {
 /// Geometric checks that are too expensive for every smoothing iteration.
 ///
 /// Unlike [`Gate`], this report checks actual polygon intersections, containment
-/// in the domain, coincident nodes, non-manifold connectivity and total material
-/// area. It is intended for the final API boundary. `overlapping_pairs` counts
-/// pairs with positive-area intersection; touching at an edge or vertex is not
-/// an overlap. `coincident_points` counts duplicate referenced nodes after the
-/// first copy; unused point-storage entries are ignored.
+/// in the domain, coincident nodes, geometric T-junctions, non-manifold
+/// connectivity and total material area. It is intended for the final API
+/// boundary. `overlapping_pairs` counts pairs with positive-area intersection;
+/// touching at an edge or vertex is not an overlap. `coincident_points` counts
+/// duplicate referenced nodes after the first copy; unused point-storage entries
+/// are ignored.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GeometryReport {
     /// Planar cell pairs whose interiors intersect.
     pub overlapping_pairs: usize,
+    /// First intersecting cell pair, if any.
+    pub first_overlap: Option<(usize, usize)>,
     /// Planar cells with a vertex, edge or interior sample outside the domain.
     pub outside_cells: usize,
+    /// First cell extending outside the domain, if any.
+    pub first_outside_cell: Option<usize>,
     /// Extra referenced nodes at exactly the same 3D coordinates as an earlier node.
     pub coincident_points: usize,
+    /// First pair of coincident referenced nodes, if any.
+    pub first_coincident_nodes: Option<(usize, usize)>,
+    /// Referenced nodes lying in the interior of a cell edge that does not use them.
+    pub t_junctions: usize,
+    /// First T-junction as `(node, edge_start, edge_end)`, if any.
+    pub first_t_junction: Option<(usize, usize, usize)>,
     /// Edges shared by more than two planar cells.
     pub non_manifold_edges: usize,
+    /// First non-manifold edge as its two node indices, if any.
+    pub first_non_manifold_edge: Option<(usize, usize)>,
     /// Interior edges traversed in the same direction by both adjacent cells.
     pub inconsistent_edges: usize,
+    /// First inconsistently oriented edge as its two node indices, if any.
+    pub first_inconsistent_edge: Option<(usize, usize)>,
     /// Cells other than `Quad4` and `Tri3`, which this planar report cannot check.
     pub unsupported_cells: usize,
+    /// First unsupported cell, if any.
+    pub first_unsupported_cell: Option<usize>,
     /// Absolute difference between mesh area and domain area, in area units.
     pub area_error: f64,
     /// Allowed absolute area difference, relative to the domain area.
@@ -378,6 +395,7 @@ impl GeometryReport {
         self.overlapping_pairs == 0
             && self.outside_cells == 0
             && self.coincident_points == 0
+            && self.t_junctions == 0
             && self.non_manifold_edges == 0
             && self.inconsistent_edges == 0
             && self.unsupported_cells == 0
@@ -408,6 +426,12 @@ impl GeometryReport {
                 self.coincident_points
             ));
         }
+        if self.t_junctions > 0 {
+            return Some(format!(
+                "{} geometric T-junction node/edge incidence(s)",
+                self.t_junctions
+            ));
+        }
         if self.overlapping_pairs > 0 {
             return Some(format!(
                 "{} geometrically overlapping cell pair(s)",
@@ -427,6 +451,40 @@ impl GeometryReport {
             ));
         }
         None
+    }
+
+    /// The first failure with its cell, node or edge location when applicable.
+    pub fn located_reason(&self) -> Option<String> {
+        let reason = self.reason()?;
+        let location = if self.unsupported_cells > 0 {
+            self.first_unsupported_cell
+                .map(|cell| format!("cell {cell}"))
+        } else if self.non_manifold_edges > 0 {
+            self.first_non_manifold_edge
+                .map(|(a, b)| format!("edge {a}-{b}"))
+        } else if self.inconsistent_edges > 0 {
+            self.first_inconsistent_edge
+                .map(|(a, b)| format!("edge {a}-{b}"))
+        } else if self.coincident_points > 0 {
+            self.first_coincident_nodes
+                .map(|(a, b)| format!("nodes {a} and {b}"))
+        } else if self.t_junctions > 0 {
+            self.first_t_junction
+                .map(|(node, a, b)| format!("node {node} on edge {a}-{b}"))
+        } else if self.overlapping_pairs > 0 {
+            self.first_overlap
+                .map(|(a, b)| format!("cells {a} and {b}"))
+        } else if self.outside_cells > 0 {
+            self.first_outside_cell.map(|cell| format!("cell {cell}"))
+        } else if !self.area_error.is_finite() || self.area_error > self.area_tolerance {
+            Some("domain coverage".to_string())
+        } else {
+            None
+        };
+        Some(match location {
+            Some(location) => format!("{reason} ({location})"),
+            None => reason,
+        })
     }
 }
 
@@ -458,20 +516,29 @@ pub fn geometry(
         }
     }
     let mut coincident: HashMap<(u64, u64, u64), usize> = HashMap::new();
+    let mut coincident_points = 0usize;
+    let mut first_coincident_nodes = None;
     for (id, &p) in mesh.points.iter().enumerate() {
-        if used[id] {
-            *coincident.entry(coordinate_key(p)).or_default() += 1;
+        if !used[id] {
+            continue;
+        }
+        if let Some(&first) = coincident.get(&coordinate_key(p)) {
+            coincident_points += 1;
+            first_coincident_nodes.get_or_insert((first, id));
+        } else {
+            coincident.insert(coordinate_key(p), id);
         }
     }
-    let coincident_points = coincident.values().map(|n| n.saturating_sub(1)).sum();
 
     let mut cells = Vec::with_capacity(mesh.cells.len());
     let mut unsupported_cells = 0usize;
+    let mut first_unsupported_cell = None;
     let mut area = 0.0;
     let mut compensation = 0.0;
-    for cell in &mesh.cells {
+    for (id, cell) in mesh.cells.iter().enumerate() {
         if cell.kind == Kind::Hex8 {
             unsupported_cells += 1;
+            first_unsupported_cell.get_or_insert(id);
             continue;
         }
         let value = quality::volume(cell, &mesh.points).abs();
@@ -482,7 +549,7 @@ pub fn geometry(
         cells.push(cell_geometry(&mesh.points, cell));
     }
 
-    let overlapping_pairs = count_geometric_overlaps(&cells);
+    let (overlapping_pairs, first_overlap) = count_geometric_overlaps(&cells);
     let domain_area = domain.area();
     let area_error = if domain_area.is_finite() && domain_area > 0.0 && area.is_finite() {
         (area - domain_area).abs()
@@ -494,24 +561,75 @@ pub fn geometry(
     } else {
         0.0
     };
-    let outside_cells = if unsupported_cells == 0 {
-        (0..mesh.cells.len())
-            .filter(|&id| cell_extends_outside(domain, &mesh.points, &mesh.cells[id], &cells[id]))
-            .count()
+    let mut outside_cells = 0usize;
+    let mut first_outside_cell = None;
+    if unsupported_cells == 0 {
+        for id in 0..mesh.cells.len() {
+            if cell_extends_outside(domain, &mesh.points, &mesh.cells[id], &cells[id]) {
+                outside_cells += 1;
+                first_outside_cell.get_or_insert(id);
+            }
+        }
+    }
+    let (t_junctions, first_t_junction) = if unsupported_cells == 0 {
+        count_t_junctions(mesh, &used, 1.0e-12 * domain_diagonal(domain))
     } else {
-        0
+        (0, None)
     };
 
     Ok(GeometryReport {
         overlapping_pairs,
+        first_overlap,
         outside_cells,
+        first_outside_cell,
         coincident_points,
+        first_coincident_nodes,
+        t_junctions,
+        first_t_junction,
         non_manifold_edges: topology.non_manifold,
+        first_non_manifold_edge: if topology.non_manifold > 0 {
+            first_non_manifold_edge(mesh)
+        } else {
+            None
+        },
         inconsistent_edges: topology.inconsistent,
+        first_inconsistent_edge: if topology.inconsistent > 0 {
+            first_inconsistent_edge(mesh)
+        } else {
+            None
+        },
         unsupported_cells,
+        first_unsupported_cell,
         area_error,
         area_tolerance,
     })
+}
+
+fn first_non_manifold_edge(mesh: &Mesh) -> Option<(usize, usize)> {
+    first_special_edge(mesh, true)
+}
+
+fn first_inconsistent_edge(mesh: &Mesh) -> Option<(usize, usize)> {
+    first_special_edge(mesh, false)
+}
+
+fn first_special_edge(mesh: &Mesh, non_manifold: bool) -> Option<(usize, usize)> {
+    let mut seen: HashMap<(usize, usize), (usize, (usize, usize))> = HashMap::new();
+    for cell in &mesh.cells {
+        for i in 0..cell.nodes.len() {
+            let a = cell.nodes[i];
+            let b = cell.nodes[(i + 1) % cell.nodes.len()];
+            let key = (a.min(b), a.max(b));
+            let (count, first) = seen.entry(key).or_insert((0, (a, b)));
+            *count += 1;
+            if (*count == 3 && non_manifold)
+                || (*count == 2 && !non_manifold && (a < b) == (first.0 < first.1))
+            {
+                return Some(key);
+            }
+        }
+    }
+    None
 }
 
 fn coordinate_key(p: crate::mesh::Node) -> (u64, u64, u64) {
@@ -548,7 +666,7 @@ fn cell_geometry(points: &[crate::mesh::Node], cell: &crate::mesh::Cell) -> Cell
     }
 }
 
-fn count_geometric_overlaps(cells: &[CellGeometry]) -> usize {
+fn count_geometric_overlaps(cells: &[CellGeometry]) -> (usize, Option<(usize, usize)>) {
     let mut order: Vec<usize> = (0..cells.len()).collect();
     order.sort_by(|&a, &b| {
         cells[a].min[0]
@@ -557,6 +675,7 @@ fn count_geometric_overlaps(cells: &[CellGeometry]) -> usize {
     });
     let mut active: Vec<usize> = Vec::new();
     let mut overlapping = 0usize;
+    let mut first = None;
     for current in order {
         active.retain(|&other| cells[other].max[0] >= cells[current].min[0]);
         for &other in &active {
@@ -564,15 +683,93 @@ fn count_geometric_overlaps(cells: &[CellGeometry]) -> usize {
                 && polygons_overlap(&cells[other], &cells[current])
             {
                 overlapping += 1;
+                first.get_or_insert((other, current));
             }
         }
         active.push(current);
     }
-    overlapping
+    (overlapping, first)
 }
 
 fn boxes_overlap(a: &CellGeometry, b: &CellGeometry) -> bool {
     a.min[0] <= b.max[0] && a.max[0] >= b.min[0] && a.min[1] <= b.max[1] && a.max[1] >= b.min[1]
+}
+
+fn count_t_junctions(
+    mesh: &Mesh,
+    used: &[bool],
+    tolerance: f64,
+) -> (usize, Option<(usize, usize, usize)>) {
+    #[derive(Clone, Copy)]
+    struct Edge {
+        nodes: [usize; 2],
+        a: [f64; 2],
+        b: [f64; 2],
+        min: [f64; 2],
+        max: [f64; 2],
+    }
+
+    let mut edges = Vec::with_capacity(mesh.cells.len() * 4);
+    for cell in &mesh.cells {
+        for i in 0..cell.nodes.len() {
+            let na = cell.nodes[i];
+            let nb = cell.nodes[(i + 1) % cell.nodes.len()];
+            let a = [mesh.points[na][0], mesh.points[na][1]];
+            let b = [mesh.points[nb][0], mesh.points[nb][1]];
+            edges.push(Edge {
+                nodes: [na, nb],
+                a,
+                b,
+                min: [a[0].min(b[0]), a[1].min(b[1])],
+                max: [a[0].max(b[0]), a[1].max(b[1])],
+            });
+        }
+    }
+    edges.sort_by(|a, b| {
+        a.min[0]
+            .total_cmp(&b.min[0])
+            .then_with(|| a.nodes.cmp(&b.nodes))
+    });
+    let mut nodes: Vec<usize> = (0..mesh.points.len()).filter(|&id| used[id]).collect();
+    nodes.sort_by(|&a, &b| {
+        mesh.points[a][0]
+            .total_cmp(&mesh.points[b][0])
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mut active = Vec::new();
+    let mut next_edge = 0usize;
+    let mut count = 0usize;
+    let mut first = None;
+    for node in nodes {
+        let p = [mesh.points[node][0], mesh.points[node][1]];
+        while next_edge < edges.len() && edges[next_edge].min[0] <= p[0] + tolerance {
+            active.push(next_edge);
+            next_edge += 1;
+        }
+        active.retain(|&edge| edges[edge].max[0] >= p[0] - tolerance);
+        for &edge in &active {
+            let e = edges[edge];
+            if e.nodes.contains(&node) || p[1] < e.min[1] - tolerance || p[1] > e.max[1] + tolerance
+            {
+                continue;
+            }
+            let ab = [e.b[0] - e.a[0], e.b[1] - e.a[1]];
+            let ap = [p[0] - e.a[0], p[1] - e.a[1]];
+            let length_squared = ab[0] * ab[0] + ab[1] * ab[1];
+            if length_squared == 0.0 {
+                continue;
+            }
+            let length = length_squared.sqrt();
+            let projection = (ap[0] * ab[0] + ap[1] * ab[1]) / length;
+            let distance = (ab[0] * ap[1] - ab[1] * ap[0]).abs() / length;
+            if projection > tolerance && projection < length - tolerance && distance <= tolerance {
+                count += 1;
+                first.get_or_insert((node, e.nodes[0], e.nodes[1]));
+            }
+        }
+    }
+    (count, first)
 }
 
 fn polygons_overlap(a: &CellGeometry, b: &CellGeometry) -> bool {
@@ -891,6 +1088,66 @@ mod tests {
         assert!(report.passes(), "{report:?}");
     }
 
+    fn t_junction_rectangle(scale: f64, offset: [f64; 2]) -> (crate::two_d::Domain, Mesh) {
+        let map = |p: [f64; 2]| [offset[0] + scale * p[0], offset[1] + scale * p[1], 0.0];
+        let domain = crate::two_d::Domain::new(
+            vec![
+                [offset[0], offset[1]],
+                [offset[0] + 2.0 * scale, offset[1]],
+                [offset[0] + 2.0 * scale, offset[1] + scale],
+                [offset[0], offset[1] + scale],
+            ],
+            vec![],
+        )
+        .unwrap();
+        let points = vec![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [2.0, 1.0],
+            [1.0, 0.5],
+            [2.0, 0.5],
+        ]
+        .into_iter()
+        .map(map)
+        .collect();
+        let mesh = Mesh::new(
+            points,
+            vec![
+                Cell::quad4([0, 1, 4, 3]),
+                Cell::quad4([1, 2, 7, 6]),
+                Cell::quad4([6, 7, 5, 4]),
+            ],
+        );
+        (domain, mesh)
+    }
+
+    #[test]
+    fn strict_geometry_detects_a_t_junction() {
+        let (domain, mesh) = t_junction_rectangle(1.0, [0.0, 0.0]);
+        assert_eq!(gate(&mesh).overlapping, 0);
+        let report = geometry(&domain, &mesh).unwrap();
+        assert_eq!(report.t_junctions, 1);
+        assert_eq!(report.first_t_junction, Some((6, 1, 4)));
+        assert_eq!(report.overlapping_pairs, 0);
+        assert!(report.reason().unwrap_or_default().contains("T-junction"));
+        assert!(report
+            .located_reason()
+            .unwrap_or_default()
+            .contains("node 6 on edge 1-4"));
+        assert!(!report.passes());
+    }
+
+    #[test]
+    fn strict_geometry_detects_a_translated_and_scaled_t_junction() {
+        let (domain, mesh) = t_junction_rectangle(1.0e6, [-3.0e7, 2.0e7]);
+        let report = geometry(&domain, &mesh).unwrap();
+        assert_eq!(report.t_junctions, 1);
+        assert!(!report.passes());
+    }
+
     #[test]
     fn strict_geometry_detects_overlap_without_shared_node_indices() {
         let domain = crate::two_d::Domain::rectangle(3.0, 3.0).unwrap();
@@ -1005,7 +1262,35 @@ mod tests {
         );
         let report = geometry(&domain, &mesh).unwrap();
         assert_eq!(report.non_manifold_edges, 1);
+        assert_eq!(report.first_non_manifold_edge, Some((0, 1)));
+        assert!(report
+            .located_reason()
+            .unwrap_or_default()
+            .contains("edge 0-1"));
         assert!(!report.passes());
+    }
+
+    #[test]
+    fn strict_geometry_locates_inconsistent_orientation() {
+        let (domain, mut mesh) = two_quad_rectangle();
+        mesh.cells[1].nodes = vec![1, 4, 5, 2];
+        let report = geometry(&domain, &mesh).unwrap();
+        assert_eq!(report.inconsistent_edges, 1);
+        assert_eq!(report.first_inconsistent_edge, Some((1, 4)));
+        assert!(report
+            .located_reason()
+            .unwrap_or_default()
+            .contains("edge 1-4"));
+    }
+
+    #[test]
+    fn strict_geometry_locates_area_failure_at_domain_level() {
+        let domain = crate::two_d::Domain::rectangle(2.0, 2.0).unwrap();
+        let report = geometry(&domain, &unit_quad()).unwrap();
+        assert!(report
+            .located_reason()
+            .unwrap_or_default()
+            .contains("domain coverage"));
     }
 
     #[test]

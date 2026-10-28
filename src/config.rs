@@ -553,7 +553,7 @@ pub fn generate_quad(
         })));
     }
     let geometry_reason = match crate::verify::geometry(domain, &out.mesh) {
-        Ok(report) => report.reason(),
+        Ok(report) => report.located_reason(),
         Err(e) => Some(format!("invalid mesh: {e}")),
     };
     if let Some(reason) = geometry_reason {
