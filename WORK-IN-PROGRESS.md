@@ -2,32 +2,33 @@
 
 ## Current task
 
-Add **one regression test** for the known dense-hole O-grid/post-smoothing
-failure. This is a test-only change: do not change the meshing or smoothing
-implementation yet.
+Isolate which stage of the common post-pass causes the dense-hole O-grid
+quality regression. This is diagnostic work: do not change the meshing or
+smoothing implementation.
 
-## Intended checks
+## Diagnostic plan
 
-Exercise the real generation path for the smallest existing dense-hole case and
-check that:
+Reuse the recorded failing case in
+`dense_hole_o_grid_survives_common_post_smoothing`: a 100 x 60 plate,
+radius-10 hole with 48 segments, and element size 1. Measure the mesh:
 
-- mesh topology remains valid;
-- scaled Jacobians are positive within the project's established tolerance; and
-- the domain boundary is preserved.
+1. after raw O-grid generation;
+2. after 80 smoothing sweeps;
+3. after the 12 angle-swap rounds; and
+4. after up to 200 perturbation rounds.
 
-First locate the existing dense-hole fixtures, tests and recorded failure to
-reuse the exact case and test conventions. The expected initial result is a
-focused test that reproduces the failure; a green test would mean the case does
-not reproduce the reported regression and must be recorded rather than treated
-as a fix.
+At every stage record minimum scaled Jacobian, minimum corner angle, inverted
+and overlapping counts, cracks, boundary offset and gate verdict. Identify the
+first stage that loses the raw pass. Prefer temporary diagnostic instrumentation
+over production changes, and record the exact command and results below.
 
 ## Constraints
 
 - Pure Rust, no new dependencies, no `unsafe`, and no panics outside tests.
-- Keep the change limited to one regression test and this handover file.
-- Record the test command and its actual result below before stopping.
+- Do not change the production implementation or weaken the regression test.
+- Record the diagnostic command and its actual result below before stopping.
 
-## Result
+## Completed baseline
 
 Added `dense_hole_o_grid_survives_common_post_smoothing` in
 `src/alt_decompose.rs`. It uses the recorded failing case: a 100 x 60 plate,
