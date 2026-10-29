@@ -635,10 +635,9 @@ fn build_mesh(points: &[Node], quads: &[[usize; 4]], leftover: &[[usize; 3]]) ->
 /// Interior nodes move to the centroid of their ring. Boundary sampling nodes
 /// slide **along** the boundary segment they sit on, which is where the worst
 /// angles are. Original domain vertices stay fixed: removing even a shallow
-/// vertex replaces two boundary edges by a chord and changes the polygon. A move
-/// is accepted only when it raises the smallest angle of every incident quad
-/// *and* does not lower the smallest scaled Jacobian — the lesson from the first
-/// smoothing attempt, which traded 0.37 of Jacobian for one degree of angle.
+/// vertex replaces two boundary edges by a chord and changes the polygon. Each
+/// move minimizes the sum of its incident corner objectives. As a final safety
+/// guard, a gate-passing input is restored if the completed pass fails the gate.
 ///
 /// This is a nodally based quality objective in the spirit of Knupp 2000
 /// (corpus `knupp-2000-part1`), not the Laplacian smoother the name might
@@ -650,7 +649,15 @@ fn build_mesh(points: &[Node], quads: &[[usize; 4]], leftover: &[[usize; 3]]) ->
 /// The caller is [`mesh_2d`]; the public form exists so a caller can re-smooth a
 /// mesh after its own post-processing.
 pub fn smooth_mesh(mesh: &mut Mesh, domain: &Domain, iterations: usize, size: f64) {
+    if !crate::verify::gate(mesh).passes() {
+        smooth(mesh, domain, iterations, size);
+        return;
+    }
+    let original = mesh.points.clone();
     smooth(mesh, domain, iterations, size);
+    if !crate::verify::gate(mesh).passes() {
+        mesh.points = original;
+    }
 }
 
 /// Implementation of [`smooth_mesh`], also used internally by [`mesh_2d`].

@@ -48,16 +48,13 @@
 //! such a mesh is returned, and the gate is the judge.
 //!
 //! Measured result (`examples/alt_decompose.rs`, default [`Options`]): all
-//! seven corpus parts are all-quad, watertight and **7/7 PASS raw**; the raw
-//! corner is 30.1 degrees on the 0.6 mm performance part (SJ 0.375) and 30.4
-//! degrees on the 1 mm plate (SJ 0.405).  After the common external post-pass
-//! (smoothing, quality swaps, perturbation) five of seven still pass: the 1 mm
-//! plate (9.8 degrees, SJ 0.170) and the 0.6 mm part (6.6 degrees, SJ 0.115)
-//! fail on the first ring outside the hole.  That ring is the measured limit:
-//! at 2 mm the post-pass worst corner is **30.1 degrees** (SJ 0.267), only 0.1
-//! degree above the 30-degree gate, at the two extreme side points where a
-//! radial O-grid chord meets a short hole arc.  The internal `relax` (40
-//! sweeps) and `polish` are already included in the "raw" rows.
+//! seven corpus parts are all-quad, watertight and **7/7 PASS raw and after the
+//! common external post-pass** (smoothing, quality swaps, perturbation).  The
+//! whole-pass smoothing guard restores the raw coordinates when smoothing would
+//! lose the gate, so the 2 mm, 1 mm and 0.6 mm hole rows retain their raw
+//! quality.  The 1 mm plate has SJ 0.405 and corner 30.4 degrees; the 0.6 mm
+//! performance part has SJ 0.375 and corner 30.1 degrees.  The internal `relax`
+//! (40 sweeps) and `polish` are already included in the "raw" rows.
 
 use std::collections::{HashMap, VecDeque};
 

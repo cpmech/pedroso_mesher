@@ -102,9 +102,9 @@ pub enum Route {
     /// transfinite templates). Character: recursive chords until every patch
     /// has four corners, then a discrete Coons map; exact on axis-aligned
     /// parts, but the 8-patch O-grid ring around a hole limits quality.
-    /// Measured table: `examples/alt_decompose.rs`; all-quad and watertight
-    /// 7/7, raw 7/7 PASS; after the common post-pass the plate-hole 1 mm and
-    /// 0.6 mm rows can fall below the 30 degree gate on that ring.
+    /// Measured table: `examples/alt_decompose.rs`; all-quad, watertight and
+    /// 7/7 PASS raw and after the common post-pass. The whole-pass smoothing
+    /// guard restores the raw coordinates if smoothing would lose the gate.
     Decompose,
 
     /// **Hybrid** — indirect, quad-dominant. Paper `zint-2021`, using the
