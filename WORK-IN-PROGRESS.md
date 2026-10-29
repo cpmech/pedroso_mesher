@@ -2,51 +2,87 @@
 
 ## Current task
 
-Isolate which stage of the common post-pass causes the dense-hole O-grid
-quality regression. This is diagnostic work: do not change the meshing or
-smoothing implementation.
+Prototype the smallest whole-pass safety guard in `two_d::smooth_mesh`: preserve
+a passing input mesh when the existing smoother returns a failing mesh.
 
-## Diagnostic plan
+## Implementation and validation plan
 
-Reuse the recorded failing case in
-`dense_hole_o_grid_survives_common_post_smoothing`: a 100 x 60 plate,
-radius-10 hole with 48 segments, and element size 1. Measure the mesh:
-
-1. after raw O-grid generation;
-2. after 80 smoothing sweeps;
-3. after the 12 angle-swap rounds; and
-4. after up to 200 perturbation rounds.
-
-At every stage record minimum scaled Jacobian, minimum corner angle, inverted
-and overlapping counts, cracks, boundary offset and gate verdict. Identify the
-first stage that loses the raw pass. Prefer temporary diagnostic instrumentation
-over production changes, and record the exact command and results below.
+1. Measure the input gate and save its node coordinates when it passes.
+2. Run the existing smoothing algorithm unchanged.
+3. Restore the saved coordinates if the input passed but the result fails.
+4. Run `dense_hole_o_grid_survives_common_post_smoothing` without weakening it,
+   then run the existing smoothing tests and formatting/diff checks.
+5. Record the actual gate metrics and any regressions below. Do not refine this
+   into a per-sweep or per-node guard until the whole-pass behavior is measured.
 
 ## Constraints
 
 - Pure Rust, no new dependencies, no `unsafe`, and no panics outside tests.
-- Do not change the production implementation or weaken the regression test.
-- Record the diagnostic command and its actual result below before stopping.
+- Do not change the local smoothing objective in this experiment.
+- Preserve existing behavior for inputs that already fail the gate.
+
+## Smoothing-move result
+
+Temporary instrumentation ran `two_d::smooth_mesh` one sweep at a time and then
+stopped at the first node-level gate failure:
+
+```text
+cargo test dense_hole_sweep_diagnostic -- --nocapture
+```
+
+The **first full sweep fails**: minimum scaled Jacobian falls from
+`0.405131722017` to `0.197644640076`, and minimum corner angle falls from
+`30.425995029317°` to `11.399257682143°`. The worst quad is cell 2464, corner
+3/node 2865, with nodes `[2864, 2883, 2884, 2865]`. All four nodes move during
+that sweep, and all are interior nodes.
+
+A second run stopped immediately when an accepted move first lost the gate.
+Interior node 458 moved from `[27.41268632381083, 5.506004378814177]` to
+`[27.624818358166795, 5.718136413170141]`: the `0.3 * size` candidate at 45
+degrees. This move leaves minimum scaled Jacobian at `0.405131722017` but drops
+minimum corner angle to `29.924307964860°` in cell 1331, corner 2/node 458.
+Both the first gate crossing and the worst full-sweep quad therefore involve
+**interior moves, not boundary slides**. Later interior moves degrade quality
+further.
+
+The smoother accepts a sum of incident corner objectives, not a global gate
+improvement, which explains why a locally improving move can cross the gate.
+Temporary instrumentation and the early return were removed; production code
+and the permanent regression test remain unchanged.
+
+Next: evaluate the smallest acceptance guard that prevents smoothing from
+losing a passing mesh, then test it against the permanent regression and the
+existing smoothing tests.
+
+## Post-pass stage result
+
+Temporary instrumentation ran each post-pass stage separately with:
+
+```text
+cargo test dense_hole_stage_diagnostic -- --nocapture
+```
+
+| Stage | Minimum scaled Jacobian | Minimum corner angle | Gate |
+| --- | ---: | ---: | --- |
+| Raw O-grid | 0.405131722017 | 30.425995029317° | PASS |
+| 80 smoothing sweeps | 0.169896689045 | 9.781812395935° | FAIL |
+| 12 angle-swap rounds | 0.169896689045 | 9.781812395935° | FAIL |
+| 200 perturbation rounds | 0.169896689045 | 9.781812395935° | FAIL |
+
+Every stage reported zero inverted cells, zero overlapping pairs and zero
+cracks. Boundary offset remained `7.105e-15`. The **80 smoothing sweeps cause
+the complete measured regression**; angle swaps and perturbation make no
+further change.
 
 ## Completed baseline
 
 Added `dense_hole_o_grid_survives_common_post_smoothing` in
-`src/alt_decompose.rs`. It uses the recorded failing case: a 100 x 60 plate,
-radius-10 hole with 48 segments, and element size 1. The test runs the real
-O-grid route followed by the benchmark's common post-pass (80 smoothing sweeps,
-12 angle-swap rounds and up to 200 perturbation rounds).
-
-Command:
+`src/alt_decompose.rs`. It uses the same case and complete common post-pass.
+The raw mesh passes; after post-processing the boundary-offset, zero-crack and
+positive-Jacobian checks pass, but the final gate fails with
+`min scaled Jacobian 0.170 < 0.2`. This is an intentionally failing regression
+test, not a fix. Its command is:
 
 ```text
 cargo test dense_hole_o_grid_survives_common_post_smoothing -- --nocapture
 ```
-
-Actual result: **the regression is reproduced**. The raw mesh passes the gate.
-After smoothing, the boundary-offset, zero-crack and positive-Jacobian checks
-pass, but the final gate fails with `min scaled Jacobian 0.170 < 0.2`. This is
-an intentionally failing regression test, not a fix.
-
-`cargo fmt --check` and `git diff --check` pass. No implementation code was
-changed. Next: diagnose why the post-pass degrades the first hole ring, make
-the smallest implementation fix, and rerun this test without weakening it.
