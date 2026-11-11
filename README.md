@@ -4,9 +4,9 @@
 
 This Rust crate implements several mesh generation algorithms. The goal is to generate unstructured meshes with good quality for Finite Element Analysis (FEA).
 
-The implementation is **MIT-licensed in pure Rust**. No external library is used. Every algorithm is implemented from public journal papers and university theses. No code is ported. See `AGENTS.md` and [`REFERENCES.md`](REFERENCES.md) for further constraints and details. The code also compiles for `wasm32-unknown-unknown` and `wasm32-wasip1`.
+The implementation is **MIT-licensed in pure Rust**. Every meshing algorithm is implemented from scratch by reading public journal papers and university theses; no meshing code is ported from external libraries. Its only runtime dependencies are [`algebra_linear`](https://github.com/cpmech/algebra_linear) (clean-room pure-Rust linear algebra) and `serde` / `serde_json`. See `AGENTS.md` and [`REFERENCES.md`](REFERENCES.md) for further constraints and details. The code compiles cleanly for `wasm32-unknown-unknown` and `wasm32-wasip1`.
 
-This tool will be used by [gemlab](https://github.com/cpmech/gemlab) and will include meshes with the following **shape** (ake, "elements" in the FEA jargon) types:
+This tool will be used by [gemlab](https://github.com/cpmech/gemlab) and will include meshes with the following **shape** (aka, "elements" in the FEA jargon) types:
 
 * Tri3, Tri6 -- Triangles and triangles with "middle" vertices
 * Qua4, Qua8 -- Quadrilaterals and quadrilaterals with "middle" vertices

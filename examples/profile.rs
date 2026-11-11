@@ -10,13 +10,13 @@ use pedroso_mesher::quality;
 use pedroso_mesher::two_d::{mesh_2d, Domain, Sizing};
 
 fn profile(name: &str, mesh: &Mesh) {
-    let quads = mesh.cells.iter().filter(|c| c.kind == Kind::Quad4).count();
+    let quads = mesh.cells.iter().filter(|c| c.kind == Kind::Qua4).count();
     let tris = mesh.cells.iter().filter(|c| c.kind == Kind::Tri3).count();
     let mut angles = Vec::new();
     let mut sjs = Vec::new();
     let mut aspect = Vec::new();
     for cell in &mesh.cells {
-        if cell.kind != Kind::Quad4 {
+        if cell.kind != Kind::Qua4 {
             continue;
         }
         let a = quality::quad_angles(cell, &mesh.points);
@@ -58,7 +58,7 @@ fn profile(name: &str, mesh: &Mesh) {
     }
     let mut valence = vec![0usize; mesh.points.len()];
     for cell in &mesh.cells {
-        if cell.kind == Kind::Quad4 {
+        if cell.kind == Kind::Qua4 {
             for &v in &cell.nodes {
                 valence[v] += 1;
             }

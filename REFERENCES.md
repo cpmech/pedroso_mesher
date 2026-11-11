@@ -1,146 +1,214 @@
 # References
 
-Numbered list of the references used by this crate. Corpus ids are the file
-stems under `~/03-Writings/articles-and-books/mesh-generation/quad-hex-mesh/`
-(`INDEX.md`, 53 entries): `blacker-1991` is `pdf/blacker-1991.pdf` and
-`md/blacker-1991.md`. Module paths say where the paper is implemented or
-cited. The second block lists the references inside the Simons thesis that
-the `simons_*` modules implement.
+Bibliography of the scientific journal papers, conference proceedings, and university theses implemented or referenced in `pedroso_mesher`. All algorithms are implemented clean-room in pure Rust strictly from these public publications.
 
+---
 
-## Corpus papers used
+## 1. Foundations (Geometric Predicates, Delaunay Refinement, Quality Metrics & Graph Matching)
 
-1. **owen-1999** — Owen S.J., Staten M.L., Canann S.A., Saigal S., 1999. "Q-Morph: an indirect approach to advancing front quad meshing." International Journal for Numerical Methods in Engineering, 44(9): 1317-1340.
-   Used in: Q-Morph: the advancing-front indirect conversion (`src/qmorph.rs`).
+1. **shewchuk-1997** — Shewchuk J.R., 1997. "Adaptive Precision Floating-Point Arithmetic and Fast Robust Geometric Predicates." *Discrete & Computational Geometry*, 18(3): 305–363. DOI: `10.1007/PL00009321`.
+   Module: `src/papers/foundations/shewchuk_1997.rs`.
 
-2. **sun-2015** — Automatic quad meshing and quality improvement by improved combination. 2015. (Full citation in `md/sun-2015.md` and `pdf/sun-2015.pdf`.)
-   Used in: The Sun residual walk and templates (`src/sun.rs`).
+2. **shewchuk-2002-delaunay-refinement** — Shewchuk J.R., 2002. "Delaunay refinement algorithms for triangular mesh generation." *Computational Geometry*, 22(1–3): 21–74. DOI: `10.1016/S0925-7721(01)00047-5`.
+   Module: `src/papers/foundations/shewchuk_2002.rs`.
 
-3. **sun-2016** — Complete triangle-to-quad conversion for multiple-domain geometry. 2016. (Full citation in `md/sun-2016.md` and `pdf/sun-2016.pdf`.)
-   Used in: Triangle-to-quad conversion: cavity closure and the Sun templates (`src/sun.rs`).
+3. **knupp-2000-part1** — Knupp P.M., 2000. "Achieving finite element mesh quality via optimization of the Jacobian matrix norm and associated quantities. Part I—A framework for surface mesh optimization." *International Journal for Numerical Methods in Engineering*, 48(3): 401–420.
+   Module: `src/papers/foundations/knupp_2000.rs`, `src/core/quality.rs`.
 
-4. **remacle-2012** — Remacle J.-F., Lambrechts J., Seny B., Marchandise E., Johnen A., Geuzaine C., 2012. "Blossom-Quad: A non-uniform quadrilateral mesh generator using a minimum-cost perfect-matching algorithm." International Journal for Numerical Methods in Engineering, 89(9): 1102-1119.
-   Used in: Blossom-Quad minimum-cost perfect matching: the default `two_d::mesh_2d` pairing (`src/two_d.rs`).
+4. **knupp-2000-part2** — Knupp P.M., 2000. "Achieving finite element mesh quality via optimization of the Jacobian matrix norm and associated quantities. Part II—A framework for volume mesh optimization and the condition number of the Jacobian matrix." *International Journal for Numerical Methods in Engineering*, 48(8): 1165–1185.
+   Module: `src/papers/foundations/knupp_2000.rs`, `src/core/quality.rs`.
 
-5. **shewchuk-2002-delaunay-refinement** — Shewchuk J.R., 2002. "Delaunay refinement algorithms for triangular mesh generation." Computational Geometry, 22(1-3): 21-74.
-   Used in: Delaunay refinement used by the clean-room triangulator (`two_d::triangulate`, `src/delaunay`).
+5. **edmonds-1965** — Edmonds J., 1965. "Paths, trees, and flowers." *Canadian Journal of Mathematics*, 17: 449–467; and Edmonds J., 1965. "Maximum matching and a polyhedron with 0,1-vertices." *Journal of Research of the National Bureau of Standards*, 69B: 125–130. (See also Galil Z., 1986, *ACM Computing Surveys* 18(1): 23–38.)
+   Module: `src/core/matching.rs`.
 
-6. **shewchuk-1997** — Shewchuk J.R., 1997. "Adaptive Precision Floating-Point Arithmetic and Fast Robust Geometric Predicates." Discrete & Computational Geometry, 18(3): 305-363.
-   Used in: Clean-room adaptive-precision geometric predicates (`src/delaunay/predicates.rs`).
+---
 
-7. **knupp-2000-part1** — Knupp P.M., 2000. "Achieving finite element mesh quality via optimization of the Jacobian matrix norm and associated quantities. Part I: A framework for surface mesh optimization." International Journal for Numerical Methods in Engineering, 48(3): 401-420.
-   Used in: Scaled Jacobian / quality metric definitions (`src/quality.rs`).
+## 2. Direct 2D Quadrilateral Generation
 
-8. **knupp-2000-part2** — Knupp P.M., 2000. "Achieving finite element mesh quality via optimization of the Jacobian matrix norm and associated quantities. Part II: A framework for volume mesh optimization and the condition number of the Jacobian matrix." International Journal for Numerical Methods in Engineering, 48(8): 1165-1185.
-   Used in: 3D Jacobian quality (the hex side of `src/quality.rs`).
+6. **blacker-1991** — Blacker T.D., Stephenson M.B., 1991. "Paving: A new approach to automated quadrilateral mesh generation." *International Journal for Numerical Methods in Engineering*, 32(4): 811–847. DOI: `10.1002/nme.1620320410`.
+   Module: `src/papers/quad_direct/blacker_1991.rs`.
 
-9. **blacker-1991** — Blacker T.D., Stephenson M.B., 1991. "Paving: A new approach to automated quadrilateral mesh generation." International Journal for Numerical Methods in Engineering, 32(4): 811-847.
-   Used in: Paving: rows, seam (section 2.8), closure (`src/alt_paving.rs`).
+7. **pellenard-2011** — Pellenard B., Alliez P., Morvan J.-M., 2011. "Isotropic 2D quadrangle meshing with size and orientation control." *Proceedings of the 20th International Meshing Roundtable*, Springer, pp. 81–98.
+   Module: `src/papers/quad_direct/pellenard_2011.rs`.
 
-10. **georgiadis-2022** — Indirect all-quadrilateral meshing based on bipartite topological labeling. 2022. (Full citation in `md/georgiadis-2022.md` and `pdf/georgiadis-2022.pdf`.)
-   Used in: Right-angled triangles + bipartite labelling (`src/alt_bipartite.rs`).
+8. **remacle-2013** — Remacle J.-F., Henrotte F., Carrier-Baudouin T., Béchet E., Marchandise E., Geuzaine C., Mouton T., 2013. "A frontal Delaunay quad mesh generator using the $L^\infty$ norm." *International Journal for Numerical Methods in Engineering*, 94(5): 494–512. DOI: `10.1002/nme.4458`.
+   Module: `src/papers/quad_direct/remacle_2013.rs`.
 
-11. **rushdi-2017** — All-quad meshing without cleanup. 2017. (Full citation in `md/rushdi-2017.md` and `pdf/rushdi-2017.pdf`.)
-   Used in: Cleanup-free quadtree with 2-ref templates (`src/alt_quadtree.rs`).
+9. **simons-2024-thesis** — Simons L.C., 2024. *Size-Driven All-Quad Meshing for Geographic Data*. PhD dissertation, University of California, Davis. (Incorporating Simons L., Amenta N., 2017, *Procedia Engineering* 203: 388–400; Knöppel F., Crane K., Pinkall U., Schröder P., 2013, *ACM TOG* 32(4): 59; Campen M., Bommes D., Kobbelt L., 2015, *ACM TOG* 34(6); Eppstein D. et al., 2008, *CGF* 27: 1477–1486; Coons S.A., 1967, MIT MAC-TR-41.)
+   Module: `src/papers/quad_direct/simons_2024/`.
 
-12. **rushdi-2015** — Robust all-quad meshing of domains with connected regions. 2015. (Full citation in `md/rushdi-2015.md` and `pdf/rushdi-2015.pdf`.)
-   Used in: All-quad meshing of connected regions with the quadtree (`src/alt_quadtree.rs`).
+---
 
-13. **yang-2024** — Boundary-constrained quad meshing by domain decomposition and templates. 2024. (Full citation in `md/yang-2024.md` and `pdf/yang-2024.pdf`.)
-   Used in: Boundary-constrained quad meshing by domain decomposition and templates (`src/alt_decompose.rs`).
+## 3. Indirect 2D Quadrilateral Conversion (Triangle-to-Quad)
 
-14. **miranda-2017** — Hierarchical template-based quadrilateral mesh generation. 2017. (Full citation in `md/miranda-2017.md` and `pdf/miranda-2017.pdf`.)
-   Used in: Hierarchical template-based quads, the T0/T1/T2 transfinite templates (`src/alt_decompose.rs`).
+10. **owen-1999** — Owen S.J., Staten M.L., Canann S.A., Saigal S., 1999. "Q-Morph: an indirect approach to advancing front quad meshing." *International Journal for Numerical Methods in Engineering*, 44(9): 1317–1340.
+    Module: `src/papers/quad_indirect/owen_1999.rs`.
 
-15. **ma-2017** — Sub-domain decomposition and quadrilateral meshing with line constraints. 2017. (Full citation in `md/ma-2017.md` and `pdf/ma-2017.pdf`.)
-   Used in: Sub-domain decomposition with line constraints (`src/alt_decompose.rs`).
+11. **lee-2003** — Lee Y.K., Lee C.K., 2003. "A new indirect anisotropic quadrilateral mesh generation scheme with enhanced local mesh smoothing procedures." *International Journal for Numerical Methods in Engineering*, 58(2): 313–339.
+    Module: `src/papers/quad_indirect/lee_2003.rs`.
 
-16. **zint-2021** — A hybrid approach to fast indirect quadrilateral mesh generation. 2021. (Full citation in `md/zint-2021.md` and `pdf/zint-2021.pdf`.)
-   Used in: Hybrid Blossom-band + greedy interior matching (`src/alt_hybrid.rs`).
+12. **merhof-2007** — Merhof D., Grosso R., Tremel U., Greiner G., 2007. "Anisotropic quadrilateral mesh generation: An indirect approach." *Advances in Engineering Software*, 38(8–9): 560–568.
+    Module: `src/papers/quad_indirect/merhof_2007.rs`.
 
-17. **pellenard-2014** — QMCF: QMorph cross-field-driven quad-dominant meshing. 2014. (Full citation in `md/pellenard-2014.md` and `pdf/pellenard-2014.pdf`.)
-   Used in: QMCF: cross-field-driven Q-Morph (`src/alt_crossfield.rs`).
+13. **ebeida-2010** — Ebeida M.S., Karamete K., Mestreau E., Dey S., 2010. "Q-TRAN: A new approach to transform triangular meshes into quadrilateral meshes locally." *Proceedings of the 19th International Meshing Roundtable*, Springer, pp. 23–34.
+    Module: `src/papers/quad_indirect/ebeida_2010.rs`.
 
-18. **pellenard-2011** — Isotropic 2D quadrangle meshing with size and orientation control. 2011. (Full citation in `md/pellenard-2011.md` and `pdf/pellenard-2011.pdf`.)
-   Used in: Isotropic 2D quad meshing with size and orientation control (`src/alt_crossfield.rs`).
+14. **liu-2011** — Liu Y., Xing H.L., Guan Z., 2011. "An indirect approach for automatic generation of quadrilateral meshes with arbitrary line constraints." *International Journal for Numerical Methods in Engineering*, 87(9): 906–924.
+    Module: `src/papers/quad_indirect/liu_2011.rs`.
 
-19. **remacle-2013** — Remacle J.-F., Henrotte F., Carrier-Baudouin T., Béchet E., Marchandise E., Geuzaine C., Mouton T., 2013. "A frontal Delaunay quad mesh generator using the L-infty norm." International Journal for Numerical Methods in Engineering, 94(5): 494-512.
-   Used in: Frontal Delaunay in the L-infinity (Chebyshev) norm (`src/alt_l1.rs`).
+15. **lu-2011** — Lu L., Qian X., Shi X., Liu F., 2011. "Quading triangular meshes with certain topological constraints." *Journal of Computational and Applied Mathematics*, 235(13): 3826–3836.
+    Module: `src/papers/quad_indirect/lu_2011.rs`.
 
-20. **sastry-2014** — Sastry S.P., Shontz S.M., Vavasis S.A., 2014 (online 2012). "A log-barrier method for mesh quality improvement and untangling." Engineering with Computers, 30(3): 315-329.
-   Used in: Log-barrier untangling / quality improvement (`src/alt_untangle.rs`).
+16. **remacle-2012** — Remacle J.-F., Lambrechts J., Seny B., Marchandise E., Johnen A., Geuzaine C., 2012. "Blossom-Quad: A non-uniform quadrilateral mesh generator using a minimum-cost perfect-matching algorithm." *International Journal for Numerical Methods in Engineering*, 89(9): 1102–1119. DOI: `10.1002/nme.3279`.
+    Module: `src/papers/quad_indirect/remacle_2012.rs`.
 
-21. **verma-2017** — Combinatorial approach to reduce singularities in quadrilateral meshes. 2017. (Full citation in `md/verma-2017.md` and `pdf/verma-2017.pdf`.)
-   Used in: Combinatorial singularity reduction (`src/alt_untangle.rs`).
+17. **liu-2013** — Liu Y., Xing H.L., 2013. "A boundary focused quadrilateral mesh generation algorithm for multi-material structures." *Journal of Computational Physics*, 232(1): 324–342.
+    Module: `src/papers/quad_indirect/liu_2013.rs`.
 
-22. **verma-2018** — αMST: quad mesh adaptation in 2D and 3D. 2018. (Full citation in `md/verma-2018.md` and `pdf/verma-2018.pdf`.)
-   Used in: alpha-MST quad mesh adaptation (`src/alt_untangle.rs`).
+18. **araujo-2014** — Araújo C., Celes W., Gattass M., 2014. "Quadrilateral mesh generation with deferred constraint insertion." *Procedia Engineering*, 82: 78–90.
+    Module: `src/papers/quad_indirect/araujo_2014.rs`.
 
-23. **chi-2025** — Chi B., Yu X., Guo Q., Zhang X., Hao J., Yuan W., 2025. "An efficient and robust unstructured quad-dominated mesh generation method based on the grid-based and Delaunay techniques." Engineering with Computers, 41(5): 3563-3585.
-   Used in: Grid + Delaunay + Q-Morph quad-dominant route (surveyed; not implemented).
+19. **pellenard-2014** — Pellenard B., Orbay G., Chen J., Sohan S., Kwok W., Tristano J.R., 2014. "QMCF: QMorph cross field-driven quad-dominant meshing algorithm." *Procedia Engineering*, 82: 338–350.
+    Module: `src/papers/quad_indirect/pellenard_2014.rs`.
 
-24. **ebeida-2010** — Q-TRAN: transforming triangular meshes into quadrilaterals locally. 2010. (Full citation in `md/ebeida-2010.md` and `pdf/ebeida-2010.pdf`.)
-   Used in: Q-TRAN local triangle-to-quad transformation (surveyed; not implemented).
+20. **johnen-2015** — Johnen A., Ernst D., Geuzaine C., 2015. "Sequential decision-making approach for quadrangular mesh generation." *Engineering with Computers*, 31(4): 719–730.
+    Module: `src/papers/quad_indirect/johnen_2015.rs`.
 
-25. **bommes-2013** — Bommes D., Lévy B., Pietroni N., Puppo E., Silva C., Tarini M., Zorin D., 2013. "Quad-Mesh Generation and Processing: A Survey." Computer Graphics Forum, 32(6): 51-76.
-   Used in: Quad-mesh generation and processing survey (general reference).
+21. **sun-2015** — Sun L., Zhao G., Yeh G.-T., 2015. "Automatic quadrilateral mesh generation and quality improvement based on an improved combination method." *Engineering with Computers*, 31(4): 675–692.
+    Module: `src/papers/quad_indirect/sun_2015_2016.rs`.
 
-26. **simons-2024-thesis** — Simons L.C., 2024. "Size-Driven All-Quad Meshing for Geographic Data." PhD dissertation, University of California, Davis.
-   Used in: Size-driven all-quad meshing: channel stitching (Ch2), size-aware GODF cross field (Ch3), size families and anisotropy (Ch4), QGP extraction (Ch5) (`src/simons_*.rs`, the `Sized` route).
+22. **sun-2016** — Sun L., Yeh G.-T., Lin F.-P., Zhao G., 2016. "An automatic method for complete triangular mesh conversion into quadrilateral mesh for multiple domain geometry." *Terrestrial, Atmospheric and Oceanic Sciences*, 27(2): 139–152. DOI: `10.3319/TAO.2015.09.14.01(Hy)`.
+    Module: `src/papers/quad_indirect/sun_2015_2016.rs`.
 
+23. **zint-2021** — Zint D., Grosso R., 2021. "A hybrid approach to fast indirect quadrilateral mesh generation." *Computing and Visualization in Science*, 23.
+    Module: `src/papers/quad_indirect/zint_2021.rs`.
 
-## References inside the Simons thesis (implemented here)
+24. **georgiadis-2022** — Georgiadis C., Reberol M., Remacle J.-F., 2022. "Indirect all-quadrilateral meshing based on bipartite topological labeling." *Engineering with Computers*, 38: 5365–5385.
+    Module: `src/papers/quad_indirect/georgiadis_2022.rs`.
 
-27. **KCPS13** — Knoppel F., Crane K., Pinkall U., Schroder P., 2013. "Globally optimal direction fields." ACM TOG 32(4):59.
-   Used in: The GODF solve of Chapter 3 (`src/simons_godf.rs`).
+25. **gao-2024** — Gao J., Xiao Z., Xu C., Shen S., Xu G., 2024. "Quadrilateral surface mesh generation with improved quality by combination of triangles." *International Journal for Numerical Methods in Engineering*, 125.
+    Module: `src/papers/quad_indirect/gao_2024.rs`.
 
-28. **CBK15** — Campen M., Bommes D., Kobbelt L., 2015. "Quantized global parametrization." ACM TOG 34(6).
-   Used in: The QGP counts and Coons extraction of Chapter 5 (`src/simons_qgp.rs`).
+26. **wang-2025** — Wang H., Yin S., Yan H., Wang F., Yu X., Liu S., Cui X., 2025. "Improved Q-Morph algorithm for quad-dominant hybrid mesh generation with advanced front propagation and topology optimization." *Engineering with Computers*.
+    Module: `src/papers/quad_indirect/wang_2025.rs`.
 
-29. **BS91** — Blacker T.D., Stephenson M.B., 1991. "Paving: a new approach to automated quadrilateral mesh generation." IJNME 32(4):811-847.
-   Used in: The six-sided closure templates of Chapter 2; also `alt_paving`.
+27. **qiu-2026** — Qiu J., Qi L., Zhu X., Tang M., Liu Y., Xu G., Pang Y., 2026. "MSQ-meshing: a multi-constraint size-adaptive quad-dominant mesh generation method for complex surfaces." *Computers & Structures*.
+    Module: `src/papers/quad_indirect/qiu_2026.rs`.
 
-30. **Coo67** — Coons S.A., 1967. "Surfaces for computer-aided design of space forms." Technical report, MIT.
-   Used in: The bilinear Coons patch of section 5.1.3 (`src/simons_qgp.rs`).
+28. **wang-2026** — Wang H., Wang F., Yin S., Li S., Wang G., Wang L., Cui X., 2026. "High-quality quad-dominant mesh generation aided by the virtual topological model generated after automatic suppression of small geometric features." *Computers & Structures*.
+    Module: `src/papers/quad_indirect/wang_2026.rs`.
 
-31. **SA17** — Simons L., Amenta N., 2017. "All-quad meshing for geographic data via templated boundary optimization." Procedia Engineering 203:388-400.
-   Used in: The channel/patch construction of Chapter 2 (`src/simons_channel.rs`).
+---
 
-32. **FAR15** — Fogg H.J., Armstrong C.G., Robinson T.T., 2015. "Automatic generation of multiblock decompositions of surfaces." IJNME 101(13):965-991.
-   Used in: The singularity-pair relaxation of section 5.1.4 (cited, not implemented).
+## 4. Grid & Quadtree 2D Quadrilateral Generation
 
-33. **EGKT08** — Eppstein D., Goodrich M.T., Kim E., Tamstorf R., 2008. "Motorcycle graphs: canonical quad mesh partitioning." CGF 27:1477-1486.
-   Used in: The motorcycle graph of sections 3.1.9/5 (cited, not implemented).
+29. **rushdi-2015** — Rushdi A.A., Mitchell S.A., Mahmoud A.H., Bajaj C.C., Ebeida M.S., 2015. "Robust all-quad meshing of domains with connected regions." *Procedia Engineering*, 124: 96–108.
+    Module: `src/papers/quad_grid/rushdi_2015_2017.rs`.
 
+30. **rushdi-2017** — Rushdi A.A., Mitchell S.A., Mahmoud A.H., Bajaj C.C., Ebeida M.S., 2017. "All-quad meshing without cleanup." *Computer-Aided Design*, 84: 1–16.
+    Module: `src/papers/quad_grid/rushdi_2015_2017.rs`.
 
-## Module map (thesis)
+31. **pochet-2017** — Pochet A., Celes W., Lopes H., Gattass M., 2017. "A new quadtree-based approach for automatic quadrilateral mesh generation." *Engineering with Computers*, 33(2): 275–292.
+    Module: `src/papers/quad_grid/pochet_2017.rs`.
 
-Where each `simons_*` module sits in the thesis, and which reference above it
-follows. The public route names are in `src/config.rs`.
+32. **smith-pierce-2024** — Smith-Pierce M., Ruffin S., Dement D., 2024. "Automated Unstructured Quad/Hex Meshing for High-Order Discontinuous Galerkin CFD." *AIAA SciTech 2024 Forum*, AIAA 2024-0384. DOI: `10.2514/6.2024-0384`.
+    Module: `src/papers/quad_grid/smith_pierce_2024.rs`.
 
-| Module | Thesis section | Primary reference |
-| --- | --- | --- |
-| `simons_channel` | Ch. 2 grid interior, boundary channel, patch cover | `simons-2024-thesis`, `SA17`, `BS91` |
-| `simons_features` | Ch. 2 interior feature constraints | `simons-2024-thesis` |
-| `simons_godf` | Ch. 3 size-aware Globally-Optimal Direction Field | `KCPS13` |
-| `simons_sizefamily` | Ch. 4 size families, anisotropy A (4.7), streamline optimisation | `simons-2024-thesis` |
-| `simons_limit` | §4.12 removable limit cycles | `simons-2024-thesis` |
-| `simons_regions` | §3.1.6–3.1.12 singularities/separatrices/motorcycle graph, §5.1.4 tiles and nautilus | `KCPS13`, `EGKT08` |
-| `simons_qgp` | Ch. 5 Quantized Global Parameterization, Coons extraction | `CBK15`, `Coo67` |
-| `simons_graded` | Ch. 5 graded tile-grid QGP | `CBK15`, `Coo67` |
-| `simons_smooth` | §2.2.10 angle + stretch smoothing | `simons-2024-thesis` |
-| `simons_pipeline` | Ch. 2–5 integration (field → QGP → channel → smooth) | all of the above |
-| `sized` | product wrapper around `simons_channel` (Chapter 2 route) | `simons-2024-thesis` |
+33. **chi-2025** — Chi B., Yu X., Guo Q., Zhang X., Hao J., Yuan W., 2025. "An efficient and robust unstructured quad-dominated mesh generation method based on the grid-based and Delaunay techniques." *Engineering with Computers*, 41(5): 3563–3585. DOI: `10.1007/s00366-025-02179-z`.
+    Module: `src/papers/quad_grid/chi_2025.rs`.
 
-## Notes
+---
 
-- The thesis' own bibliography has about 100 entries; only the ones implemented or
-  explicitly approximated by this crate are listed above.
+## 5. Domain Decomposition, Templates & Singularity Reduction
 
-- `papers-metadata.txt` holds Crossref records for only part of the corpus; for
-  the rest the title/year come from `INDEX.md` (the full citation is in the
-  paper's own `md/` file).
+34. **nasri-2009** — Nasri A., Sabin M., Yasseen Z., 2009. "Filling $n$-sided regions by quad meshes for subdivision surfaces." *Computer Graphics Forum*, 28(6): 1644–1658.
+    Module: `src/papers/quad_decompose/nasri_2009.rs`.
 
-- The corpus paper `remacle-2013` is titled "L 1 norm" in the PDF/markdown, but
-  its abstract says "infinity norm" and the equations are `max(|dx|,|dy|)`: the
-  route implements the L-infinity (Chebyshev) geometry, not the Manhattan norm.
+35. **ma-2017** — Ma X., Zhao G., Sun L., 2017. "Sub-domain decomposition and quadrilateral meshing with line constraints." *Advances in Engineering Software*, 109: 26–38.
+    Module: `src/papers/quad_decompose/ma_2017.rs`.
+
+36. **miranda-2017** — Miranda A.C.O., Martha L.F., 2017. "Hierarchical template-based quadrilateral mesh generation." *Engineering with Computers*, 33(2): 123–138.
+    Module: `src/papers/quad_decompose/miranda_2017.rs`.
+
+37. **verma-2017** — Verma C.S., Suresh K., 2017. "A combinatorial approach to reduce singularities in quadrilateral meshes." *Computer-Aided Design*, 85: 99–110.
+    Module: `src/papers/quad_decompose/verma_2017_2018.rs`.
+
+38. **verma-2018** — Verma C.S., Suresh K., 2018. "$\alpha$MST: A unified algorithm for quad mesh adaptation." *International Journal for Numerical Methods in Engineering*, 113: 513–536.
+    Module: `src/papers/quad_decompose/verma_2017_2018.rs`.
+
+39. **yang-2024** — Yang S. et al., 2024. "Boundary-constrained quadrilateral mesh generation based on domain decomposition and templates." *Finite Elements in Analysis and Design*.
+    Module: `src/papers/quad_decompose/yang_2024.rs`.
+
+---
+
+## 6. Smoothing, Untangling & High-Order Boundary Curving
+
+40. **diaz-2004** — Menéndez-Díaz A., González-Nicieza C., Álvarez-Vigil A.E., 2004. "Improvement of quadrilateral meshes for discretization of tunnels." *Computers and Geotechnics*, 31(1): 47–56.
+    Module: `src/papers/smoothing/menendez_diaz_2004.rs`.
+
+41. **diaz-2005** — Menéndez-Díaz A., González-Nicieza C., Álvarez-Vigil A.E., 2005. "Hexahedral mesh smoothing using a direct method." *Computers & Geosciences*, 31(4): 453–463.
+    Module: `src/papers/smoothing/menendez_diaz_2005.rs`.
+
+42. **xie-2013** — Xie Z.Q., Sevilla R., Hassan O., Morgan K., 2013. "The generation of arbitrary order curved meshes for 3D finite element analysis." *Computational Mechanics*, 51(3): 361–374. DOI: `10.1007/s00466-012-0736-4`.
+    Module: `src/papers/smoothing/xie_2013.rs`.
+
+43. **sastry-2014** — Sastry S.P., Shontz S.M., Vavasis S.A., 2014. "A log-barrier method for mesh quality improvement and untangling." *Engineering with Computers*, 30(3): 315–329.
+    Module: `src/papers/smoothing/sastry_2014.rs`.
+
+44. **lin-2014** — Lin T.J., Guan Z.Q., Chang J.H., Lo S.H., 2014. "Vertex-Ball Spring Smoothing: An efficient method for unstructured dynamic hybrid meshes." *Computers & Structures*, 136: 24–33.
+    Module: `src/papers/smoothing/lin_2014.rs`.
+
+45. **durand-2019** — Durand R., Pantoja-Rosero B.G., Oliveira V., 2019. "A general mesh smoothing method for finite elements." *Finite Elements in Analysis and Design*, 158: 17–30.
+    Module: `src/papers/smoothing/durand_2019.rs`.
+
+46. **sun-2020** — Sun S., Gou Z., Geng M., 2020. "Simultaneous Smoothing and Untangling of 2D Meshes Based on Explicit Element Geometric Transformation and Element Stitching." *Applied Sciences*, 10(14): 4994.
+    Module: `src/papers/smoothing/sun_2020.rs`.
+
+47. **yang-2020** — Yang F., Zhang D., Ren H., Xu J., 2020. "2D Mesh smoothing based on Markov chain method." *Engineering with Computers*, 36: 1615–1626. DOI: `10.1007/s00366-019-00786-1`.
+    Module: `src/papers/smoothing/yang_2020.rs`.
+
+---
+
+## 7. 3D Hexahedral Generation
+
+48. **yerry-1984** — Yerry M.A., Shephard M.S., 1984. "Automatic three-dimensional mesh generation by the modified-octree technique." *International Journal for Numerical Methods in Engineering*, 20(11): 1965–1990. DOI: `10.1002/nme.1620201103`.
+    Module: `src/papers/hex/yerry_1984.rs`.
+
+49. **schneiders-1996** — Schneiders R., 1996. "A grid-based algorithm for the generation of hexahedral element meshes." *Engineering with Computers*, 12(3–4): 168–177.
+    Module: `src/papers/hex/schneiders_1996.rs`.
+
+50. **tautges-1996** — Tautges T.J., Blacker T., Mitchell S.A., 1996. "The whisker weaving algorithm: A connectivity-based method for constructing all-hexahedral finite element meshes." *International Journal for Numerical Methods in Engineering*, 39(19): 3327–3349.
+    Module: `src/papers/hex/tautges_1996.rs`.
+
+51. **owen-2000** — Owen S.J., Saigal S., 2000. "H-Morph: an indirect approach to advancing front hex meshing." *International Journal for Numerical Methods in Engineering*, 49(1–2): 289–312.
+    Module: `src/papers/hex/owen_2000.rs`.
+
+52. **carrier-baudouin-2014** — Carrier-Baudouin T., Remacle J.-F., Marchandise E., Lambrechts J., 2014. "A frontal approach to hex-dominant mesh generation." *Advanced Modeling and Simulation in Engineering Sciences*, 1: 8. DOI: `10.1186/2213-7467-1-8`.
+    Module: `src/papers/hex/carrier_baudouin_2014.rs`.
+
+53. **bosnjak-2023** — Bošnjak D., Pepe A., Schussnig R., Schmalstieg D., Fries T.-P., 2023. "Higher-order block-structured hex meshing of tubular structures." *Engineering with Computers*. DOI: `10.1007/s00366-023-01834-7`.
+    Module: `src/papers/hex/bosnjak_2023.rs`.
+
+54. **zhang-2023** — Zhang P., Chiang J., Fan X., Mundilova K., 2023. "Local decomposition of hexahedral singular nodes into singular curves." *Computer-Aided Design*, 158: 103484. DOI: `10.1016/j.cad.2023.103484`.
+    Module: `src/papers/hex/zhang_2023.rs`.
+
+55. **tong-2024** — Tong H., Halilaj E., Zhang Y.J., 2024. "HybridOctree_Hex: Hybrid octree-based adaptive all-hexahedral mesh generation with Jacobian control." *Journal of Computational Science*, 78: 102278. DOI: `10.1016/j.jocs.2024.102278`.
+    Module: `src/papers/hex/tong_2024.rs`.
+
+56. **tong-2026-mchex** — Tong H., Zhang Y.J., 2026. "MCHex: marching cubes based adaptive hexahedral mesh generation with guaranteed positive Jacobian." *ACM Transactions on Graphics*. DOI: `10.1145/3858338`.
+    Module: `src/papers/hex/tong_2026_mchex.rs`.
+
+57. **tong-2026-element-saving** — Tong H., Zhang Y.J., 2026. "Element-saving hexahedral 3-refinement templates." *Computer Aided Geometric Design*, 102550. DOI: `10.1016/j.cagd.2026.102550`.
+    Module: `src/papers/hex/tong_2026_templates.rs`.
+
+---
+
+## 8. Surveys & Non-Classical Reference Works (Reviewed; No Rust Module)
+
+58. **bommes-2013** — Bommes D., Lévy B., Pietroni N., Puppo E., Silva C., Tarini M., Zorin D., 2013. "Quad-Mesh Generation and Processing: A Survey." *Computer Graphics Forum*, 32(6): 51–76.
+
+59. **pietroni-2022** — Pietroni N., Campen M., Sheffer A., Cherchi G., Bommes D., Gao X., Scateni R., Ledoux F., Remacle J.-F., Livesu M., 2022. "Hex-Mesh Generation and Processing: A Survey." *ACM Transactions on Graphics*, 42(2). DOI: `10.1145/3554920`.
+
+60. **tong-2023** — Tong H., Qian K., Zhang Y.J., 2023. "SRL-assisted AFM: learning-assisted advancing front quad meshing." (Deep neural-network / RL method; excluded from classical library).
+
+61. **xie-2026** — Xie et al., 2026. "Intelligent quad meshing for ship structures by hybrid deep reinforcement learning (S2R-AFM)." (Deep RL policy method; excluded from classical library).

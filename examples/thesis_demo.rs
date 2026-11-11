@@ -112,7 +112,7 @@ fn main() {
                 });
                 ids[k] = id;
             }
-            cells.push(Cell::quad4(ids));
+            cells.push(Cell::qua4(ids));
         }
     }
     let mesh = Mesh::new(points, cells);

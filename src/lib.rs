@@ -1,30 +1,18 @@
-//! `pedroso_mesher` — clean-room, pure-Rust, MIT-licensed unstructured quad and
-//! hex mesh generation for finite element analysis. The module map is: `mesh`
-//! is the data model (`Mesh`, `Cell`, `Node`, `Topology`); `two_d` is the
-//! planar substrate and the default quad-dominant `mesh_2d`; `delaunay` is the
-//! independent robust fixed/mutable CDT kernel being built in Phase B; `quad`
-//! is the gate-checked all-quad pipeline (Q-Morph + Sun closure); `config` is the
-//! shipped API that selects any of the twelve routes and applies the shared
-//! smoother; `qmorph`, `parity`, `twostage`, `sun`, `recovery`, `grid`, `smooth`
-//! and `quality` are the shared stages; `stats`, `verify` and `bench` are the
-//! measurements; `draw`, `io` and `msh` are the I/O and diagnostics;
-//! `alt_paving`, `alt_bipartite`, `alt_quadtree`, `alt_decompose`, `alt_hybrid`,
-//! `alt_crossfield`, `alt_untangle` and `alt_l1` are the alternative routes;
-//! `sized` is the Simons 2024 channel route, and `simons_channel`,
-//! `simons_features`, `simons_godf`, `simons_sizefamily`, `simons_limit`,
-//! `simons_regions`, `simons_qgp`, `simons_graded`, `simons_smooth` and
-//! `simons_pipeline` implement the thesis chapters (see `README.md`).
-//! The rules are: every algorithm is implemented from public journal papers and
-//! university theses (the clean-room policy in `AGENTS.md` and the corpus
-//! `INDEX.md`); no code is ported or copied, BSD code needs prior authorization,
-//! non-MIT code is never read, nothing is driven from a commercial product, and
-//! the crate must build for `wasm32-unknown-unknown`. The Cargo lints forbid
-//! `unsafe`, `unwrap`, `expect`, `panic!`, `todo!` and `unimplemented!` in
-//! non-test code, so failures are `Result` values through the crate's error
-//! types. The acceptance contract is [`quality::report`] and [`verify::Gate`]
-//! (all-quad, scaled Jacobian >= 0.2, corner angle >= 30 degrees, watertight,
-//! no overlapping cells); a route that cannot meet it reports the measured
-//! failure instead of shipping the mesh.
+//! `pedroso_mesher` — clean-room, pure-Rust, MIT-licensed mesh generation for
+//! Finite Element Analysis (`Tri3`, `Tri6`, `Qua4`, `Qua8`, `Tet4`, `Tet10`,
+//! `Hex8`, `Hex20`).
+//!
+//! ## Crate Architecture
+//! - [`core`] — Shared FEA mesh model, markers, PSLG/PLC domains, exact Edmonds
+//!   Blossom graph matching, quality metrics, strict geometric verification,
+//!   quadratic mid-edge elevation, and `JSON` / `.msh` / `.vtu` / `SVG` I/O.
+//!   All linear algebra uses [`algebra_linear`].
+//! - [`papers`] — Dedicated, unmodified clean-room modules organized one-per-paper
+//!   (or cohesive same-author paper series) across `foundations`, `tri`,
+//!   `quad_direct`, `quad_indirect`, `quad_grid`, `quad_decompose`, `smoothing`,
+//!   `tet`, and `hex`.
+//! - [`generators`] — Production quality-constrained FEA generators (`tri`,
+//!   `quad`, `tet`, `hex`) built atop empirically validated paper methods.
 //!
 //! ```
 //! use pedroso_mesher::{Cell, Mesh, quality};
@@ -38,73 +26,55 @@
 //! assert_eq!(quality::report(&mesh).verdict, quality::Verdict::Acceptable);
 //! ```
 
-pub mod bench;
-pub mod draw;
-pub mod grid;
-pub mod io;
-pub mod mesh;
-pub mod msh;
-pub mod parity;
-pub mod qmorph;
-pub mod quad;
-pub mod quadify;
-pub mod quality;
-pub mod recovery;
-pub mod smooth;
-pub mod stats;
-pub mod sun;
-pub mod two_d;
-pub mod twostage;
-pub mod verify;
+pub mod core;
+pub mod generators;
+pub mod papers;
 
+// Core module aliases at crate root for ergonomic access and test/example continuity.
+pub use core::bench;
+pub use core::io::json as io;
+pub use core::io::msh;
+pub use core::io::svg as draw;
+pub use core::io::vtu;
+pub use core::mesh;
+pub use core::quality;
+pub use core::stats;
+pub use core::verify;
+
+// Paper & legacy compatibility aliases preserving existing tests and examples
+// during Phase 2 unbundling.
+pub use papers::common::{config, parity, quad, smooth, two_d, twostage};
+pub use papers::foundations::delaunay;
+pub use papers::quad_decompose::yang_2024 as alt_decompose;
+pub use papers::quad_direct::blacker_1991 as alt_paving;
+pub use papers::quad_direct::remacle_2013 as alt_l1;
+pub use papers::quad_direct::simons_2024::ch2_channel as simons_channel;
+pub use papers::quad_direct::simons_2024::ch2_features as simons_features;
+pub use papers::quad_direct::simons_2024::ch3_godf as simons_godf;
+pub use papers::quad_direct::simons_2024::ch4_limit as simons_limit;
+pub use papers::quad_direct::simons_2024::ch4_size_family as simons_sizefamily;
+pub use papers::quad_direct::simons_2024::ch5_graded as simons_graded;
+pub use papers::quad_direct::simons_2024::ch5_qgp as simons_qgp;
+pub use papers::quad_direct::simons_2024::ch5_regions as simons_regions;
+pub use papers::quad_direct::simons_2024::ch5_seeded as simons_seeded;
+pub use papers::quad_direct::simons_2024::pipeline as simons_pipeline;
+pub use papers::quad_direct::simons_2024::sized;
+pub use papers::quad_direct::simons_2024::smooth as simons_smooth;
+pub use papers::quad_grid::rushdi_2015_2017 as alt_quadtree;
+pub use papers::quad_indirect::georgiadis_2022 as alt_bipartite;
+pub use papers::quad_indirect::owen_1999 as qmorph;
+pub use papers::quad_indirect::pellenard_2014 as alt_crossfield;
+pub use papers::quad_indirect::sun_2015_2016 as sun;
+pub use papers::quad_indirect::zint_2021 as alt_hybrid;
+pub use papers::smoothing::sastry_2014 as alt_untangle;
+
+// Primary top-level type & function re-exports.
 pub use bench::{Part, PARTS};
-pub use io::read_mesh_json;
+pub use core::error::{Error, Result};
+pub use core::high_order::elevate_to_quadratic;
+pub use io::{read_mesh_json, write_mesh_json};
 pub use mesh::{Cell, Kind, Mesh, MeshError, Node, Topology};
 pub use msh::{to_msh, write_msh};
 pub use quad::{mesh_quads, QuadError, QuadMesh};
 pub use quality::{report, report_with, Report, Thresholds, Verdict};
 pub use two_d::{mesh_2d, Domain, Sizing, TwoDResult, TwoDStats};
-
-pub mod alt_paving;
-
-pub mod alt_hybrid;
-
-pub mod alt_untangle;
-
-pub mod alt_quadtree;
-
-pub mod alt_bipartite;
-
-pub mod alt_l1;
-
-pub mod alt_decompose;
-
-pub mod alt_crossfield;
-
-pub mod config;
-
-pub mod delaunay;
-
-pub mod simons_godf;
-
-pub mod simons_qgp;
-
-pub mod simons_sizefamily;
-
-pub mod simons_channel;
-
-pub mod sized;
-
-pub mod simons_smooth;
-
-pub mod simons_regions;
-
-pub mod simons_seeded;
-
-pub mod simons_features;
-
-pub mod simons_limit;
-
-pub mod simons_pipeline;
-
-pub mod simons_graded;

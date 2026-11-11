@@ -67,7 +67,7 @@ fn stepped() -> Domain {
 fn quad_vec(mesh: &Mesh) -> Vec<[usize; 4]> {
     mesh.cells
         .iter()
-        .filter(|c| c.kind == Kind::Quad4)
+        .filter(|c| c.kind == Kind::Qua4)
         .map(|c| [c.nodes[0], c.nodes[1], c.nodes[2], c.nodes[3]])
         .collect()
 }
@@ -83,7 +83,7 @@ fn tri_vec(mesh: &Mesh) -> Vec<[usize; 3]> {
 fn cells_of(quads: &[[usize; 4]], tris: &[[usize; 3]]) -> Vec<Cell> {
     let mut cells = Vec::with_capacity(quads.len() + tris.len());
     for q in quads {
-        cells.push(Cell::quad4(*q));
+        cells.push(Cell::qua4(*q));
     }
     for t in tris {
         cells.push(Cell::tri3(*t));
@@ -138,7 +138,7 @@ fn measure(mesh: &Mesh, domain: &Domain, secs: f64) -> Measured {
     let mut aspects: Vec<f64> = mesh
         .cells
         .iter()
-        .filter(|c| c.kind == Kind::Quad4)
+        .filter(|c| c.kind == Kind::Qua4)
         .map(|c| quality::aspect_ratio(c, &mesh.points))
         .filter(|a| a.is_finite())
         .collect();

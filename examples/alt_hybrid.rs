@@ -68,7 +68,7 @@ fn stepped() -> Domain {
 fn quad_vec(mesh: &Mesh) -> Vec<[usize; 4]> {
     mesh.cells
         .iter()
-        .filter(|c| c.kind == Kind::Quad4)
+        .filter(|c| c.kind == Kind::Qua4)
         .filter_map(|c| c.nodes.as_slice().try_into().ok())
         .collect()
 }
@@ -82,7 +82,7 @@ fn tri_vec(mesh: &Mesh) -> Vec<[usize; 3]> {
 }
 
 fn cells_of(quads: &[[usize; 4]], tris: &[[usize; 3]]) -> Vec<Cell> {
-    let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::quad4(*q)).collect();
+    let mut cells: Vec<Cell> = quads.iter().map(|q| Cell::qua4(*q)).collect();
     cells.extend(tris.iter().map(|t| Cell::tri3(*t)));
     cells
 }
@@ -131,7 +131,7 @@ fn valence4(mesh: &Mesh) -> Option<f64> {
     for cell in &mesh.cells {
         for &v in &cell.nodes {
             used[v] = true;
-            if cell.kind == Kind::Quad4 {
+            if cell.kind == Kind::Qua4 {
                 *quads_at.entry(v).or_insert(0) += 1;
             }
         }

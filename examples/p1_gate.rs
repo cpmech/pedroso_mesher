@@ -76,7 +76,7 @@ fn run_with(name: &str, d: &Domain, size: f64, all_quad: bool) {
     let rep = quality::report(&r.mesh);
     let mut min_angle = f64::INFINITY;
     for cell in &r.mesh.cells {
-        if cell.kind == pedroso_mesher::mesh::Kind::Quad4 {
+        if cell.kind == pedroso_mesher::mesh::Kind::Qua4 {
             for a in quad_angles(cell, &r.mesh.points) {
                 min_angle = min_angle.min(a);
             }

@@ -21,7 +21,7 @@ fn analyse(name: &str, d: &Domain, size: f64) {
             let key = (a.min(b), a.max(b));
             match c.kind {
                 Kind::Tri3 => *edge_tris.entry(key).or_insert(0) += 1,
-                Kind::Quad4 => *edge_quads.entry(key).or_insert(0) += 1,
+                Kind::Qua4 => *edge_quads.entry(key).or_insert(0) += 1,
                 _ => {}
             }
         }

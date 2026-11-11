@@ -21,7 +21,7 @@ fn main() {
     for j in 0..rows.len() - 1 {
         for i in 0..6 {
             let a = j * 7 + i;
-            cells.push(Cell::quad4([a, a + 1, a + 8, a + 7]));
+            cells.push(Cell::qua4([a, a + 1, a + 8, a + 7]));
         }
     }
     let mesh = Mesh::new(points, cells);

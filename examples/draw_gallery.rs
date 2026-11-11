@@ -460,7 +460,7 @@ fn qgp_tiles_2x2() -> Result<Mesh, String> {
                 });
                 ids[k] = id;
             }
-            cells.push(Cell::quad4(ids));
+            cells.push(Cell::qua4(ids));
         }
     }
     Ok(Mesh::new(points, cells))
